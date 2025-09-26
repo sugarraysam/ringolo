@@ -82,7 +82,6 @@ impl SingleIssuerRing {
             }
         }
 
-        // TODO: missing `libc::sigset_t` ?
         unsafe {
             self.ring
                 .submitter()
