@@ -52,6 +52,10 @@ impl RawSqeSlab {
     pub fn len(&self) -> usize {
         self.slab.len()
     }
+
+    pub fn capacity(&self) -> usize {
+        self.slab.capacity()
+    }
 }
 
 #[cfg(test)]
