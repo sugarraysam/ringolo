@@ -1,18 +1,12 @@
 use anyhow::Result;
-use io_uring::EnterFlags;
 use io_uring::squeue::Entry;
-use io_uring::{IoUring, types};
+use io_uring::{CompletionQueue, EnterFlags, IoUring, SubmissionQueue, types};
 use libc;
 use std::io;
 use std::time::Duration;
 
-use std::marker::PhantomData;
-
 pub struct SingleIssuerRing {
     ring: IoUring,
-
-    // Make !Send + !Sync with a marker type.
-    _not_send_or_sync: PhantomData<*const ()>,
 }
 
 impl SingleIssuerRing {
@@ -27,23 +21,16 @@ impl SingleIssuerRing {
             .setup_taskrun_flag()
             .build(sq_ring_size)?;
 
-        Ok(SingleIssuerRing {
-            ring,
-            _not_send_or_sync: PhantomData,
-        })
+        Ok(SingleIssuerRing { ring })
     }
 
     pub fn submit_and_wait_timeout(
         &mut self,
-        sqes: &[Entry],
         num_to_wait: usize,
         timeout: Option<Duration>,
     ) -> anyhow::Result<usize> {
-        unsafe {
-            let mut sq = self.ring.submission();
-            sq.push_multiple(sqes)?;
-            sq.sync();
-        }
+        // Sync user space and kernel shared queue
+        self.submission().sync();
 
         if let Some(duration) = timeout {
             let ts = types::Timespec::from(duration);
@@ -87,6 +74,14 @@ impl SingleIssuerRing {
                 .submitter()
                 .enter::<libc::sigset_t>(0, min_complete, flags.bits(), None)
         }
+    }
+
+    pub fn submission(&mut self) -> SubmissionQueue<'_> {
+        self.ring.submission()
+    }
+
+    pub fn completion(&mut self) -> CompletionQueue<'_> {
+        self.ring.completion()
     }
 
     pub fn as_mut(&mut self) -> &mut IoUring {

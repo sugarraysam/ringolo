@@ -8,7 +8,6 @@ libc = { version = "0.2.98", default-features = false }
 anyhow = "^1.0.99"
 # TODO: refine which features are needed
 tokio = { version = "1", features = ["full"] }
-# Waiting for PR: https://github.com/tokio-rs/io-uring/pull/363
 # io-uring = "^0.7.10"
 io-uring = { git = "https://github.com/sugarraysam/io-uring.git", branch = "origin/expose-enter-flags" }
 either = "^1.15.0"

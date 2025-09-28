@@ -1,7 +1,7 @@
 // TODO: remove this
 #![allow(dead_code)]
 
-use crate::context::{with_context, with_slab_mut};
+use crate::context::{with_context_mut, with_slab_mut};
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::{Context, Result, anyhow};
 use io_uring::squeue::{Entry, Flags};
@@ -55,17 +55,7 @@ impl SqeList {
 
 impl Submittable for SqeList {
     fn submit(&self) -> io::Result<i32> {
-        let _ = with_context(|ctx| -> Result<()> {
-            for idx in self.list.iter() {
-                let _entry = ctx.get_slab().get(*idx)?.get_entry()?;
-
-                // TODO: push in iouring
-            }
-
-            Ok(())
-        });
-
-        Ok(0)
+        with_context_mut(|ctx| ctx.submit_sqes(&self.list))
     }
 }
 

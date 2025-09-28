@@ -1,4 +1,4 @@
-use crate::context::{with_context, with_slab_mut};
+use crate::context::{with_context_mut, with_slab_mut};
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::Result;
 use io_uring::squeue::Entry;
@@ -24,19 +24,7 @@ impl SqeSingle {
 
 impl Submittable for SqeSingle {
     fn submit(&self) -> io::Result<i32> {
-        let _ = with_context(|ctx| -> Result<()> {
-            // TODO: get thread local uring + add submission queue
-            // let uring = get_thread_local_uring();
-
-            // !IMPORTANT: clone entry to avoid lifetime issues, we need buffer ptrs to remain alive
-            // for lifetime of SQE for example!
-
-            let _entry = ctx.get_slab().get(self.idx)?.get_entry()?;
-
-            Ok(())
-        });
-
-        Ok(0)
+        with_context_mut(|ctx| ctx.submit_sqes(&[self.idx]))
     }
 }
 
