@@ -1,4 +1,3 @@
-use crate::context::with_slab_mut;
 use anyhow::{Context, Result, anyhow};
 use io_uring::squeue::Entry;
 use std::cell::RefCell;
@@ -44,6 +43,10 @@ impl RawSqe {
         self.entry.as_ref().ok_or_else(|| anyhow!("Entry is None"))
     }
 
+    pub fn has_waker(&self) -> bool {
+        self.waker.is_some()
+    }
+
     pub fn set_waker(&mut self, waker: &Waker) {
         if let Some(waker_ref) = self.waker.as_ref() {
             // No need to override waker if they are related.
@@ -67,7 +70,8 @@ impl RawSqe {
         Ok(())
     }
 
-    pub fn on_completion(&mut self, res: i32) -> Result<()> {
+    // Optionally returns a "head" to wake if we're working with BatchOrChain.
+    pub fn on_completion(&mut self, res: i32) -> Result<Option<usize>> {
         self.result = if res >= 0 {
             Some(Ok(res))
         } else {
@@ -75,16 +79,16 @@ impl RawSqe {
         };
 
         match &self.handler {
-            CompletionHandler::Single => self.wake(),
+            CompletionHandler::Single => self.wake().map(|_| None),
             CompletionHandler::BatchOrChain { head, remaining } => {
                 let mut count = remaining.borrow_mut();
                 *count -= 1;
 
                 // We completed the last SQE in the batch/chain, wake the head.
                 if *count == 0 {
-                    with_slab_mut(|slab| slab.get_mut(*head).context("No head node")?.wake())
+                    Ok(Some(*head))
                 } else {
-                    Ok(())
+                    Ok(None)
                 }
             }
             CompletionHandler::RingMessage => {
@@ -123,7 +127,7 @@ impl RawSqe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::init_context;
+    use crate::context::{init_context, with_slab_mut};
     use crate::test_utils::mocks::mock_waker;
     use io_uring::opcode::Nop;
     use rstest::rstest;
@@ -161,6 +165,7 @@ mod tests {
         #[case] res: i32,
         #[case] expected: io::Result<i32>,
     ) -> Result<()> {
+        init_context(64);
         let user_data = 42;
 
         let mut sqe = RawSqe::new(
@@ -170,7 +175,7 @@ mod tests {
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
-        sqe.on_completion(res)?;
+        assert!(sqe.on_completion(res)?.is_none());
 
         assert!(sqe.is_ready());
         let (entry, got) = sqe.get_result()?;
@@ -202,8 +207,6 @@ mod tests {
         #[case] n_sqes: usize,
     ) -> Result<()> {
         init_context(64);
-        let (waker, waker_data) = mock_waker();
-
         let remaining = Rc::new(RefCell::new(n_sqes));
 
         let handler = with_slab_mut(|slab| -> Result<CompletionHandler> {
@@ -216,26 +219,24 @@ mod tests {
             };
 
             let mut head = RawSqe::new(Nop::new().build(), handler.clone());
-            head.set_waker(&waker);
-            head.on_completion(res)?;
-
-            vacant.insert(head);
 
             // Not woken up yet, we have `n_sqes - 1` remaining
-            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+            assert!(head.on_completion(res)?.is_none());
+
+            vacant.insert(head);
 
             Ok(handler)
         })?;
 
         while *remaining.borrow() > 0 {
             let mut sqe = RawSqe::new(Nop::new().build(), handler.clone());
-            sqe.on_completion(res)?;
+            let head_to_wake = sqe.on_completion(res)?;
 
             // Last SQE to complete triggers completion
             if *remaining.borrow() == 0 {
-                assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+                assert!(head_to_wake.is_some());
             } else {
-                assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+                assert!(head_to_wake.is_none());
             }
         }
 

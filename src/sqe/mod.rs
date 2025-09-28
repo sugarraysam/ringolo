@@ -22,7 +22,6 @@ pub trait Submittable {
 pub trait Completable {
     type Output;
 
-    // TODO: need Pin<&mut Self> ?
     fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output>;
 }
 
@@ -89,5 +88,66 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{init_context, with_context_mut};
+    use crate::test_utils::mocks::mock_waker;
+    use io_uring::opcode::Nop;
+    use std::pin::pin;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll};
+
+    #[test]
+    fn test_submit_and_complete_single_sqe() -> Result<()> {
+        init_context(64);
+
+        let sqe = SqeSingle::try_new(Nop::new().build())?;
+        let idx = sqe.get_idx();
+        let mut sqe_fut = pin!(Sqe::new(sqe));
+
+        let (waker, waker_data) = mock_waker();
+        let mut ctx = Context::from_waker(&waker);
+
+        // Polling once will submit the SQE and set the waker.
+        // Polling N more times after this won't change the state.
+        for _ in 0..10 {
+            assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
+            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+
+            with_context_mut(|ctx| {
+                assert_eq!(ctx.get_ring_mut().submission().len(), 1);
+
+                let res = ctx.get_slab().get(idx).and_then(|sqe| {
+                    assert!(!sqe.is_ready());
+                    assert!(sqe.has_waker());
+                    Ok(())
+                });
+
+                assert!(res.is_ok());
+            });
+        }
+
+        with_context_mut(|ctx| {
+            // Submit SQEs and wait for CQEs :: `io_uring_enter`
+            assert!(matches!(ctx.submit_and_wait_timeout(1, None), Ok(1)));
+            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+
+            // Process CQEs :: wakes up Waker
+            assert!(matches!(ctx.process_cqes(None), Ok(1)));
+            assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+        });
+
+        if let Poll::Ready(Ok((entry, result))) = sqe_fut.as_mut().poll(&mut ctx) {
+            assert!(matches!(result, Ok(0)));
+            assert_eq!(entry.get_user_data(), idx as u64);
+        } else {
+            assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
+        }
+
+        Ok(())
     }
 }

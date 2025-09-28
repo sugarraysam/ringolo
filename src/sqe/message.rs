@@ -30,7 +30,7 @@ impl SqeRingMessage {
 impl Submittable for SqeRingMessage {
     // TODO: impl ACK + mailbox
     fn submit(&self) -> io::Result<i32> {
-        with_context_mut(|ctx| ctx.submit_sqes(&[self.idx]))
+        with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
     }
 }
 

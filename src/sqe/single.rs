@@ -20,11 +20,15 @@ impl SqeSingle {
 
         Ok(Self { idx })
     }
+
+    pub fn get_idx(&self) -> usize {
+        self.idx
+    }
 }
 
 impl Submittable for SqeSingle {
     fn submit(&self) -> io::Result<i32> {
-        with_context_mut(|ctx| ctx.submit_sqes(&[self.idx]))
+        with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
     }
 }
 

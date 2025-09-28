@@ -55,7 +55,7 @@ impl SqeList {
 
 impl Submittable for SqeList {
     fn submit(&self) -> io::Result<i32> {
-        with_context_mut(|ctx| ctx.submit_sqes(&self.list))
+        with_context_mut(|ctx| ctx.push_sqes(&self.list))
     }
 }
 

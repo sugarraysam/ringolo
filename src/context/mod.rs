@@ -1,8 +1,12 @@
 use anyhow::Result;
+use either::Either;
+use io_uring::types::{SubmitArgs, Timespec};
 use slab::RawSqeSlab;
 use std::cell::{OnceCell, RefCell};
 use std::io;
+use std::os::unix::io::RawFd;
 use std::thread_local;
+use std::time::Duration;
 
 use crate::context::ring::SingleIssuerRing;
 
@@ -44,17 +48,21 @@ impl Context {
         debug_assert!(self.init.get().is_some(), "uninitialized");
     }
 
+    pub fn ring_fd(&self) -> RawFd {
+        self.get_ring().as_raw_fd()
+    }
+
     // Queues SQEs in the SQ ring, fetching them from the slab using the provided
     // indices. To submit the SQEs to the kernel, we need to call `q.sync()` and
     // make an `io_uring_enter` syscall unless kernel side SQ polling is enabled.
-    pub fn submit_sqes<'a>(
+    pub fn push_sqes<'a>(
         &mut self,
         indices: impl IntoIterator<Item = &'a usize>,
     ) -> io::Result<i32> {
         // Need to manually access the fields to avoid immutable vs. mutable
         // borrow issues or double borrow problem.
         let slab = self.slab.get().unwrap();
-        let mut q = self.ring.get_mut().unwrap().submission();
+        let mut sq = self.ring.get_mut().unwrap().submission();
 
         for idx in indices {
             let entry = slab
@@ -62,11 +70,77 @@ impl Context {
                 .and_then(|sqe| sqe.get_entry())
                 .map_err(|_e| io::Error::new(io::ErrorKind::Other, "Can't find RawSqe in slab."))?;
 
-            unsafe { q.push(entry) }
+            unsafe { sq.push(entry) }
                 .map_err(|_e| io::Error::new(io::ErrorKind::ResourceBusy, "SQ ring full."))?;
         }
 
         Ok(0)
+    }
+
+    pub fn submit_and_wait_timeout(
+        &mut self,
+        num_to_wait: usize,
+        timeout: Option<Duration>,
+    ) -> io::Result<usize> {
+        let ring = self.get_ring_mut().get_mut();
+
+        // Sync user space and kernel shared queue
+        ring.submission().sync();
+
+        if let Some(duration) = timeout {
+            let ts = Timespec::from(duration);
+            let args = SubmitArgs::new().timespec(&ts);
+
+            return ring.submitter().submit_with_args(num_to_wait, &args);
+        }
+
+        ring.submitter().submit_and_wait(num_to_wait)
+    }
+
+    pub fn has_pending_cqes(&self) -> bool {
+        self.get_ring().has_pending_cqes()
+    }
+
+    pub fn process_cqes(&mut self, num_to_complete: Option<usize>) -> Result<usize> {
+        let mut num_completed = 0;
+
+        {
+            let slab = self.slab.get_mut().unwrap();
+            let cq = self.ring.get_mut().unwrap().completion();
+
+            // If `num_to_complete` is not provided, we complete as many CQEs as
+            // possible.
+            let q_iter = if let Some(n) = num_to_complete {
+                Either::Right(cq.into_iter().take(n))
+            } else {
+                Either::Left(cq.into_iter())
+            };
+
+            for cqe in q_iter {
+                let raw_sqe = match slab.get_mut(cqe.user_data() as usize) {
+                    Err(e) => {
+                        eprintln!("CQE user data not found in RawSqeSlab: {:?}", e);
+                        continue;
+                    }
+                    Ok(sqe) => sqe,
+                };
+
+                let head_to_wake = raw_sqe.on_completion(cqe.result())?;
+                num_completed += 1;
+
+                // We have to handle waking up the head outside the scope of RawSqe
+                // to get around Rust's double borrow rule on the slab.
+                if let Some(head) = head_to_wake {
+                    slab.get_mut(head)?.wake()?;
+                }
+            }
+        }
+
+        // Sync with kernel queue.
+        let mut cq = self.ring.get_mut().unwrap().completion();
+        cq.sync();
+
+        Ok(num_completed)
     }
 
     pub fn get_slab(&self) -> &RawSqeSlab {

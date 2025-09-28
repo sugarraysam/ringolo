@@ -1,8 +1,8 @@
 use anyhow::Result;
-use io_uring::squeue::Entry;
 use io_uring::{CompletionQueue, EnterFlags, IoUring, SubmissionQueue, types};
 use libc;
 use std::io;
+use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
 pub struct SingleIssuerRing {
@@ -24,28 +24,15 @@ impl SingleIssuerRing {
         Ok(SingleIssuerRing { ring })
     }
 
-    pub fn submit_and_wait_timeout(
-        &mut self,
-        num_to_wait: usize,
-        timeout: Option<Duration>,
-    ) -> anyhow::Result<usize> {
-        // Sync user space and kernel shared queue
-        self.submission().sync();
-
-        if let Some(duration) = timeout {
-            let ts = types::Timespec::from(duration);
-            let args = types::SubmitArgs::new().timespec(&ts);
-
-            return Ok(self.ring.submitter().submit_with_args(num_to_wait, &args)?);
-        }
-
-        Ok(self.ring.submitter().submit_and_wait(num_to_wait)?)
+    pub fn as_raw_fd(&self) -> RawFd {
+        self.ring.as_raw_fd()
     }
 
+    // TODO: write unit test does not seem to work
     // Because we set IORING_SQ_TASKRUN flag, we have a shortcut to check if
     // we have pending completions.
-    pub fn has_pending_completions(&mut self) -> bool {
-        self.ring.submission().taskrun()
+    pub fn has_pending_cqes(&self) -> bool {
+        unsafe { self.ring.submission_shared() }.taskrun()
     }
 
     pub fn wait_cqes_timeout(
@@ -84,7 +71,11 @@ impl SingleIssuerRing {
         self.ring.completion()
     }
 
-    pub fn as_mut(&mut self) -> &mut IoUring {
+    pub fn get(&self) -> &IoUring {
+        &self.ring
+    }
+
+    pub fn get_mut(&mut self) -> &mut IoUring {
         &mut self.ring
     }
 }
