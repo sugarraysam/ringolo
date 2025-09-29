@@ -119,9 +119,9 @@ mod tests {
             assert_eq!(waker_data.load(Ordering::Relaxed), 0);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.get_ring_mut().submission().len(), 1);
+                assert_eq!(ctx.ring.get_mut().submission().len(), 1);
 
-                let res = ctx.get_slab().get(idx).and_then(|sqe| {
+                let res = ctx.slab.get(idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());
                     assert!(sqe.has_waker());
                     Ok(())

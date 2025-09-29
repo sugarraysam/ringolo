@@ -1,4 +1,4 @@
-use crate::context::{with_context_mut, with_slab_mut};
+use crate::context::with_context_mut;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::Result;
 use io_uring::squeue::Entry;
@@ -18,8 +18,10 @@ pub struct SqeRingMessage {
 
 impl SqeRingMessage {
     pub fn try_new(entry: Entry) -> Result<Self> {
-        let idx = with_slab_mut(|slab| -> Result<usize> {
-            let (idx, _) = slab.insert(RawSqe::new(entry, CompletionHandler::RingMessage))?;
+        let idx = with_context_mut(|ctx| -> Result<usize> {
+            let (idx, _) = ctx
+                .slab
+                .insert(RawSqe::new(entry, CompletionHandler::RingMessage))?;
             Ok(idx)
         })?;
 
@@ -46,8 +48,8 @@ impl Completable for SqeRingMessage {
 // RAII: free RawSqe from slab.
 impl Drop for SqeRingMessage {
     fn drop(&mut self) {
-        with_slab_mut(|slab| {
-            if !slab.try_remove(self.idx) {
+        with_context_mut(|ctx| {
+            if !ctx.slab.try_remove(self.idx) {
                 eprintln!("Warning: SQE {} not found in slab during drop", self.idx);
             }
         });

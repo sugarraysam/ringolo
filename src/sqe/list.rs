@@ -1,7 +1,7 @@
 // TODO: remove this
 #![allow(dead_code)]
 
-use crate::context::{with_context_mut, with_slab_mut};
+use crate::context::with_context_mut;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::{Context, Result, anyhow};
 use io_uring::squeue::{Entry, Flags};
@@ -45,7 +45,7 @@ impl SqeList {
             .front()
             .with_context(|| anyhow!("Empty SQE list"))?;
 
-        with_slab_mut(|slab| slab.get_mut(*head).map(|sqe| sqe.set_waker(waker)))
+        with_context_mut(|ctx| ctx.slab.get_mut(*head).map(|sqe| sqe.set_waker(waker)))
     }
 
     fn is_ready(&self) -> bool {
@@ -73,10 +73,12 @@ impl Completable for SqeList {
             };
         }
 
-        let res = with_slab_mut(|slab| -> Self::Output {
+        let res = with_context_mut(|ctx| -> Self::Output {
             self.list
                 .iter()
-                .map(|idx| -> Result<(Entry, io::Result<i32>)> { slab.get_mut(*idx)?.get_result() })
+                .map(|idx| -> Result<(Entry, io::Result<i32>)> {
+                    ctx.slab.get_mut(*idx)?.get_result()
+                })
                 .collect::<Result<Vec<_>>>()
         });
 
@@ -87,9 +89,9 @@ impl Completable for SqeList {
 // RAII: walk the SqeList and free every RawSqe from slab.
 impl Drop for SqeList {
     fn drop(&mut self) {
-        with_slab_mut(|slab| {
+        with_context_mut(|ctx| {
             self.list.iter().for_each(|idx| {
-                if !slab.try_remove(*idx) {
+                if !ctx.slab.try_remove(*idx) {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);
                 }
             });
@@ -195,8 +197,8 @@ impl SqeListBuilder {
         let remaining = Rc::new(RefCell::new(n_sqes));
 
         let (head_idx, mut indices) =
-            with_slab_mut(|slab| -> Result<(usize, LinkedList<usize>)> {
-                let vacant = slab.vacant_entry()?;
+            with_context_mut(|ctx| -> Result<(usize, LinkedList<usize>)> {
+                let vacant = ctx.slab.vacant_entry()?;
                 let head_idx = vacant.key();
 
                 let handler = CompletionHandler::BatchOrChain {
@@ -212,7 +214,7 @@ impl SqeListBuilder {
 
                 let indices = entries
                     .map(|entry| {
-                        let (idx, _) = slab.insert(RawSqe::new(entry, handler.clone()))?;
+                        let (idx, _) = ctx.slab.insert(RawSqe::new(entry, handler.clone()))?;
                         Ok(idx)
                     })
                     .collect::<Result<LinkedList<_>>>()?;

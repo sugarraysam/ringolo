@@ -1,4 +1,4 @@
-use crate::context::{with_context_mut, with_slab_mut};
+use crate::context::with_context_mut;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::Result;
 use io_uring::squeue::Entry;
@@ -13,8 +13,10 @@ pub struct SqeSingle {
 
 impl SqeSingle {
     pub fn try_new(entry: Entry) -> Result<Self> {
-        let idx = with_slab_mut(|slab| -> Result<usize> {
-            let (idx, _) = slab.insert(RawSqe::new(entry, CompletionHandler::Single))?;
+        let idx = with_context_mut(|ctx| -> Result<usize> {
+            let (idx, _) = ctx
+                .slab
+                .insert(RawSqe::new(entry, CompletionHandler::Single))?;
             Ok(idx)
         })?;
 
@@ -36,8 +38,8 @@ impl Completable for SqeSingle {
     type Output = Result<(Entry, io::Result<i32>)>;
 
     fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output> {
-        with_slab_mut(|slab| -> Poll<Self::Output> {
-            let raw_sqe = match slab.get_mut(self.idx) {
+        with_context_mut(|ctx| -> Poll<Self::Output> {
+            let raw_sqe = match ctx.slab.get_mut(self.idx) {
                 Ok(sqe) => sqe,
                 Err(e) => return Poll::Ready(Err(e)),
             };
@@ -55,8 +57,8 @@ impl Completable for SqeSingle {
 // RAII: free RawSqe from slab.
 impl Drop for SqeSingle {
     fn drop(&mut self) {
-        with_slab_mut(|slab| {
-            if !slab.try_remove(self.idx) {
+        with_context_mut(|ctx| {
+            if !ctx.slab.try_remove(self.idx) {
                 eprintln!("Warning: SQE {} not found in slab during drop", self.idx);
             }
         });

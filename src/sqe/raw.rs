@@ -127,7 +127,7 @@ impl RawSqe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{init_context, with_slab_mut};
+    use crate::context::{init_context, with_context_mut};
     use crate::test_utils::mocks::mock_waker;
     use io_uring::opcode::Nop;
     use rstest::rstest;
@@ -209,8 +209,8 @@ mod tests {
         init_context(64);
         let remaining = Rc::new(RefCell::new(n_sqes));
 
-        let handler = with_slab_mut(|slab| -> Result<CompletionHandler> {
-            let vacant = slab.vacant_entry()?;
+        let handler = with_context_mut(|ctx| -> Result<CompletionHandler> {
+            let vacant = ctx.slab.vacant_entry()?;
             let head_idx = vacant.key();
 
             let handler = CompletionHandler::BatchOrChain {
