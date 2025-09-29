@@ -6,9 +6,8 @@ use std::io;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
-use crate::context::GlobalContext;
-use crate::context::ThreadId;
 use crate::context::ring::SingleIssuerRing;
+use crate::context::{GlobalContext, ThreadId};
 use crate::protocol::message::{MAX_MSG_COUNTER_VALUE, MSG_COUNTER_BITS, MsgId};
 
 pub struct LocalContext {
@@ -32,11 +31,6 @@ impl LocalContext {
         let ring_fd = ring.as_raw_fd();
 
         let thread_id = GlobalContext::instance().register_ring_fd(ring_fd)?;
-        dbg!(
-            "Registered ring_fd: {:?}, thread_id: {:?}",
-            ring_fd,
-            thread_id
-        );
 
         Ok(Self {
             thread_id,
@@ -154,5 +148,13 @@ impl LocalContext {
         let thread_id = (self.thread_id as i32) << MSG_COUNTER_BITS;
 
         MsgId::from(thread_id | prev_msg_counter)
+    }
+}
+
+impl Drop for LocalContext {
+    fn drop(&mut self) {
+        if let Err(e) = GlobalContext::instance().release_thread_id_and_ring_fd(self.thread_id) {
+            eprintln!("Failed to release thread_id: {:?}", e);
+        }
     }
 }
