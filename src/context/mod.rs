@@ -63,8 +63,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Result;
+    use std::collections::HashSet;
+    use std::os::fd::RawFd;
     use std::panic::catch_unwind;
-    use std::thread;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
 
     #[test]
     fn test_context_is_thread_local() {
@@ -140,39 +146,67 @@ mod tests {
         );
     }
 
+    struct ThreadData {
+        pub thread_ids: HashSet<ThreadId>,
+        pub ring_fds: HashSet<RawFd>,
+    }
+    impl ThreadData {
+        pub fn new() -> Self {
+            Self {
+                thread_ids: HashSet::new(),
+                ring_fds: HashSet::new(),
+            }
+        }
+    }
+
     #[test]
-    fn test_context_ring_fd_registration() {
-        const THREAD_A_RING_SIZE: usize = 64;
-        const THREAD_B_RING_SIZE: usize = 64;
+    fn test_context_ring_fd_registration() -> Result<()> {
+        let expected = 10;
+        let done = Arc::new(AtomicBool::new(false));
 
-        let mut thread_a_id = 0;
-        let mut thread_a_ring_fd = 0;
+        let data = Arc::new(Mutex::new(ThreadData::new()));
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-        init_context(THREAD_A_RING_SIZE);
-        with_context(|ctx| {
-            let ring_fd = GlobalContext::instance().get_ring_fd(ctx.thread_id);
-            assert!(ring_fd.is_ok());
-            assert_eq!(ring_fd.unwrap(), ctx.ring_fd);
+        // register N threads and guarantee uniqueness for both:
+        // - thread_ids
+        // - ring_fds
+        for _ in 0..expected {
+            let data_clone = Arc::clone(&data);
+            let done_clone = Arc::clone(&done);
 
-            thread_a_id = ctx.thread_id;
-            thread_a_ring_fd = ctx.ring_fd;
-        });
-
-        // register N threads and guarantee uniqueness
-        for _ in 0..20 {
             let handle = thread::spawn(move || {
-                init_context(THREAD_B_RING_SIZE);
-                with_context(|ctx| {
+                init_context(32);
+                let (thread_id, ring_fd) = with_context(|ctx| -> (ThreadId, RawFd) {
                     let ring_fd = GlobalContext::instance().get_ring_fd(ctx.thread_id);
                     assert!(ring_fd.is_ok());
                     assert_eq!(ring_fd.unwrap(), ctx.ring_fd);
 
-                    // Ensure uniqueness
-                    assert_ne!(thread_a_id, ctx.thread_id);
-                    assert_ne!(thread_a_ring_fd, ctx.ring_fd);
+                    (ctx.thread_id, ctx.ring_fd)
                 });
+
+                let mut data = data_clone.lock().unwrap();
+                assert!(data.thread_ids.insert(thread_id));
+                assert!(data.ring_fds.insert(ring_fd));
+
+                while !done_clone.load(Ordering::Relaxed) {
+                    thread::sleep(Duration::from_millis(10));
+                }
             });
+
+            handles.push(handle);
+        }
+
+        done.store(true, Ordering::Relaxed);
+
+        for handle in handles {
             assert!(handle.join().is_ok());
         }
+
+        let data = data.lock().unwrap();
+        assert_eq!(data.thread_ids.len(), expected);
+        assert_eq!(data.ring_fds.len(), expected);
+
+        // TODO: thread unregisters itself upon exit
+        Ok(())
     }
 }

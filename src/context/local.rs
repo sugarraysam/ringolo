@@ -9,6 +9,7 @@ use std::time::Duration;
 use crate::context::GlobalContext;
 use crate::context::ThreadId;
 use crate::context::ring::SingleIssuerRing;
+use crate::protocol::message::{MAX_MSG_COUNTER_VALUE, MSG_COUNTER_BITS, MsgId};
 
 pub struct LocalContext {
     // Global thread_id
@@ -20,6 +21,9 @@ pub struct LocalContext {
     // IoUring to submit and complete IO operations.
     pub ring_fd: RawFd,
     pub ring: SingleIssuerRing,
+
+    // TODO: add to mailbox
+    pub ring_msg_counter: u32,
 }
 
 impl LocalContext {
@@ -39,6 +43,7 @@ impl LocalContext {
             slab: RawSqeSlab::new(sq_ring_size),
             ring_fd: ring.as_raw_fd(),
             ring,
+            ring_msg_counter: 0,
         })
     }
 
@@ -130,5 +135,24 @@ impl LocalContext {
         cq.sync();
 
         Ok(num_completed)
+    }
+
+    // Each thread is responsible for generating MsgId to be used in the
+    // RingMessage protocol. The reasoning is we want to avoid collisions when
+    // storing MsgIds in the Mailbox. We achieve this goal by including the
+    // unique `thread_id` in the upper 8 bits of the MsgId.
+    pub fn next_ring_msg_id(&mut self) -> MsgId {
+        let prev_msg_counter = self.ring_msg_counter as i32;
+
+        // We have 10 bits for ring_msg_counter, so we need to wrap around and
+        // re-use previous ids when we reach the maximum.
+        self.ring_msg_counter += 1;
+        if self.ring_msg_counter >= MAX_MSG_COUNTER_VALUE {
+            self.ring_msg_counter = 0;
+        }
+
+        let thread_id = (self.thread_id as i32) << MSG_COUNTER_BITS;
+
+        MsgId::from(thread_id | prev_msg_counter)
     }
 }
