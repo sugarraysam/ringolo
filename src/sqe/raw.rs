@@ -1,8 +1,8 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use io_uring::squeue::Entry;
-use std::cell::RefCell;
 use std::io;
-use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::Waker;
 
 #[derive(Debug, Clone)]
@@ -12,12 +12,20 @@ pub enum CompletionHandler {
         // Waker only set on the head, so we store a pointer to the head SQE.
         head: usize,
 
-        // Reference counted pointer to track how many SQEs are still pending.
-        remaining: Rc<RefCell<usize>>,
+        // Reference counted counter to track how many SQEs are still pending.
+        remaining: Arc<AtomicUsize>,
     },
     RingMessage,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RawSqeState {
+    Available,
+    Pending,
+    Completed,
+}
+
+#[derive(Debug)]
 pub struct RawSqe {
     entry: Option<Entry>,
 
@@ -27,6 +35,8 @@ pub struct RawSqe {
     result: Option<io::Result<i32>>,
 
     waker: Option<Waker>,
+
+    state: RawSqeState,
 }
 
 impl RawSqe {
@@ -36,11 +46,24 @@ impl RawSqe {
             handler,
             result: None,
             waker: None,
+            state: RawSqeState::Available,
         }
     }
 
     pub fn get_entry(&self) -> Result<&Entry> {
         self.entry.as_ref().ok_or_else(|| anyhow!("Entry is None"))
+    }
+
+    pub fn set_available(&mut self) {
+        self.state = RawSqeState::Available;
+    }
+
+    pub fn get_state(&self) -> RawSqeState {
+        self.state
+    }
+
+    pub fn get_completion_handler(&self) -> &CompletionHandler {
+        &self.handler
     }
 
     pub fn has_waker(&self) -> bool {
@@ -65,6 +88,7 @@ impl RawSqe {
             .take()
             .with_context(|| anyhow!("Entry is None"))?;
 
+        self.state = RawSqeState::Pending;
         self.entry = Some(old.user_data(user_data));
 
         Ok(())
@@ -72,6 +96,8 @@ impl RawSqe {
 
     // Optionally returns a "head" to wake if we're working with BatchOrChain.
     pub fn on_completion(&mut self, res: i32) -> Result<Option<usize>> {
+        self.state = RawSqeState::Completed;
+
         self.result = if res >= 0 {
             Some(Ok(res))
         } else {
@@ -81,11 +107,8 @@ impl RawSqe {
         match &self.handler {
             CompletionHandler::Single => self.wake().map(|_| None),
             CompletionHandler::BatchOrChain { head, remaining } => {
-                let mut count = remaining.borrow_mut();
-                *count -= 1;
-
-                // We completed the last SQE in the batch/chain, wake the head.
-                if *count == 0 {
+                let count = remaining.fetch_sub(1, Ordering::Relaxed) - 1;
+                if count == 0 {
                     Ok(Some(*head))
                 } else {
                     Ok(None)
@@ -101,11 +124,13 @@ impl RawSqe {
         let entry = self.entry.take().context("No entry")?;
         let result = self.result.take().context("No result")?;
 
+        self.state = RawSqeState::Available;
+
         Ok((entry, result))
     }
 
     pub fn is_ready(&self) -> bool {
-        self.result.is_some()
+        self.result.is_some() && self.state == RawSqeState::Completed
     }
 
     pub fn wake(&mut self) -> Result<()> {
@@ -128,15 +153,14 @@ impl RawSqe {
 mod tests {
     use super::*;
     use crate::context::{init_context, with_context_mut};
-    use crate::test_utils::mocks::mock_waker;
-    use io_uring::opcode::Nop;
+    use crate::test_utils::*;
     use rstest::rstest;
     use std::io::{self, ErrorKind};
     use std::sync::atomic::Ordering;
 
     #[test]
     fn test_raw_sqe_set_waker_logic() -> Result<()> {
-        let mut sqe = RawSqe::new(Nop::new().build(), CompletionHandler::Single);
+        let mut sqe = RawSqe::new(nop(), CompletionHandler::Single);
 
         let (waker1, waker1_data) = mock_waker();
 
@@ -168,10 +192,7 @@ mod tests {
         init_context(64);
         let user_data = 42;
 
-        let mut sqe = RawSqe::new(
-            Nop::new().build().user_data(user_data),
-            CompletionHandler::Single,
-        );
+        let mut sqe = RawSqe::new(nop().user_data(user_data), CompletionHandler::Single);
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
@@ -207,7 +228,7 @@ mod tests {
         #[case] n_sqes: usize,
     ) -> Result<()> {
         init_context(64);
-        let remaining = Rc::new(RefCell::new(n_sqes));
+        let remaining = Arc::new(AtomicUsize::new(n_sqes));
 
         let handler = with_context_mut(|ctx| -> Result<CompletionHandler> {
             let vacant = ctx.slab.vacant_entry()?;
@@ -215,10 +236,10 @@ mod tests {
 
             let handler = CompletionHandler::BatchOrChain {
                 head: head_idx,
-                remaining: remaining.clone(),
+                remaining: Arc::clone(&remaining),
             };
 
-            let mut head = RawSqe::new(Nop::new().build(), handler.clone());
+            let mut head = RawSqe::new(nop(), handler.clone());
 
             // Not woken up yet, we have `n_sqes - 1` remaining
             assert!(head.on_completion(res)?.is_none());
@@ -228,12 +249,12 @@ mod tests {
             Ok(handler)
         })?;
 
-        while *remaining.borrow() > 0 {
-            let mut sqe = RawSqe::new(Nop::new().build(), handler.clone());
+        while remaining.load(Ordering::Relaxed) > 0 {
+            let mut sqe = RawSqe::new(nop(), handler.clone());
             let head_to_wake = sqe.on_completion(res)?;
 
             // Last SQE to complete triggers completion
-            if *remaining.borrow() == 0 {
+            if remaining.load(Ordering::Relaxed) == 0 {
                 assert!(head_to_wake.is_some());
             } else {
                 assert!(head_to_wake.is_none());
@@ -241,5 +262,36 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_raw_sqe_lifecycle() -> Result<()> {
+        init_context(64);
+
+        let raw_sqe = RawSqe::new(nop(), CompletionHandler::Single);
+        assert_eq!(raw_sqe.get_state(), RawSqeState::Available);
+
+        with_context_mut(|ctx| -> Result<()> {
+            let (waker, waker_data) = mock_waker();
+
+            let idx = ctx.slab.insert(raw_sqe).map(|(idx, inserted)| {
+                assert_eq!(inserted.get_state(), RawSqeState::Pending);
+                inserted.set_waker(&waker);
+
+                assert!(inserted.on_completion(0).is_ok());
+                assert_eq!(inserted.get_state(), RawSqeState::Completed);
+
+                assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+
+                idx
+            })?;
+
+            let removed = ctx.slab.try_remove(idx);
+            assert!(removed
+                .map(|sqe| assert_eq!(sqe.get_state(), RawSqeState::Available))
+                .is_some());
+
+            Ok(())
+        })
     }
 }

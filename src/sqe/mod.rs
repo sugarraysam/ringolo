@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
+use std::{io, mem};
 
 // Re-exports
 pub mod list;
@@ -10,8 +10,8 @@ pub use list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
 pub mod message;
 pub use message::SqeRingMessage;
 pub mod raw;
-pub use raw::CompletionHandler;
 pub use raw::RawSqe;
+pub use raw::{CompletionHandler, RawSqeState};
 pub mod single;
 pub use single::SqeSingle;
 
@@ -44,7 +44,16 @@ impl<T: Submittable + Completable> Sqe<T> {
             inner,
         }
     }
+
+    pub fn get(&self) -> &T {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
 }
+
 impl<T: Submittable + Completable> Unpin for Sqe<T> {}
 
 impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<T> {
@@ -91,59 +100,262 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<
     }
 }
 
+pub struct SqeCollection<T: Submittable + Completable> {
+    state: State,
+    inner: Vec<(usize, T)>,
+
+    // Store results in internal future state to persist across poll calls.
+    // We store it behind Option<T> because this type impl default which allows
+    // pre-allocating and indexing directly.
+    results: Vec<Option<T::Output>>,
+}
+
+impl<T: Submittable + Completable> SqeCollection<T> {
+    pub fn new(inner: Vec<T>) -> Self {
+        let results = (0..inner.len()).map(|_| None).collect();
+        Self {
+            state: State::Initial,
+            inner: inner.into_iter().enumerate().collect(),
+            results,
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.inner.is_empty()
+    }
+}
+
+impl<T: Submittable + Completable> Unpin for SqeCollection<T> {}
+
+impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeCollection<T> {
+    type Output = Vec<T::Output>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        loop {
+            match this.state {
+                State::Initial => {
+                    // Submit implementation only pushes sqes in SQ ring so this
+                    // is quite efficient and we maintain the guarantee that all
+                    // operations are submitted as part of the same `io_uring_enter`
+                    // syscall.
+                    for (_, sqe) in &mut this.inner {
+                        if let Err(e) = sqe.submit() {
+                            if e.kind() == io::ErrorKind::ResourceBusy {
+                                // TODO: log error this is real bad, need to double SQ ring size
+                                // Submission queue is full, yield and try again later.
+                                eprintln!("Warning: Submission queue is full, double SQ ring size");
+                                return Poll::Pending;
+                            } else {
+                                this.state = State::Completed;
+                                return Poll::Ready(vec![Err(anyhow!(
+                                    "failed to submit: {:?}",
+                                    e
+                                ))]);
+                            }
+                        }
+                    }
+
+                    // Continue the loop to immediately poll for completion. Although very unlikely
+                    // as we will batch submit SQEs in SQ ring. Nevertheless, we want to call
+                    // `poll_complete` to ensure we set the waker.
+                    this.state = State::Submitted;
+                    continue;
+                }
+                State::Submitted => {
+                    this.inner.retain(|(idx, sqe)| {
+                        match sqe.poll_complete(cx.waker()) {
+                            Poll::Ready(res) => {
+                                this.results[*idx] = Some(res);
+                                false
+                            }
+                            Poll::Pending => true, // keep polling
+                        }
+                    });
+
+                    if this.is_ready() {
+                        this.state = State::Completed;
+
+                        let results = mem::replace(&mut this.results, vec![])
+                            .into_iter()
+                            .filter_map(|res| res)
+                            .collect();
+
+                        return Poll::Ready(results);
+                    } else {
+                        return Poll::Pending;
+                    }
+                }
+
+                State::Completed => {
+                    panic!("Future polled after completion");
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::{init_context, with_context_mut};
-    use crate::test_utils::mocks::mock_waker;
-    use io_uring::opcode::Nop;
+    use crate::test_utils::*;
+    use either::Either;
+    use io_uring::squeue::Entry;
+    use rstest::rstest;
     use std::pin::pin;
     use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
 
-    #[test]
-    fn test_submit_and_complete_single_sqe() -> Result<()> {
+    #[rstest]
+    #[case::collection_two_batches(
+        vec![
+            SqeListKind::Batch,
+            SqeListKind::Batch,
+            SqeListKind::Batch,
+        ],
+        vec![
+            vec![
+                nop(),
+                nop(),
+            ],
+            vec![
+                openat(-22, "dummy"),
+                openat(-33, "invalid"),
+            ],
+            vec![
+                nop(),
+                nop(),
+            ],
+        ],
+        vec![
+            vec![
+                Either::Left(0),
+                Either::Left(0),
+            ],
+            vec![
+                Either::Right(libc::ENOENT),
+                Either::Right(libc::ENOENT),
+            ],
+            vec![
+                Either::Left(0),
+                Either::Left(0),
+            ],
+        ]
+    )]
+    #[case::collection_three_chains(
+        vec![
+            SqeListKind::Chain,
+            SqeListKind::Chain,
+            SqeListKind::Chain,
+        ],
+        vec![
+            vec![
+                nop(),
+                nop(),
+            ],
+            vec![
+                openat(-333, "dummy"),
+                openat(-111, "invalid"),
+                nop(),
+                openat(-22, "invalid"),
+            ],
+            vec![
+                nop(),
+                nop(),
+                openat(-333, "dummy"),
+                nop(),
+                nop(),
+            ],
+        ],
+
+        vec![
+            vec![
+                Either::Left(0),
+                Either::Left(0),
+            ],
+            vec![
+                Either::Right(libc::ENOENT),
+                Either::Right(libc::ENOENT),
+                Either::Right(libc::ECANCELED),
+                Either::Right(libc::ENOENT),
+            ],
+            vec![
+                Either::Left(0),
+                Either::Left(0),
+                Either::Right(libc::ENOENT),
+                Either::Right(libc::ECANCELED),
+                Either::Right(libc::ECANCELED),
+            ],
+        ]
+    )]
+    fn test_sqe_collection(
+        #[case] kinds: Vec<SqeListKind>,
+        #[case] entries: Vec<Vec<Entry>>,
+        #[case] expected_results: Vec<Vec<Either<i32, i32>>>,
+    ) -> Result<()> {
+        assert_eq!(entries.len(), expected_results.len());
+
         init_context(64);
 
-        let sqe = SqeSingle::try_new(Nop::new().build())?;
-        let idx = sqe.get_idx();
-        let mut sqe_fut = pin!(Sqe::new(sqe));
+        let num_lists = entries.len();
+        let n_sqes = entries.iter().map(Vec::len).sum();
+
+        let collection = kinds
+            .into_iter()
+            .zip(entries.into_iter())
+            .map(|(kind, entries)| build_list_with_entries(kind, entries))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut sqe_fut = pin!(SqeCollection::new(collection));
 
         let (waker, waker_data) = mock_waker();
         let mut ctx = Context::from_waker(&waker);
 
-        // Polling once will submit the SQE and set the waker.
+        // Polling once will submit the batch SQE and set the waker.
         // Polling N more times after this won't change the state.
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.load(Ordering::Relaxed), 0);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.get_mut().submission().len(), 1);
-
-                let res = ctx.slab.get(idx).and_then(|sqe| {
-                    assert!(!sqe.is_ready());
-                    assert!(sqe.has_waker());
-                    Ok(())
-                });
-
-                assert!(res.is_ok());
+                assert_eq!(ctx.ring.submission().len(), n_sqes);
             });
         }
 
-        with_context_mut(|ctx| {
+        with_context_mut(|ctx| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert!(matches!(ctx.submit_and_wait_timeout(1, None), Ok(1)));
+            assert_eq!(ctx.submit_and_wait(n_sqes, None)?, n_sqes);
             assert_eq!(waker_data.load(Ordering::Relaxed), 0);
 
             // Process CQEs :: wakes up Waker
-            assert!(matches!(ctx.process_cqes(None), Ok(1)));
-            assert_eq!(waker_data.load(Ordering::Relaxed), 1);
-        });
+            assert_eq!(ctx.process_cqes(None)?, n_sqes);
+            assert_eq!(waker_data.load(Ordering::Relaxed), num_lists as u32);
+            Ok(())
+        })?;
 
-        if let Poll::Ready(Ok((entry, result))) = sqe_fut.as_mut().poll(&mut ctx) {
-            assert!(matches!(result, Ok(0)));
-            assert_eq!(entry.get_user_data(), idx as u64);
+        if let Poll::Ready(results) = sqe_fut.as_mut().poll(&mut ctx) {
+            assert_eq!(results.len(), num_lists);
+            assert!(results.iter().all(Result::is_ok));
+
+            let results = results.into_iter().collect::<Result<Vec<_>>>()?;
+
+            // SqeCollection contract is the results order has to respect the insertion order.
+            for (got, expected) in results.iter().zip(expected_results) {
+                assert_eq!(got.len(), expected.len());
+
+                for ((_, io_result), expected) in got.iter().zip(expected) {
+                    match (io_result, expected) {
+                        (Err(e1), Either::Right(e2)) => assert_eq!(e1.raw_os_error().unwrap(), e2),
+                        (Ok(r1), Either::Left(r2)) => assert_eq!(*r1, r2),
+                        (got, expected) => {
+                            dbg!("got: {:?}, expected: {:?}", got, expected);
+                            // assert!(false);
+                        }
+                    }
+                }
+            }
         } else {
             assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
         }

@@ -49,7 +49,7 @@ impl Completable for SqeRingMessage {
 impl Drop for SqeRingMessage {
     fn drop(&mut self) {
         with_context_mut(|ctx| {
-            if !ctx.slab.try_remove(self.idx) {
+            if ctx.slab.try_remove(self.idx).is_none() {
                 eprintln!("Warning: SQE {} not found in slab during drop", self.idx);
             }
         });

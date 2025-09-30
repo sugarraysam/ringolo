@@ -45,8 +45,11 @@ impl RawSqeSlab {
     }
 
     // Removes and drop the entry if it exists. Returns true if an entry was dropped.
-    pub fn try_remove(&mut self, key: usize) -> bool {
-        self.slab.try_remove(key).is_some()
+    pub fn try_remove(&mut self, key: usize) -> Option<RawSqe> {
+        self.slab.try_remove(key).map(|mut sqe| {
+            sqe.set_available();
+            sqe
+        })
     }
 
     pub fn len(&self) -> usize {
@@ -62,7 +65,7 @@ impl RawSqeSlab {
 mod tests {
     use super::*;
     use crate::sqe::raw::CompletionHandler;
-    use io_uring::opcode::Nop;
+    use crate::test_utils::*;
 
     #[test]
     fn test_new_and_capacity() {
@@ -78,7 +81,7 @@ mod tests {
         let mut slab = RawSqeSlab::new(n_sqes);
 
         for i in 1..=n_sqes {
-            let sqe = RawSqe::new(Nop::new().build(), CompletionHandler::Single);
+            let sqe = RawSqe::new(nop(), CompletionHandler::Single);
 
             let (key, inserted) = slab.insert(sqe)?;
 
@@ -97,7 +100,7 @@ mod tests {
         let mut slab = RawSqeSlab::new(n_sqes - 1);
 
         for i in 1..=n_sqes {
-            let res = slab.insert(RawSqe::new(Nop::new().build(), CompletionHandler::Single));
+            let res = slab.insert(RawSqe::new(nop(), CompletionHandler::Single));
             if i == n_sqes {
                 assert!(res.is_err());
             } else {

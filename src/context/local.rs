@@ -1,7 +1,6 @@
 use crate::context::RawSqeSlab;
+use crate::sqe::raw::RawSqeState;
 use anyhow::Result;
-use either::Either;
-use io_uring::types::{SubmitArgs, Timespec};
 use std::io;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
@@ -50,7 +49,7 @@ impl LocalContext {
     ) -> io::Result<i32> {
         // Need to manually access the fields to avoid immutable vs. mutable
         // borrow issues or double borrow problem.
-        let mut sq = self.ring.get_mut().submission();
+        let mut sq = self.ring.submission();
 
         for idx in indices {
             let entry = self
@@ -66,51 +65,51 @@ impl LocalContext {
         Ok(0)
     }
 
-    pub fn submit_and_wait_timeout(
+    pub fn submit_and_wait(
         &mut self,
         num_to_wait: usize,
         timeout: Option<Duration>,
     ) -> io::Result<usize> {
-        let ring = self.ring.get_mut();
+        self.ring.submit_and_wait(num_to_wait, timeout)
+    }
 
-        // Sync user space and kernel shared queue
-        ring.submission().sync();
-
-        if let Some(duration) = timeout {
-            let ts = Timespec::from(duration);
-            let args = SubmitArgs::new().timespec(&ts);
-
-            return ring.submitter().submit_with_args(num_to_wait, &args);
-        }
-
-        ring.submitter().submit_and_wait(num_to_wait)
+    pub fn submit_no_wait(&mut self) -> io::Result<usize> {
+        self.ring.submit_no_wait()
     }
 
     pub fn has_pending_cqes(&self) -> bool {
         self.ring.has_pending_cqes()
     }
 
+    // Will busy loop until `num_to_complete` has been achieved. It is the caller's
+    // responsibility to make sure the CQ will see that many completions, otherwise
+    // this will result in an infinite loop.
     pub fn process_cqes(&mut self, num_to_complete: Option<usize>) -> Result<usize> {
         let mut num_completed = 0;
+        let to_complete = num_to_complete.unwrap_or(self.ring.completion().len());
 
-        {
-            let cq = self.ring.get_mut().completion();
+        let mut should_sync = false;
 
-            // If `num_to_complete` is not provided, we complete as many CQEs as
-            // possible.
-            let q_iter = if let Some(n) = num_to_complete {
-                Either::Right(cq.into_iter().take(n))
-            } else {
-                Either::Left(cq.into_iter())
-            };
+        while num_completed < to_complete {
+            // Avoid syncing on first pass
+            if should_sync {
+                self.ring.completion().sync();
+            }
 
-            for cqe in q_iter {
+            for cqe in self.ring.completion() {
                 let raw_sqe = match self.slab.get_mut(cqe.user_data() as usize) {
                     Err(e) => {
                         eprintln!("CQE user data not found in RawSqeSlab: {:?}", e);
                         continue;
                     }
-                    Ok(sqe) => sqe,
+                    Ok(sqe) => {
+                        // Ignore unknown CQEs which might have valid index in
+                        // the Slab. Can this even happen?
+                        if sqe.get_state() != RawSqeState::Pending {
+                            continue;
+                        }
+                        sqe
+                    }
                 };
 
                 let head_to_wake = raw_sqe.on_completion(cqe.result())?;
@@ -122,11 +121,10 @@ impl LocalContext {
                     self.slab.get_mut(head)?.wake()?;
                 }
             }
-        }
 
-        // Sync with kernel queue.
-        let mut cq = self.ring.get_mut().completion();
-        cq.sync();
+            // Do not sync on first pass
+            should_sync = true;
+        }
 
         Ok(num_completed)
     }

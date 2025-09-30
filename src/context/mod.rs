@@ -80,20 +80,14 @@ mod tests {
         init_context(THREAD_A_RING_SIZE);
         with_context_mut(|ctx| {
             assert_eq!(ctx.slab.capacity(), THREAD_A_RING_SIZE);
-            assert_eq!(
-                ctx.ring.get_mut().submission().capacity(),
-                THREAD_A_RING_SIZE
-            );
+            assert_eq!(ctx.ring.submission().capacity(), THREAD_A_RING_SIZE);
         });
 
         let handle = thread::spawn(move || {
             init_context(THREAD_B_RING_SIZE);
             with_context_mut(|ctx| {
                 assert_eq!(ctx.slab.capacity(), THREAD_B_RING_SIZE);
-                assert_eq!(
-                    ctx.ring.get_mut().submission().capacity(),
-                    THREAD_B_RING_SIZE
-                );
+                assert_eq!(ctx.ring.submission().capacity(), THREAD_B_RING_SIZE);
             });
         });
 
@@ -101,10 +95,7 @@ mod tests {
 
         with_context_mut(|ctx| {
             assert_eq!(ctx.slab.capacity(), THREAD_A_RING_SIZE);
-            assert_eq!(
-                ctx.ring.get_mut().submission().capacity(),
-                THREAD_A_RING_SIZE
-            );
+            assert_eq!(ctx.ring.submission().capacity(), THREAD_A_RING_SIZE);
         });
     }
 
