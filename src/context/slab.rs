@@ -81,7 +81,7 @@ mod tests {
         let mut slab = RawSqeSlab::new(n_sqes);
 
         for i in 1..=n_sqes {
-            let sqe = RawSqe::new(nop(), CompletionHandler::Single);
+            let sqe = RawSqe::new(nop(), CompletionHandler::new_single());
 
             let (key, inserted) = slab.insert(sqe)?;
 
@@ -100,7 +100,7 @@ mod tests {
         let mut slab = RawSqeSlab::new(n_sqes - 1);
 
         for i in 1..=n_sqes {
-            let res = slab.insert(RawSqe::new(nop(), CompletionHandler::Single));
+            let res = slab.insert(RawSqe::new(nop(), CompletionHandler::new_single()));
             if i == n_sqes {
                 assert!(res.is_err());
             } else {

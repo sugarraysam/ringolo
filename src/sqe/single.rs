@@ -16,7 +16,7 @@ impl SqeSingle {
         let idx = with_context_mut(|ctx| -> Result<usize> {
             let (idx, _) = ctx
                 .slab
-                .insert(RawSqe::new(entry, CompletionHandler::Single))?;
+                .insert(RawSqe::new(entry, CompletionHandler::new_single()))?;
             Ok(idx)
         })?;
 
@@ -45,7 +45,7 @@ impl Completable for SqeSingle {
             };
 
             if raw_sqe.is_ready() {
-                Poll::Ready(raw_sqe.get_result())
+                Poll::Ready(raw_sqe.take_final_result())
             } else {
                 raw_sqe.set_waker(waker);
                 Poll::Pending

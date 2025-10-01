@@ -1,5 +1,5 @@
 use crate::context::RawSqeSlab;
-use crate::sqe::raw::RawSqeState;
+use crate::sqe::{CompletionEffect, RawSqeState};
 use anyhow::Result;
 use std::io;
 use std::os::unix::io::RawFd;
@@ -105,24 +105,27 @@ impl LocalContext {
                     Ok(sqe) => {
                         // Ignore unknown CQEs which might have valid index in
                         // the Slab. Can this even happen?
-                        if sqe.get_state() != RawSqeState::Pending {
+                        if !matches!(sqe.get_state(), RawSqeState::Pending | RawSqeState::Ready) {
                             continue;
                         }
                         sqe
                     }
                 };
 
-                let head_to_wake = raw_sqe.on_completion(cqe.result())?;
+                let cqe_flags = match cqe.flags() {
+                    0 => None,
+                    flags => Some(flags),
+                };
+
                 num_completed += 1;
 
-                // We have to handle waking up the head outside the scope of RawSqe
-                // to get around Rust's double borrow rule on the slab.
-                if let Some(head) = head_to_wake {
+                if let CompletionEffect::WakeHead { head } =
+                    raw_sqe.on_completion(cqe.result(), cqe_flags)?
+                {
                     self.slab.get_mut(head)?.wake()?;
                 }
             }
 
-            // Do not sync on first pass
             should_sync = true;
         }
 

@@ -21,7 +21,7 @@ impl SqeRingMessage {
         let idx = with_context_mut(|ctx| -> Result<usize> {
             let (idx, _) = ctx
                 .slab
-                .insert(RawSqe::new(entry, CompletionHandler::RingMessage))?;
+                .insert(RawSqe::new(entry, CompletionHandler::new_message()))?;
             Ok(idx)
         })?;
 

@@ -11,9 +11,11 @@ pub mod message;
 pub use message::SqeRingMessage;
 pub mod raw;
 pub use raw::RawSqe;
-pub use raw::{CompletionHandler, RawSqeState};
+pub use raw::{CompletionEffect, CompletionHandler, RawSqeState};
 pub mod single;
 pub use single::SqeSingle;
+pub mod stream;
+pub use stream::{SqeStream, SqeStreamError};
 
 pub trait Submittable {
     fn submit(&self) -> io::Result<i32>;
@@ -69,6 +71,8 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<
                         if e.kind() == io::ErrorKind::ResourceBusy {
                             // TODO: log error this is real bad, need to double SQ ring size
                             // Submission queue is full, yield and try again later.
+                            //
+                            // TODO BUG: will never be woken up?
                             eprintln!("Warning: Submission queue is full, double SQ ring size");
                             return Poll::Pending;
                         } else {

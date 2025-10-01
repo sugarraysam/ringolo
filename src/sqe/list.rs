@@ -85,7 +85,7 @@ impl Completable for SqeList {
             self.list
                 .iter()
                 .map(|idx| -> Result<(Entry, io::Result<i32>)> {
-                    ctx.slab.get_mut(*idx)?.get_result()
+                    ctx.slab.get_mut(*idx)?.take_final_result()
                 })
                 .collect::<Result<Vec<_>>>()
         });
@@ -238,21 +238,19 @@ impl SqeListBuilder {
             let vacant = ctx.slab.vacant_entry()?;
             indices.push(vacant.key());
 
-            let handler = CompletionHandler::BatchOrChain {
-                head: indices[0],
-                remaining: Arc::clone(&remaining),
-            };
-
             let mut head = RawSqe::new(
                 // SAFETY: self.list.len() >= 2.
                 entries.next().unwrap(),
-                handler.clone(),
+                CompletionHandler::new_batch_or_chain(indices[0], Arc::clone(&remaining)),
             );
             head.set_user_data(indices[0] as u64)?;
             _ = vacant.insert(head);
 
             for entry in entries {
-                let (idx, _) = ctx.slab.insert(RawSqe::new(entry, handler.clone()))?;
+                let (idx, _) = ctx.slab.insert(RawSqe::new(
+                    entry,
+                    CompletionHandler::new_batch_or_chain(indices[0], Arc::clone(&remaining)),
+                ))?;
                 indices.push(idx);
             }
 
@@ -296,8 +294,10 @@ mod tests {
                 let sqe = ctx.slab.get(*idx)?;
                 assert_eq!(sqe.get_state(), RawSqeState::Pending);
 
-                match sqe.get_completion_handler() {
-                    CompletionHandler::BatchOrChain { head, remaining } => {
+                match &sqe.handler {
+                    CompletionHandler::BatchOrChain {
+                        head, remaining, ..
+                    } => {
                         assert_eq!(remaining.load(Ordering::Relaxed), list.len());
                         if sqe.has_waker() {
                             assert_eq!(*idx, *head, "sqe with waker should be head node");
