@@ -1,0 +1,116 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
+use crate::task::RawTask;
+use crate::task::{Header, Schedule};
+use std::fmt;
+use std::marker::PhantomData;
+use std::mem;
+use std::ptr::NonNull;
+
+/// An owned handle to the task, tracked by ref count.
+#[repr(transparent)]
+pub(crate) struct Task<S: 'static> {
+    raw: RawTask,
+    _p: PhantomData<S>,
+}
+
+unsafe impl<S> Send for Task<S> {}
+unsafe impl<S> Sync for Task<S> {}
+
+impl<S: 'static> Task<S> {
+    pub(super) fn new(raw: RawTask) -> Task<S> {
+        Task {
+            raw,
+            _p: PhantomData,
+        }
+    }
+
+    pub(super) unsafe fn from_raw(ptr: NonNull<Header>) -> Task<S> {
+        Task::new(RawTask::from_raw(ptr))
+    }
+
+    pub(super) fn as_raw(&self) -> RawTask {
+        self.raw
+    }
+
+    fn header(&self) -> &Header {
+        self.raw.header()
+    }
+
+    fn header_ptr(&self) -> NonNull<Header> {
+        self.raw.header_ptr()
+    }
+
+    /// Returns a [task ID] that uniquely identifies this task relative to other
+    /// currently spawned tasks.
+    ///
+    /// [task ID]: crate::task::Id
+    pub(crate) fn id(&self) -> crate::task::Id {
+        // Safety: The header pointer is valid.
+        unsafe { Header::get_id(self.raw.header_ptr()) }
+    }
+}
+
+impl<S: Schedule> Task<S> {
+    /// Preemptively cancels the task as part of the shutdown process.
+    pub(crate) fn shutdown(self) {
+        let raw = self.raw;
+        mem::forget(self);
+        raw.shutdown();
+    }
+}
+
+impl<S: 'static> Drop for Task<S> {
+    fn drop(&mut self) {
+        // Decrement the ref count
+        if self.header().state.ref_dec() {
+            // Deallocate if this is the final ref count
+            self.raw.dealloc();
+        }
+    }
+}
+
+impl<S> fmt::Debug for Task<S> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(fmt, "Task({:p})", self.header())
+    }
+}
+
+/// A task was notified.
+#[repr(transparent)]
+pub(crate) struct Notified<S: 'static>(Task<S>);
+
+// safety: This type cannot be used to touch the task without first verifying
+// that the value is on a thread where it is safe to poll the task.
+unsafe impl<S: Schedule> Send for Notified<S> {}
+unsafe impl<S: Schedule> Sync for Notified<S> {}
+
+impl<S: 'static> Notified<S> {
+    pub(super) fn new(task: Task<S>) -> Notified<S> {
+        Notified(task)
+    }
+
+    pub(crate) unsafe fn from_raw(ptr: RawTask) -> Notified<S> {
+        Notified(Task::new(ptr))
+    }
+
+    pub(crate) fn into_raw(self) -> RawTask {
+        let raw = self.0.raw;
+        mem::forget(self);
+        raw
+    }
+
+    fn header(&self) -> &Header {
+        self.0.header()
+    }
+
+    pub(crate) fn task_id(&self) -> crate::task::Id {
+        self.0.id()
+    }
+}
+
+impl<S> fmt::Debug for Notified<S> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(fmt, "task::Notified({:p})", self.0.header())
+    }
+}

@@ -18,12 +18,16 @@ pub mod stream;
 pub use stream::{SqeStream, SqeStreamError};
 
 pub trait Submittable {
-    fn submit(&self) -> io::Result<i32>;
+    /// We pas the waker so we get access to the RawTask Header.
+    fn submit(&self, waker: &Waker) -> io::Result<i32>;
 }
 
 pub trait Completable {
     type Output;
 
+    /// We pas the waker so we get access to the RawTask Header but also because
+    /// implementation of completable needs to guarantee the associated task will
+    /// be woken up in the future.
     fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output>;
 }
 
@@ -67,7 +71,7 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<
         loop {
             match this.state {
                 State::Initial => {
-                    if let Err(e) = this.inner.submit() {
+                    if let Err(e) = this.inner.submit(cx.waker()) {
                         if e.kind() == io::ErrorKind::ResourceBusy {
                             // TODO: log error this is real bad, need to double SQ ring size
                             // Submission queue is full, yield and try again later.
@@ -145,7 +149,7 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeC
                     // operations are submitted as part of the same `io_uring_enter`
                     // syscall.
                     for (_, sqe) in &mut this.inner {
-                        if let Err(e) = sqe.submit() {
+                        if let Err(e) = sqe.submit(cx.waker()) {
                             if e.kind() == io::ErrorKind::ResourceBusy {
                                 // TODO: log error this is real bad, need to double SQ ring size
                                 // Submission queue is full, yield and try again later.
@@ -209,7 +213,6 @@ mod tests {
     use io_uring::squeue::Entry;
     use rstest::rstest;
     use std::pin::pin;
-    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
 
     #[rstest]
@@ -321,7 +324,8 @@ mod tests {
         // Polling N more times after this won't change the state.
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
-            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+            assert_eq!(waker_data.get_count(), 0);
+            assert_eq!(waker_data.get_pending_io(), num_lists as i32);
 
             with_context_mut(|ctx| {
                 assert_eq!(ctx.ring.submission().len(), n_sqes);
@@ -331,11 +335,12 @@ mod tests {
         with_context_mut(|ctx| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
             assert_eq!(ctx.submit_and_wait(n_sqes, None)?, n_sqes);
-            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+            assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
             assert_eq!(ctx.process_cqes(None)?, n_sqes);
-            assert_eq!(waker_data.load(Ordering::Relaxed), num_lists as u32);
+            assert_eq!(waker_data.get_count(), num_lists as u32);
+            assert_eq!(waker_data.get_pending_io(), 0);
             Ok(())
         })?;
 

@@ -1,8 +1,10 @@
 use crate::context::with_context_mut;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
+use crate::task::Header;
 use anyhow::Result;
 use io_uring::squeue::Entry;
 use std::io;
+use std::ptr::NonNull;
 use std::task::{Poll, Waker};
 
 // TODO: this is largely unusable as of now, need to re-implement the protocol
@@ -31,7 +33,11 @@ impl SqeRingMessage {
 
 impl Submittable for SqeRingMessage {
     // TODO: impl ACK + mailbox
-    fn submit(&self) -> io::Result<i32> {
+    fn submit(&self, waker: &Waker) -> io::Result<i32> {
+        unsafe {
+            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+            Header::increment_pending_io(ptr);
+        }
         with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
     }
 }

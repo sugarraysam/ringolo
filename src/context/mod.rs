@@ -1,29 +1,30 @@
+use crate::task::Id;
 use slab::RawSqeSlab;
 use std::cell::{OnceCell, RefCell};
 use std::thread_local;
 
 // Exports
-pub mod global;
-pub use global::GlobalContext;
+mod global;
+pub(crate) use global::GlobalContext;
 
-pub mod local;
-use local::LocalContext;
+mod local;
+pub(crate) use local::LocalContext;
 
-pub mod ring;
-pub mod slab;
+mod ring;
+mod slab;
 
 // Why are we limiting ourselves to 255 threads in our program? The reason is
 // this is a constrait of the RingMessage protocol. We have very limited space
 // to encode information in our messages, and we need to fit our header in 32
 // bits.
-pub type ThreadId = u8;
+pub(crate) type ThreadId = u8;
 
 thread_local! {
     static CONTEXT: OnceCell<RefCell<LocalContext>> = OnceCell::new();
 }
 
 // Lazily initialize LocalContext /w custom args.
-pub fn init_context(sq_ring_size: usize) {
+pub(crate) fn init_context(sq_ring_size: usize) {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
             RefCell::new(
@@ -36,7 +37,7 @@ pub fn init_context(sq_ring_size: usize) {
 
 // Warning: all of the `with_*` functions are not re-entrant. Do not nest calls.
 #[inline]
-pub fn with_context<F, R>(f: F) -> R
+pub(crate) fn with_context<F, R>(f: F) -> R
 where
     F: FnOnce(&LocalContext) -> R,
 {
@@ -47,7 +48,7 @@ where
 }
 
 #[inline]
-pub fn with_context_mut<F, R>(f: F) -> R
+pub(crate) fn with_context_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut LocalContext) -> R,
 {
@@ -58,6 +59,16 @@ where
             .borrow_mut();
         f(&mut ctx)
     })
+}
+
+#[inline]
+pub(crate) fn current_task_id() -> Option<Id> {
+    with_context(|ctx| ctx.current_task_id)
+}
+
+#[inline]
+pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
+    with_context_mut(|ctx| ctx.set_current_task_id(id))
 }
 
 #[cfg(test)]

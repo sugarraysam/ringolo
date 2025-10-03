@@ -1,7 +1,9 @@
 use crate::context::RawSqeSlab;
 use crate::sqe::{CompletionEffect, RawSqeState};
+use crate::task::Id;
 use anyhow::Result;
 use std::io;
+use std::mem;
 use std::os::unix::io::RawFd;
 use std::time::Duration;
 
@@ -9,7 +11,7 @@ use crate::context::ring::SingleIssuerRing;
 use crate::context::{GlobalContext, ThreadId};
 use crate::protocol::message::{MAX_MSG_COUNTER_VALUE, MSG_COUNTER_BITS, MsgId};
 
-pub struct LocalContext {
+pub(crate) struct LocalContext {
     // Global thread_id
     pub thread_id: ThreadId,
 
@@ -22,10 +24,13 @@ pub struct LocalContext {
 
     // TODO: add to mailbox
     pub ring_msg_counter: u32,
+
+    // Task that is currently executing on this thread.
+    pub current_task_id: Option<Id>,
 }
 
 impl LocalContext {
-    pub fn try_new(sq_ring_size: usize) -> Result<Self> {
+    pub(super) fn try_new(sq_ring_size: usize) -> Result<Self> {
         let ring = SingleIssuerRing::try_new(sq_ring_size as u32)?;
         let ring_fd = ring.as_raw_fd();
 
@@ -37,13 +42,14 @@ impl LocalContext {
             ring_fd: ring.as_raw_fd(),
             ring,
             ring_msg_counter: 0,
+            current_task_id: None,
         })
     }
 
     // Queues SQEs in the SQ ring, fetching them from the slab using the provided
     // indices. To submit the SQEs to the kernel, we need to call `q.sync()` and
     // make an `io_uring_enter` syscall unless kernel side SQ polling is enabled.
-    pub fn push_sqes<'a>(
+    pub(crate) fn push_sqes<'a>(
         &mut self,
         indices: impl IntoIterator<Item = &'a usize>,
     ) -> io::Result<i32> {
@@ -65,7 +71,7 @@ impl LocalContext {
         Ok(0)
     }
 
-    pub fn submit_and_wait(
+    pub(crate) fn submit_and_wait(
         &mut self,
         num_to_wait: usize,
         timeout: Option<Duration>,
@@ -73,18 +79,18 @@ impl LocalContext {
         self.ring.submit_and_wait(num_to_wait, timeout)
     }
 
-    pub fn submit_no_wait(&mut self) -> io::Result<usize> {
+    pub(crate) fn submit_no_wait(&mut self) -> io::Result<usize> {
         self.ring.submit_no_wait()
     }
 
-    pub fn has_pending_cqes(&self) -> bool {
+    pub(crate) fn has_pending_cqes(&self) -> bool {
         self.ring.has_pending_cqes()
     }
 
     // Will busy loop until `num_to_complete` has been achieved. It is the caller's
     // responsibility to make sure the CQ will see that many completions, otherwise
     // this will result in an infinite loop.
-    pub fn process_cqes(&mut self, num_to_complete: Option<usize>) -> Result<usize> {
+    pub(crate) fn process_cqes(&mut self, num_to_complete: Option<usize>) -> Result<usize> {
         let mut num_completed = 0;
         let to_complete = num_to_complete.unwrap_or(self.ring.completion().len());
 
@@ -136,7 +142,7 @@ impl LocalContext {
     // RingMessage protocol. The reasoning is we want to avoid collisions when
     // storing MsgIds in the Mailbox. We achieve this goal by including the
     // unique `thread_id` in the upper 8 bits of the MsgId.
-    pub fn next_ring_msg_id(&mut self) -> MsgId {
+    pub(crate) fn next_ring_msg_id(&mut self) -> MsgId {
         let prev_msg_counter = self.ring_msg_counter as i32;
 
         // We have 10 bits for ring_msg_counter, so we need to wrap around and
@@ -149,6 +155,10 @@ impl LocalContext {
         let thread_id = (self.thread_id as i32) << MSG_COUNTER_BITS;
 
         MsgId::from(thread_id | prev_msg_counter)
+    }
+
+    pub(crate) fn set_current_task_id(&mut self, id: Option<Id>) -> Option<Id> {
+        mem::replace(&mut self.current_task_id, id)
     }
 }
 

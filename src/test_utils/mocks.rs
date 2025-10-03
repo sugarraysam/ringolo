@@ -1,33 +1,92 @@
+use crate::task::vtable::vtable;
+use crate::task::{Header, Notified, Schedule, State, Task};
+use std::future::Ready;
+use std::ptr::{self, NonNull};
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
 };
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-// Counter to keep track of how many times we woke the Waker.
-type WakerData = Arc<AtomicU32>;
+#[derive(Debug)]
+pub(crate) struct DummyScheduler;
+
+impl Schedule for DummyScheduler {
+    fn schedule(&self, _task: Notified<Self>) {
+        unimplemented!("dummy scheduler");
+    }
+
+    fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {
+        unimplemented!("dummy scheduler");
+    }
+}
+
+#[repr(C)]
+pub(crate) struct WakerData {
+    // Header has to be the first field in the WakerData. This is because we
+    // access the raw pointer from the `waker.data()` mechanics when submitting
+    // IO. We can properly mock a RawTask by ensuring we can cast the `*const ()`
+    // to NonNull<Header>.
+    pub header: Header,
+
+    pub wake_count: AtomicU32,
+}
+
+impl WakerData {
+    pub(crate) fn new() -> Self {
+        let vtable = vtable::<Ready<()>, DummyScheduler>();
+
+        Self {
+            header: Header::new(State::new(), vtable),
+            wake_count: AtomicU32::new(0),
+        }
+    }
+
+    pub(crate) fn get_count(&self) -> u32 {
+        self.wake_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn get_pending_io(&self) -> i32 {
+        unsafe {
+            let ptr = ptr::addr_of!(self.header) as *mut Header;
+            Header::get_pending_io(NonNull::new_unchecked(ptr))
+        }
+    }
+
+    pub(crate) fn decrement_pending_io(&self) {
+        unsafe {
+            let ptr = ptr::addr_of!(self.header) as *mut Header;
+            Header::decrement_pending_io(NonNull::new_unchecked(ptr));
+        }
+    }
+}
 
 unsafe fn mock_wake(data: *const ()) {
     // Need to consume 1 Arc reference
-    let data = unsafe { Arc::from_raw(data as *const AtomicU32) };
-    data.fetch_add(1, Ordering::Relaxed);
+    let data = unsafe { Arc::from_raw(data as *const WakerData) };
+    data.wake_count.fetch_add(1, Ordering::Relaxed);
+
+    // We mock decrementing pending_io on consuming wake. This is how we hook
+    // the real CompletionHandler for every `io_uring` resource. This allows
+    // making sure we handle the reference counted IO registration properly.
+    data.decrement_pending_io();
 }
 
 unsafe fn mock_wake_by_ref(data: *const ()) {
     // Not consuming any Arc ref
-    let data = unsafe { &*(data as *const AtomicU32) };
-    data.fetch_add(1, Ordering::Relaxed);
+    let data = unsafe { &*(data as *const WakerData) };
+    data.wake_count.fetch_add(1, Ordering::Relaxed);
 }
 
 // Drop the Waker Arc reference.
 unsafe fn mock_drop(data: *const ()) {
     if !data.is_null() {
-        let _data = unsafe { Arc::from_raw(data as *const AtomicU32) };
+        let _data = unsafe { Arc::from_raw(data as *const WakerData) };
     }
 }
 
 unsafe fn mock_clone(data: *const ()) -> RawWaker {
-    let data = unsafe { Arc::from_raw(data as *const AtomicU32) };
+    let data = unsafe { Arc::from_raw(data as *const WakerData) };
     let raw_data = Arc::into_raw(Arc::clone(&data));
 
     // Need to leak data again avoid decrementing Arc ref count
@@ -43,8 +102,8 @@ static MOCK_VTABLE: std::task::RawWakerVTable =
 // Mocking where the Waker will increment the atomic everytime it is woken up.
 // Calling Arc::into_raw *does not decrement the reference count*, so we need to
 // ensure we call `Arc::from_raw` on all these leaked ptrs.
-pub fn mock_waker() -> (Waker, WakerData) {
-    let data = Arc::new(AtomicU32::new(0));
+pub fn mock_waker() -> (Waker, Arc<WakerData>) {
+    let data = Arc::new(WakerData::new());
     let raw_data = Arc::into_raw(Arc::clone(&data));
 
     let raw_waker = RawWaker::new(raw_data as *const (), &MOCK_VTABLE);
@@ -55,18 +114,31 @@ pub fn mock_waker() -> (Waker, WakerData) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ptr::NonNull;
 
     #[test]
     fn test_mock_raw_waker() {
         let (waker1, waker_data) = mock_waker();
         waker1.wake_by_ref();
-        assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+        assert_eq!(waker_data.get_count(), 1);
 
         let waker2 = waker1.clone();
         waker2.wake();
-        assert_eq!(waker_data.load(Ordering::Relaxed), 2);
+        assert_eq!(waker_data.get_count(), 2);
 
         drop(waker1);
-        assert_eq!(waker_data.load(Ordering::Relaxed), 2);
+        assert_eq!(waker_data.get_count(), 2);
+    }
+
+    #[test]
+    fn test_mock_raw_waker_data_ptr_is_header() {
+        let (waker, _) = mock_waker();
+
+        unsafe {
+            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+            Header::increment_pending_io(ptr);
+            Header::decrement_pending_io(ptr);
+            assert!(Header::is_stealable(ptr));
+        }
     }
 }

@@ -1,3 +1,5 @@
+#![allow(unused_imports)]
+
 pub mod mailbox;
 pub use mailbox::Mailbox;
 

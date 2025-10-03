@@ -1,8 +1,10 @@
 use crate::context::with_context_mut;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
+use crate::task::Header;
 use anyhow::Result;
 use io_uring::squeue::Entry;
 use std::io;
+use std::ptr::NonNull;
 use std::task::{Poll, Waker};
 
 #[derive(Debug)]
@@ -29,7 +31,11 @@ impl SqeSingle {
 }
 
 impl Submittable for SqeSingle {
-    fn submit(&self) -> io::Result<i32> {
+    fn submit(&self, waker: &Waker) -> io::Result<i32> {
+        unsafe {
+            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+            Header::increment_pending_io(ptr);
+        }
         with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
     }
 }
@@ -77,7 +83,6 @@ mod tests {
     use crate::context::{init_context, with_context_mut};
     use crate::test_utils::*;
     use std::pin::pin;
-    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
 
     #[test]
@@ -95,7 +100,8 @@ mod tests {
         // Polling N more times after this won't change the state.
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
-            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+            assert_eq!(waker_data.get_count(), 0);
+            assert_eq!(waker_data.get_pending_io(), 1);
 
             with_context_mut(|ctx| {
                 assert_eq!(ctx.ring.submission().len(), 1);
@@ -113,11 +119,12 @@ mod tests {
         with_context_mut(|ctx| {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
             assert!(matches!(ctx.submit_and_wait(1, None), Ok(1)));
-            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+            assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
             assert!(matches!(ctx.process_cqes(None), Ok(1)));
-            assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+            assert_eq!(waker_data.get_count(), 1);
+            assert_eq!(waker_data.get_pending_io(), 0);
         });
 
         if let Poll::Ready(Ok((entry, result))) = sqe_fut.as_mut().poll(&mut ctx) {

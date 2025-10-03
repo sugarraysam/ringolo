@@ -1,11 +1,13 @@
 use crate::context::with_context_mut;
 use crate::sqe::{CompletionHandler, RawSqe, RawSqeState, State, Submittable};
+use crate::task::Header;
 use anyhow::{Result, anyhow};
 use futures::Stream;
 use io_uring::squeue::Entry;
 use std::io::{self, ErrorKind};
 use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::ptr::NonNull;
+use std::task::{Context, Poll, Waker};
 
 #[derive(Debug)]
 pub struct SqeStream {
@@ -44,7 +46,11 @@ impl SqeStream {
 }
 
 impl Submittable for SqeStream {
-    fn submit(&self) -> io::Result<i32> {
+    fn submit(&self, waker: &Waker) -> io::Result<i32> {
+        unsafe {
+            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+            Header::increment_pending_io(ptr);
+        }
         with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
     }
 }
@@ -73,7 +79,7 @@ impl Stream for SqeStream {
         loop {
             match this.state {
                 State::Initial => {
-                    match this.submit() {
+                    match this.submit(cx.waker()) {
                         Ok(_) => {
                             // Submission successful, advance state and immediately
                             // try to poll for a result.
@@ -156,7 +162,6 @@ mod tests {
     use io_uring::types::{TimeoutFlags, Timespec};
     use rstest::rstest;
     use std::pin::pin;
-    use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
 
     #[rstest]
@@ -185,8 +190,9 @@ mod tests {
             let res = stream.as_mut().poll_next(&mut ctx);
             assert!(matches!(res, Poll::Pending));
 
-            // assert!(matches!(stream.as_mut().poll_next(&mut ctx), Poll::Pending));
-            assert_eq!(waker_data.load(Ordering::Relaxed), 0);
+            assert!(matches!(stream.as_mut().poll_next(&mut ctx), Poll::Pending));
+            assert_eq!(waker_data.get_count(), 0);
+            assert_eq!(waker_data.get_pending_io(), 1);
 
             with_context_mut(|ctx| {
                 assert_eq!(ctx.ring.submission().len(), 1);
@@ -214,9 +220,10 @@ mod tests {
             let num_completed = ctx.process_cqes(Some(n))?;
             assert_eq!(num_completed, n);
 
-            // Because we have not progressed in our stream, the RawSqeState state
-            // stayed at ready, so we expect a single wake event.
-            assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+            // We wake the task N time, and let scheduler handle the Notified
+            // state and set the bit appropriately.
+            assert_eq!(waker_data.get_count(), count);
+            assert_eq!(waker_data.get_pending_io(), 0);
 
             if let CompletionHandler::Stream {
                 results,

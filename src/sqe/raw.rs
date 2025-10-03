@@ -158,11 +158,9 @@ impl RawSqe {
     }
 
     pub fn set_user_data(&mut self, user_data: u64) -> Result<()> {
-        debug_assert!(
-            self.state == RawSqeState::Available,
-            "unexpected state {:?}",
-            self.state
-        );
+        if !matches!(self.state, RawSqeState::Available) {
+            return Err(anyhow!("unexpected state {:?}", self.state));
+        }
 
         let old = self
             .entry
@@ -181,11 +179,9 @@ impl RawSqe {
         cqe_res: i32,
         cqe_flags: Option<u32>,
     ) -> Result<CompletionEffect> {
-        debug_assert!(
-            matches!(self.state, RawSqeState::Pending | RawSqeState::Ready),
-            "unexpected state: {:?}",
-            self.state
-        );
+        if !matches!(self.state, RawSqeState::Pending | RawSqeState::Ready) {
+            return Err(anyhow!("unexpected state: {:?}", self.state));
+        }
 
         let cqe_res: io::Result<i32> = if cqe_res >= 0 {
             Ok(cqe_res)
@@ -193,7 +189,7 @@ impl RawSqe {
             Err(io::Error::from_raw_os_error(-cqe_res))
         };
 
-        let prev_state = std::mem::replace(&mut self.state, RawSqeState::Ready);
+        let _prev_state = std::mem::replace(&mut self.state, RawSqeState::Ready);
 
         match &mut self.handler {
             CompletionHandler::Single { result } => {
@@ -221,26 +217,32 @@ impl RawSqe {
             } => {
                 results.push_back(cqe_res.map_err(SqeStreamError::Io));
 
-                match completion {
+                let done = match completion {
                     StreamCompletion::ByCount { remaining } => {
-                        remaining.fetch_sub(1, Ordering::Relaxed);
+                        let prev = remaining.fetch_sub(1, Ordering::Relaxed) - 1;
+                        prev == 0
                     }
                     StreamCompletion::ByFlag { done } => {
                         // If we have the `IORING_CQE_F_MORE` flags set, it means we are
                         // expecting more results, otherwise this was the final result.
                         *done = cqe_flags.map_or(false, io_uring::cqueue::more);
+                        *done
                     }
-                }
+                };
 
-                // Ensure we wake the task one time for N pending results.
-                if matches!(prev_state, RawSqeState::Pending) {
+                // Important to distinguish between final wake and wake_by_ref.
+                // This is because we will decrement the pending IO counter on the
+                // task when invoking the consuming wake() call.
+                if done {
+                    self.wake()?;
+                } else {
                     self.wake_by_ref()?;
                 }
 
                 Ok(CompletionEffect::None)
             }
             CompletionHandler::Message => {
-                unreachable!("RingMessage are not yet implemented.")
+                unimplemented!("RingMessage are not yet implemented.")
             }
         }
     }
@@ -339,7 +341,7 @@ mod tests {
 
         sqe.set_waker(&waker1);
         sqe.wake_by_ref()?;
-        assert_eq!(waker1_data.load(Ordering::Relaxed), 1);
+        assert_eq!(waker1_data.get_count(), 1);
 
         // Set unrelated waker - should overwrite waker1
         let (waker2, waker2_data) = mock_waker();
@@ -348,8 +350,8 @@ mod tests {
         sqe.set_waker(&waker2);
         sqe.wake_by_ref().unwrap();
 
-        assert_eq!(waker1_data.load(Ordering::Relaxed), 1);
-        assert_eq!(waker2_data.load(Ordering::Relaxed), 1);
+        assert_eq!(waker1_data.get_count(), 1);
+        assert_eq!(waker2_data.get_count(), 1);
         Ok(())
     }
 
@@ -391,7 +393,7 @@ mod tests {
         }
 
         // The waker was consumed and called
-        assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+        assert_eq!(waker_data.get_count(), 1);
         assert!(sqe.waker.is_none());
 
         Ok(())
@@ -466,7 +468,7 @@ mod tests {
                 assert!(inserted.on_completion(0, None).is_ok());
                 assert_eq!(inserted.get_state(), RawSqeState::Ready);
 
-                assert_eq!(waker_data.load(Ordering::Relaxed), 1);
+                assert_eq!(waker_data.get_count(), 1);
 
                 idx
             })?;
