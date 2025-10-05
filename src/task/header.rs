@@ -1,9 +1,9 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::task::id::Id;
+use crate::task::layout::Vtable;
 use crate::task::state::State;
 use crate::task::trailer::Trailer;
-use crate::task::vtable::Vtable;
 use std::cell::Cell;
 use std::ptr::NonNull;
 
@@ -14,6 +14,12 @@ pub(crate) struct Header {
 
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
+
+    /// Task id which can also used as the tracing::Id. Tight integration with
+    /// tracing library to save few bytes in Header field. We store it in hot
+    /// data as we update the thread local context before polling any task, and
+    /// leverage the field constantly for task tracing.
+    pub(super) id: Id,
 
     /// We keep track of all locally scheduled IOs on iouring as a signal to
     /// determine if a task can safely be stolen by another thread. This is
@@ -30,6 +36,7 @@ impl Header {
         Header {
             state,
             vtable,
+            id: Id::next(),
             pending_io: Cell::new(0),
         }
     }
@@ -59,25 +66,13 @@ impl Header {
         NonNull::new_unchecked(scheduler)
     }
 
-    /// Gets a pointer to the id of the task containing this `Header`.
-    ///
-    /// # Safety
-    ///
-    /// The provided raw pointer must point at the header of a task.
-    pub(super) unsafe fn get_id_ptr(me: NonNull<Header>) -> NonNull<Id> {
-        let offset = me.as_ref().vtable.id_offset;
-        let id = me.as_ptr().cast::<u8>().add(offset).cast::<Id>();
-        NonNull::new_unchecked(id)
-    }
-
     /// Gets the id of the task containing this `Header`.
     ///
     /// # Safety
     ///
     /// The provided raw pointer must point at the header of a task.
     pub(super) unsafe fn get_id(me: NonNull<Header>) -> Id {
-        let ptr = Header::get_id_ptr(me).as_ptr();
-        *ptr
+        me.as_ref().id
     }
 
     /// Increment pending io on local thread.
@@ -105,6 +100,4 @@ impl Header {
     pub(crate) unsafe fn is_stealable(me: NonNull<Header>) -> bool {
         me.as_ref().pending_io.get() == 0
     }
-
-    // TODO: impl Id methods
 }

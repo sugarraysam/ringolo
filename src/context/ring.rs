@@ -121,7 +121,7 @@ mod tests {
     use std::pin::pin;
     use std::task::{Context, Poll};
 
-    use crate::context::{init_context, with_context_mut};
+    use crate::context::with_core_mut;
     use crate::future::opcodes::TimeoutBuilder;
 
     use super::*;
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     #[ignore = "Can't get taskrun flag to work as expected. Never set by kernel."]
     fn test_taskrun_flag() -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let timespec = Timespec::from(Duration::from_millis(10));
 
@@ -140,16 +140,16 @@ mod tests {
         let mut ctx = Context::from_waker(&waker);
         assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
 
-        with_context_mut(|ctx| {
-            assert!(!ctx.ring.has_pending_cqes());
+        with_core_mut(|core| {
+            assert!(!core.has_pending_cqes());
 
             // submit + complete
-            assert!(matches!(ctx.submit_no_wait(), Ok(0)));
+            assert!(matches!(core.submit_no_wait(), Ok(0)));
 
             // TODO: cant get the flag to be set...
-            while !ctx.ring.has_pending_cqes() {}
+            while !core.has_pending_cqes() {}
 
-            assert!(matches!(ctx.process_cqes(None), Ok(1)));
+            assert!(matches!(core.process_cqes(None), Ok(1)));
         });
 
         match sqe_fut.as_mut().poll(&mut ctx) {

@@ -1,4 +1,4 @@
-use crate::task::{Header, RawTask};
+use crate::task::{Header, Id, RawTask};
 use std::fmt;
 use std::panic::{RefUnwindSafe, UnwindSafe};
 
@@ -52,7 +52,7 @@ impl AbortHandle {
     /// currently spawned tasks.
     ///
     /// [task ID]: crate::task::Id
-    pub fn id(&self) -> super::Id {
+    pub fn id(&self) -> Id {
         // Safety: The header pointer is valid.
         unsafe { Header::get_id(self.raw.header_ptr()) }
     }
@@ -67,9 +67,9 @@ impl RefUnwindSafe for AbortHandle {}
 impl fmt::Debug for AbortHandle {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Safety: The header pointer is valid.
-        let id_ptr = unsafe { Header::get_id_ptr(self.raw.header_ptr()) };
-        let id = unsafe { id_ptr.as_ref() };
-        fmt.debug_struct("AbortHandle").field("id", id).finish()
+        fmt.debug_struct("AbortHandle")
+            .field("id", &self.id())
+            .finish()
     }
 }
 

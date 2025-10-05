@@ -1,3 +1,5 @@
+use crate::runtime::Schedule;
+
 // Public API
 pub mod abort;
 pub use self::abort::AbortHandle;
@@ -17,7 +19,7 @@ mod harness;
 mod header;
 pub(crate) use self::header::Header;
 
-mod layout;
+pub mod layout;
 
 pub mod raw;
 pub(crate) use self::raw::RawTask;
@@ -33,29 +35,10 @@ pub(crate) use self::task::{Notified, Task};
 
 mod trailer;
 
-pub(crate) mod vtable;
-
 mod waker;
 
 /// Task result sent back.
 pub(crate) type Result<T> = std::result::Result<T, JoinError>;
-
-/// Scheduler trait
-pub(crate) trait Schedule: Sync + Sized + 'static {
-    fn schedule(&self, task: Notified<Self>);
-
-    /// The task has completed work and is ready to be released. The scheduler
-    /// should release it immediately and return it. The task module will batch
-    /// the ref-dec with setting other options.
-    ///
-    /// If the scheduler has already released the task, then None is returned.
-    fn release(&self, task: &Task<Self>) -> Option<Task<Self>>;
-
-    /// Polling the task resulted in a panic. Should the runtime shutdown?
-    fn unhandled_panic(&self) {
-        // By default, do nothing.
-    }
-}
 
 /// This is the constructor for a new task. Three references to the task are
 /// created. The first task reference is usually put into an `OwnedTasks`

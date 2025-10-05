@@ -1,6 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::task::{Header, RawTask, Schedule};
+use crate::runtime::Schedule;
+use crate::task::{Header, RawTask};
 
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;

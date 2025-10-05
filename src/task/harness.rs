@@ -1,9 +1,10 @@
+use crate::runtime::Schedule;
 use crate::task::layout::{Core, TaskLayout};
 use crate::task::raw::can_read_output;
 use crate::task::state::{State, TransitionToIdle, TransitionToRunning};
 use crate::task::trailer::Trailer;
 use crate::task::waker::waker_ref;
-use crate::task::{Header, Id, JoinError, Notified, Schedule, Task};
+use crate::task::{Header, Id, JoinError, Notified, Task};
 
 use std::future::Future;
 
@@ -111,7 +112,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
                 // We give one of them to a new task and call `yield_now`.
                 self.core()
                     .scheduler
-                    .schedule(Notified::new(self.get_new_task()));
+                    .schedule(false, Notified::new(self.get_new_task()));
 
                 // The remaining ref-count is now dropped. We kept the extra
                 // ref-count until now to ensure that even if the `yield_now`

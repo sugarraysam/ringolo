@@ -1,5 +1,6 @@
-use crate::task::vtable::vtable;
-use crate::task::{Header, Notified, Schedule, State, Task};
+use crate::runtime::Schedule;
+use crate::task::layout::vtable;
+use crate::task::{Header, Notified, State, Task};
 use std::future::Ready;
 use std::ptr::{self, NonNull};
 use std::sync::{
@@ -12,7 +13,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 pub(crate) struct DummyScheduler;
 
 impl Schedule for DummyScheduler {
-    fn schedule(&self, _task: Notified<Self>) {
+    fn schedule(&self, _is_new: bool, _task: Notified<Self>) {
         unimplemented!("dummy scheduler");
     }
 
@@ -102,7 +103,7 @@ static MOCK_VTABLE: std::task::RawWakerVTable =
 // Mocking where the Waker will increment the atomic everytime it is woken up.
 // Calling Arc::into_raw *does not decrement the reference count*, so we need to
 // ensure we call `Arc::from_raw` on all these leaked ptrs.
-pub fn mock_waker() -> (Waker, Arc<WakerData>) {
+pub(crate) fn mock_waker() -> (Waker, Arc<WakerData>) {
     let data = Arc::new(WakerData::new());
     let raw_data = Arc::into_raw(Arc::clone(&data));
 

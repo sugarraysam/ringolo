@@ -73,6 +73,11 @@ impl Id {
     pub(crate) fn as_u64(&self) -> u64 {
         self.0.get()
     }
+
+    /// Get a unique task tracing Id to be used with tracing library.
+    pub(crate) fn as_tracing_id(&self) -> tracing::Id {
+        tracing::Id::from_non_zero_u64(self.0)
+    }
 }
 
 /// Set and clear the task id in the context when the future is executed or

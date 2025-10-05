@@ -1,11 +1,13 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::runtime::Schedule;
+use crate::task::Header;
 use crate::task::RawTask;
-use crate::task::{Header, Schedule};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// An owned handle to the task, tracked by ref count.
 #[repr(transparent)]

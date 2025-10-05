@@ -33,7 +33,6 @@ use std::task::{Context, Poll};
 ///         ...
 ///     ]
 /// );`
-#[macro_export]
 macro_rules! generate_io_uring_future {
     (
         $name:ident,

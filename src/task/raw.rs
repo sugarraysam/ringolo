@@ -1,9 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::runtime::Schedule;
 use crate::task::layout::TaskLayout;
 use crate::task::state::{Snapshot, State, TransitionToNotifiedByRef, TransitionToNotifiedByVal};
 use crate::task::trailer::Trailer;
-use crate::task::{Header, Id, Schedule};
+use crate::task::{Header, Id};
 use std::future::Future;
 use std::ptr::NonNull;
 use std::task::Waker;

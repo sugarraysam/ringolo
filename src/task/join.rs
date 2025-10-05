@@ -345,8 +345,8 @@ where
 {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Safety: The header pointer is valid.
-        let id_ptr = unsafe { Header::get_id_ptr(self.raw.header_ptr()) };
-        let id = unsafe { id_ptr.as_ref() };
-        fmt.debug_struct("JoinHandle").field("id", id).finish()
+        fmt.debug_struct("JoinHandle")
+            .field("id", &self.id())
+            .finish()
     }
 }

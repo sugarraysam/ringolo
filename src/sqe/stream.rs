@@ -1,4 +1,4 @@
-use crate::context::with_context_mut;
+use crate::context::{with_core_mut, with_slab_mut};
 use crate::sqe::{CompletionHandler, RawSqe, RawSqeState, State, Submittable};
 use crate::task::Header;
 use anyhow::{Result, anyhow};
@@ -27,10 +27,8 @@ impl SqeStream {
         //
         // Which SQE flags to set?
 
-        let idx = with_context_mut(|ctx| -> Result<usize> {
-            let (idx, _) = ctx
-                .slab
-                .insert(RawSqe::new(entry, CompletionHandler::new_stream(count)))?;
+        let idx = with_slab_mut(|slab| -> Result<usize> {
+            let (idx, _) = slab.insert(RawSqe::new(entry, CompletionHandler::new_stream(count)))?;
             Ok(idx)
         })?;
 
@@ -51,7 +49,7 @@ impl Submittable for SqeStream {
             let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
             Header::increment_pending_io(ptr);
         }
-        with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
+        with_core_mut(|core| core.push_sqes(&[self.idx]))
     }
 }
 
@@ -101,8 +99,8 @@ impl Stream for SqeStream {
                     }
                 }
                 State::Submitted => {
-                    return with_context_mut(|ctx| -> Poll<Option<Self::Item>> {
-                        let raw_sqe = match ctx.slab.get_mut(this.idx) {
+                    return with_slab_mut(|slab| -> Poll<Option<Self::Item>> {
+                        let raw_sqe = match slab.get_mut(this.idx) {
                             Ok(sqe) => sqe,
                             Err(e) => {
                                 this.state = State::Completed;
@@ -145,8 +143,8 @@ impl Stream for SqeStream {
 // RAII: free RawSqe from slab.
 impl Drop for SqeStream {
     fn drop(&mut self) {
-        with_context_mut(|ctx| {
-            if ctx.slab.try_remove(self.idx).is_none() {
+        with_slab_mut(|slab| {
+            if slab.try_remove(self.idx).is_none() {
                 eprintln!("Warning: SQE {} not found in slab during drop", self.idx);
             }
         });
@@ -156,7 +154,7 @@ impl Drop for SqeStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{init_context, with_context_mut};
+    use crate::context::with_slab_and_ring_mut;
     use crate::test_utils::*;
     use io_uring::opcode::Timeout;
     use io_uring::types::{TimeoutFlags, Timespec};
@@ -169,7 +167,7 @@ mod tests {
     #[case::ten_timeouts(10, 1_000)]
     #[case::two_timeouts_slow(2, 1_000_000)]
     fn test_sqe_stream_timeout_multishot(#[case] count: u32, #[case] nsecs: u32) -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let n = count as usize;
 
@@ -194,10 +192,10 @@ mod tests {
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
 
-            with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.sq().len(), 1);
+            with_slab_and_ring_mut(|slab, ring| {
+                assert_eq!(ring.sq().len(), 1);
 
-                let res = ctx.slab.get(idx).and_then(|sqe| {
+                let res = slab.get(idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());
                     assert!(sqe.has_waker());
 
@@ -212,12 +210,12 @@ mod tests {
             });
         }
 
-        with_context_mut(|ctx| -> Result<()> {
+        with_core_mut(|core| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert!(matches!(ctx.submit_and_wait(1, None), Ok(1)));
+            assert!(matches!(core.submit_and_wait(1, None), Ok(1)));
 
             // Wait for our timeouts to have completed N times
-            let num_completed = ctx.process_cqes(Some(n))?;
+            let num_completed = core.process_cqes(Some(n))?;
             assert_eq!(num_completed, n);
 
             // We wake the task N time, and let scheduler handle the Notified
@@ -228,7 +226,7 @@ mod tests {
             if let CompletionHandler::Stream {
                 results,
                 completion,
-            } = &ctx.slab.get(idx)?.handler
+            } = &core.slab.borrow().get(idx)?.handler
             {
                 assert_eq!(results.len(), n);
                 assert!(!completion.has_more());

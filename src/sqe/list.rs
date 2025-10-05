@@ -1,4 +1,6 @@
-use crate::context::with_context_mut;
+use crate::context::{
+    with_core_mut, with_slab_mut,
+};
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use crate::task::Header;
 use anyhow::{Result, anyhow};
@@ -47,11 +49,7 @@ impl SqeList {
     }
 
     pub fn set_waker(&self, waker: &Waker) -> Result<()> {
-        with_context_mut(|ctx| {
-            ctx.slab
-                .get_mut(self.list[0])
-                .map(|sqe| sqe.set_waker(waker))
-        })
+        with_slab_mut(|slab| slab.get_mut(self.list[0]).map(|sqe| sqe.set_waker(waker)))
     }
 
     pub fn is_ready(&self) -> bool {
@@ -69,7 +67,7 @@ impl Submittable for SqeList {
             let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
             Header::increment_pending_io(ptr);
         }
-        with_context_mut(|ctx| ctx.push_sqes(&self.list))
+        with_core_mut(|ctx| ctx.push_sqes(&self.list))
     }
 }
 
@@ -87,11 +85,11 @@ impl Completable for SqeList {
             };
         }
 
-        let res = with_context_mut(|ctx| -> Self::Output {
+        let res = with_slab_mut(|slab| -> Self::Output {
             self.list
                 .iter()
                 .map(|idx| -> Result<(Entry, io::Result<i32>)> {
-                    ctx.slab.get_mut(*idx)?.take_final_result()
+                    slab.get_mut(*idx)?.take_final_result()
                 })
                 .collect::<Result<Vec<_>>>()
         });
@@ -103,9 +101,9 @@ impl Completable for SqeList {
 // RAII: walk the SqeList and free every RawSqe from slab.
 impl Drop for SqeList {
     fn drop(&mut self) {
-        with_context_mut(|ctx| {
+        with_slab_mut(|slab| {
             self.list.iter().for_each(|idx| {
-                if ctx.slab.try_remove(*idx).is_none() {
+                if slab.try_remove(*idx).is_none() {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);
                 }
             });
@@ -252,8 +250,8 @@ impl SqeListBuilder {
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
         let mut indices = Vec::with_capacity(entries.len());
 
-        with_context_mut(|ctx| -> Result<()> {
-            let vacant = ctx.slab.vacant_entry()?;
+        with_slab_mut(|slab| -> Result<()> {
+            let vacant = slab.vacant_entry()?;
             indices.push(vacant.key());
 
             let mut head = RawSqe::new(
@@ -265,7 +263,7 @@ impl SqeListBuilder {
             _ = vacant.insert(head);
 
             for entry in entries {
-                let (idx, _) = ctx.slab.insert(RawSqe::new(
+                let (idx, _) = slab.insert(RawSqe::new(
                     entry,
                     CompletionHandler::new_batch_or_chain(indices[0], Arc::clone(&remaining)),
                 ))?;
@@ -282,7 +280,8 @@ impl SqeListBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{init_context, with_context, with_context_mut};
+    use crate::context::{with_slab, with_slab_and_ring_mut};
+    use crate::runtime::Builder;
     use crate::sqe::RawSqeState;
     use crate::test_utils::*;
     use either::Either;
@@ -295,7 +294,7 @@ mod tests {
     #[case::batch(SqeListKind::Batch)]
     #[case::batch(SqeListKind::Chain)]
     fn test_list_builder(#[case] kind: SqeListKind) -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let n = 4;
         let list = match kind {
@@ -307,9 +306,9 @@ mod tests {
         list.set_waker(&waker)?;
         let mut num_heads = 0;
 
-        with_context(|ctx| -> Result<()> {
+        with_slab(|slab| -> Result<()> {
             for idx in list.list.iter() {
-                let sqe = ctx.slab.get(*idx)?;
+                let sqe = slab.get(*idx)?;
                 assert_eq!(sqe.get_state(), RawSqeState::Pending);
 
                 match &sqe.handler {
@@ -325,10 +324,11 @@ mod tests {
                     _ => assert!(false, "unexpected completion handler"),
                 }
             }
-
-            assert_eq!(num_heads, 1, "expected one unique head node");
             Ok(())
-        })
+        });
+
+        assert_eq!(num_heads, 1, "expected one unique head node");
+        Ok(())
     }
 
     #[rstest]
@@ -342,7 +342,7 @@ mod tests {
         #[case] size: usize,
         #[case] kind: SqeListKind,
     ) -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let list = match kind {
             SqeListKind::Batch => build_batch(size),
@@ -365,11 +365,11 @@ mod tests {
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
 
-            with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.sq().len(), size);
+            with_slab_and_ring_mut(|slab, ring| {
+                assert_eq!(ring.sq().len(), size);
 
                 // Waker only set on head in batch/chain setup
-                let res = ctx.slab.get(head_idx).and_then(|sqe| {
+                let res = slab.get(head_idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());
                     assert!(sqe.has_waker());
                     assert_eq!(sqe.get_state(), RawSqeState::Pending);
@@ -380,13 +380,13 @@ mod tests {
             });
         }
 
-        with_context_mut(|ctx| -> Result<()> {
+        with_core_mut(|core| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert_eq!(ctx.submit_and_wait(size, None)?, size);
+            assert_eq!(core.submit_and_wait(size, None)?, size);
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert_eq!(ctx.process_cqes(None)?, size);
+            assert_eq!(core.process_cqes(None)?, size);
             assert_eq!(waker_data.get_count(), 1);
             assert_eq!(waker_data.get_pending_io(), 0);
             Ok(())
@@ -444,7 +444,7 @@ mod tests {
     ) -> Result<()> {
         assert_eq!(entries.len(), expected_results.len());
 
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let size = entries.len();
         let sqe_list = Sqe::new(build_list_with_entries(kind, entries)?);
@@ -464,11 +464,11 @@ mod tests {
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
 
-            with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.sq().len(), size);
+            with_slab_and_ring_mut(|slab, ring| {
+                assert_eq!(ring.sq().len(), size);
 
                 // Waker only set on head in batch/chain setup
-                let res = ctx.slab.get(head_idx).and_then(|sqe| {
+                let res = slab.get(head_idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());
                     assert!(sqe.has_waker());
                     Ok(())
@@ -478,13 +478,13 @@ mod tests {
             });
         }
 
-        with_context_mut(|ctx| -> Result<()> {
+        with_core_mut(|core| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert_eq!(ctx.submit_and_wait(size, None)?, size);
+            assert_eq!(core.submit_and_wait(size, None)?, size);
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert_eq!(ctx.process_cqes(None)?, size);
+            assert_eq!(core.process_cqes(None)?, size);
             assert_eq!(waker_data.get_count(), 1);
             assert_eq!(waker_data.get_pending_io(), 0);
             Ok(())
@@ -521,7 +521,8 @@ mod tests {
         let ring_size = 32;
         let batch_size = (ring_size * 2) + 1;
 
-        init_context(ring_size);
+        let builder = Builder::new_local().sq_ring_size(ring_size);
+        init_local_runtime_and_context(Some(builder))?;
 
         let mut builder = SqeBatchBuilder::new();
         for _ in 0..batch_size {

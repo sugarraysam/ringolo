@@ -1,4 +1,4 @@
-use crate::context::with_context_mut;
+use crate::context::{with_core_mut, with_slab_mut};
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use crate::task::Header;
 use anyhow::Result;
@@ -15,10 +15,8 @@ pub struct SqeSingle {
 
 impl SqeSingle {
     pub fn try_new(entry: Entry) -> Result<Self> {
-        let idx = with_context_mut(|ctx| -> Result<usize> {
-            let (idx, _) = ctx
-                .slab
-                .insert(RawSqe::new(entry, CompletionHandler::new_single()))?;
+        let idx = with_slab_mut(|slab| -> Result<usize> {
+            let (idx, _) = slab.insert(RawSqe::new(entry, CompletionHandler::new_single()))?;
             Ok(idx)
         })?;
 
@@ -36,7 +34,7 @@ impl Submittable for SqeSingle {
             let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
             Header::increment_pending_io(ptr);
         }
-        with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
+        with_core_mut(|core| core.push_sqes(&[self.idx]))
     }
 }
 
@@ -44,8 +42,8 @@ impl Completable for SqeSingle {
     type Output = Result<(Entry, io::Result<i32>)>;
 
     fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output> {
-        with_context_mut(|ctx| -> Poll<Self::Output> {
-            let raw_sqe = match ctx.slab.get_mut(self.idx) {
+        with_slab_mut(|slab| -> Poll<Self::Output> {
+            let raw_sqe = match slab.get_mut(self.idx) {
                 Ok(sqe) => sqe,
                 Err(e) => return Poll::Ready(Err(e)),
             };
@@ -63,8 +61,8 @@ impl Completable for SqeSingle {
 // RAII: free RawSqe from slab.
 impl Drop for SqeSingle {
     fn drop(&mut self) {
-        with_context_mut(|ctx| {
-            if ctx.slab.try_remove(self.idx).is_none() {
+        with_slab_mut(|slab| {
+            if slab.try_remove(self.idx).is_none() {
                 eprintln!("Warning: SQE {} not found in slab during drop", self.idx);
             }
         });
@@ -80,14 +78,14 @@ impl From<SqeSingle> for Sqe<SqeSingle> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{init_context, with_context_mut};
+    use crate::context::with_slab_and_ring_mut;
     use crate::test_utils::*;
     use std::pin::pin;
     use std::task::{Context, Poll};
 
     #[test]
     fn test_submit_and_complete_single_sqe() -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let sqe = SqeSingle::try_new(nop())?;
         let idx = sqe.get_idx();
@@ -103,10 +101,10 @@ mod tests {
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
 
-            with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.sq().len(), 1);
+            with_slab_and_ring_mut(|slab, ring| {
+                assert_eq!(ring.sq().len(), 1);
 
-                let res = ctx.slab.get(idx).and_then(|sqe| {
+                let res = slab.get(idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());
                     assert!(sqe.has_waker());
                     Ok(())
@@ -116,13 +114,13 @@ mod tests {
             });
         }
 
-        with_context_mut(|ctx| {
+        with_core_mut(|core| {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert!(matches!(ctx.submit_and_wait(1, None), Ok(1)));
+            assert!(matches!(core.submit_and_wait(1, None), Ok(1)));
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert!(matches!(ctx.process_cqes(None), Ok(1)));
+            assert!(matches!(core.process_cqes(None), Ok(1)));
             assert_eq!(waker_data.get_count(), 1);
             assert_eq!(waker_data.get_pending_io(), 0);
         });

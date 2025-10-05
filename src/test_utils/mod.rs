@@ -7,7 +7,10 @@ use std::ffi::CString;
 use crate::sqe::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
 
 // Exports
-pub mod mocks;
+pub(crate) mod context;
+pub(crate) use context::init_local_runtime_and_context;
+
+pub(crate) mod mocks;
 pub(crate) use mocks::mock_waker;
 
 pub(crate) fn build_list_with_entries(kind: SqeListKind, entries: Vec<Entry>) -> Result<SqeList> {

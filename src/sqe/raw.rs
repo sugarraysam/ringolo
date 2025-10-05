@@ -332,7 +332,7 @@ impl RawSqe {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{init_context, with_context_mut};
+    use crate::context::with_slab_mut;
     use crate::test_utils::*;
     use rstest::rstest;
     use std::io::{self, ErrorKind};
@@ -369,7 +369,7 @@ mod tests {
         #[case] res: i32,
         #[case] expected: io::Result<i32>,
     ) -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
         let user_data = 42;
 
         let mut sqe = RawSqe::new(nop(), CompletionHandler::new_single());
@@ -411,12 +411,12 @@ mod tests {
         #[case] res: i32,
         #[case] n_sqes: usize,
     ) -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
         let user_data = 12345;
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
 
-        let head_idx = with_context_mut(|ctx| -> Result<usize> {
-            let vacant = ctx.slab.vacant_entry()?;
+        let head_idx = with_slab_mut(|slab| -> Result<usize> {
+            let vacant = slab.vacant_entry()?;
             let head_idx = vacant.key();
 
             let mut head = RawSqe::new(
@@ -458,15 +458,15 @@ mod tests {
 
     #[test]
     fn test_raw_sqe_lifecycle() -> Result<()> {
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
         assert_eq!(raw_sqe.get_state(), RawSqeState::Available);
 
-        with_context_mut(|ctx| -> Result<()> {
+        with_slab_mut(|slab| -> Result<()> {
             let (waker, waker_data) = mock_waker();
 
-            let idx = ctx.slab.insert(raw_sqe).map(|(idx, inserted)| {
+            let idx = slab.insert(raw_sqe).map(|(idx, inserted)| {
                 assert_eq!(inserted.get_state(), RawSqeState::Pending);
                 inserted.set_waker(&waker);
 
@@ -478,7 +478,7 @@ mod tests {
                 idx
             })?;
 
-            let removed = ctx.slab.try_remove(idx);
+            let removed = slab.try_remove(idx);
             assert!(
                 removed
                     .map(|sqe| assert_eq!(sqe.get_state(), RawSqeState::Available))

@@ -1,4 +1,4 @@
-use crate::context::with_context_mut;
+use crate::context::{with_core_mut, with_slab_mut};
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use crate::task::Header;
 use anyhow::Result;
@@ -20,10 +20,8 @@ pub(crate) struct SqeRingMessage {
 
 impl SqeRingMessage {
     pub(crate) fn try_new(entry: Entry) -> Result<Self> {
-        let idx = with_context_mut(|ctx| -> Result<usize> {
-            let (idx, _) = ctx
-                .slab
-                .insert(RawSqe::new(entry, CompletionHandler::new_message()))?;
+        let idx = with_slab_mut(|slab| -> Result<usize> {
+            let (idx, _) = slab.insert(RawSqe::new(entry, CompletionHandler::new_message()))?;
             Ok(idx)
         })?;
 
@@ -38,7 +36,7 @@ impl Submittable for SqeRingMessage {
             let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
             Header::increment_pending_io(ptr);
         }
-        with_context_mut(|ctx| ctx.push_sqes(&[self.idx]))
+        with_core_mut(|core| core.push_sqes(&[self.idx]))
     }
 }
 
@@ -54,8 +52,8 @@ impl Completable for SqeRingMessage {
 // RAII: free RawSqe from slab.
 impl Drop for SqeRingMessage {
     fn drop(&mut self) {
-        with_context_mut(|ctx| {
-            if ctx.slab.try_remove(self.idx).is_none() {
+        with_slab_mut(|slab| {
+            if slab.try_remove(self.idx).is_none() {
                 eprintln!("Warning: SQE {} not found in slab during drop", self.idx);
             }
         });

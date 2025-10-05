@@ -212,7 +212,7 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeC
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{init_context, with_context_mut};
+    use crate::context::{with_core_mut, with_ring_mut};
     use crate::test_utils::*;
     use either::Either;
     use io_uring::squeue::Entry;
@@ -309,7 +309,7 @@ mod tests {
     ) -> Result<()> {
         assert_eq!(entries.len(), expected_results.len());
 
-        init_context(64);
+        init_local_runtime_and_context(None)?;
 
         let num_lists = entries.len();
         let n_sqes = entries.iter().map(Vec::len).sum();
@@ -332,18 +332,18 @@ mod tests {
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), num_lists as i32);
 
-            with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.sq().len(), n_sqes);
+            with_ring_mut(|ring| {
+                assert_eq!(ring.sq().len(), n_sqes);
             });
         }
 
-        with_context_mut(|ctx| -> Result<()> {
+        with_core_mut(|core| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert_eq!(ctx.submit_and_wait(n_sqes, None)?, n_sqes);
+            assert_eq!(core.submit_and_wait(n_sqes, None)?, n_sqes);
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert_eq!(ctx.process_cqes(None)?, n_sqes);
+            assert_eq!(core.process_cqes(None)?, n_sqes);
             assert_eq!(waker_data.get_count(), num_lists as u32);
             assert_eq!(waker_data.get_pending_io(), 0);
             Ok(())
