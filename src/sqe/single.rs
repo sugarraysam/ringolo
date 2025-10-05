@@ -71,9 +71,9 @@ impl Drop for SqeSingle {
     }
 }
 
-impl Into<Sqe<SqeSingle>> for SqeSingle {
-    fn into(self) -> Sqe<SqeSingle> {
-        Sqe::new(self)
+impl From<SqeSingle> for Sqe<SqeSingle> {
+    fn from(val: SqeSingle) -> Self {
+        Sqe::new(val)
     }
 }
 
@@ -104,7 +104,7 @@ mod tests {
             assert_eq!(waker_data.get_pending_io(), 1);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.submission().len(), 1);
+                assert_eq!(ctx.ring.sq().len(), 1);
 
                 let res = ctx.slab.get(idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());

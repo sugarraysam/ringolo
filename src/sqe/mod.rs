@@ -1,21 +1,26 @@
 use anyhow::{Result, anyhow};
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
-use std::{io, mem};
+
+// Public API
+pub mod single;
+pub use self::single::SqeSingle;
+
+pub mod list;
+pub use self::list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
+
+pub mod stream;
+pub use self::stream::{SqeStream, SqeStreamError};
 
 // Re-exports
-pub mod list;
-pub use list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
+#[allow(dead_code)]
 pub mod message;
-pub use message::SqeRingMessage;
+
 pub mod raw;
-pub use raw::RawSqe;
-pub use raw::{CompletionEffect, CompletionHandler, RawSqeState};
-pub mod single;
-pub use single::SqeSingle;
-pub mod stream;
-pub use stream::{SqeStream, SqeStreamError};
+pub(crate) use self::raw::RawSqe;
+pub(crate) use self::raw::{CompletionEffect, CompletionHandler, RawSqeState};
 
 pub trait Submittable {
     /// We pas the waker so we get access to the RawTask Header.
@@ -32,7 +37,7 @@ pub trait Completable {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum State {
+pub(super) enum State {
     Initial,
     Submitted,
     Completed,
@@ -185,9 +190,9 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeC
                     if this.is_ready() {
                         this.state = State::Completed;
 
-                        let results = mem::replace(&mut this.results, vec![])
+                        let results = std::mem::take(&mut this.results)
                             .into_iter()
-                            .filter_map(|res| res)
+                            .flatten()
                             .collect();
 
                         return Poll::Ready(results);
@@ -328,7 +333,7 @@ mod tests {
             assert_eq!(waker_data.get_pending_io(), num_lists as i32);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.submission().len(), n_sqes);
+                assert_eq!(ctx.ring.sq().len(), n_sqes);
             });
         }
 

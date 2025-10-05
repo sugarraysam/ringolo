@@ -129,7 +129,7 @@ impl Stream for SqeStream {
                                 if matches!(e, SqeStreamError::Fatal(_)) {
                                     this.state = State::Completed;
                                 }
-                                Poll::Ready(Some(Err(e.into())))
+                                Poll::Ready(Some(Err(e)))
                             }
                         }
                     });
@@ -195,7 +195,7 @@ mod tests {
             assert_eq!(waker_data.get_pending_io(), 1);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.submission().len(), 1);
+                assert_eq!(ctx.ring.sq().len(), 1);
 
                 let res = ctx.slab.get(idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());

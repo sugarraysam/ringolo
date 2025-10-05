@@ -6,12 +6,12 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
-pub struct SingleIssuerRing {
+pub(crate) struct SingleIssuerRing {
     ring: IoUring,
 }
 
 impl SingleIssuerRing {
-    pub fn try_new(sq_ring_size: u32) -> Result<Self> {
+    pub(super) fn try_new(sq_ring_size: u32) -> Result<Self> {
         let ring = IoUring::builder()
             // Keep submitting requests even if we encounter error. This is
             // important to reduce the number of syscall. We also want to produce
@@ -30,17 +30,17 @@ impl SingleIssuerRing {
         Ok(SingleIssuerRing { ring })
     }
 
-    pub fn as_raw_fd(&self) -> RawFd {
+    pub(super) fn as_raw_fd(&self) -> RawFd {
         self.ring.as_raw_fd()
     }
 
-    pub fn submit_and_wait(
+    pub(super) fn submit_and_wait(
         &mut self,
         num_to_wait: usize,
         timeout: Option<Duration>,
     ) -> io::Result<usize> {
         // Sync user space and kernel shared queue
-        self.submission().sync();
+        self.ring.submission().sync();
 
         if let Some(duration) = timeout {
             let ts = Timespec::from(duration);
@@ -52,29 +52,26 @@ impl SingleIssuerRing {
         self.ring.submitter().submit_and_wait(num_to_wait)
     }
 
-    pub fn submit_no_wait(&mut self) -> io::Result<usize> {
-        self.submission().sync();
+    pub(super) fn submit_no_wait(&mut self) -> io::Result<usize> {
+        self.ring.submission().sync();
 
         // Submit w/o the IORING_GETEVENTS flags. Since we use coop taskrun,
         // io_uring will process work asynchronously and set the taskrun flag on
         // SQ ring once we have pending CQEs.
         unsafe {
-            return self.ring.submitter().enter::<libc::sigset_t>(
-                0,
-                0,
-                EnterFlags::empty().bits(),
-                None,
-            );
+            self.ring
+                .submitter()
+                .enter::<libc::sigset_t>(0, 0, EnterFlags::empty().bits(), None)
         }
     }
 
     // Because we set IORING_SQ_TASKRUN flag, we have a shortcut to check if
     // we have pending completions.
-    pub fn has_pending_cqes(&self) -> bool {
+    pub(super) fn has_pending_cqes(&self) -> bool {
         unsafe { self.ring.submission_shared() }.taskrun()
     }
 
-    pub fn wait_cqes_timeout(
+    pub(super) fn wait_cqes_timeout(
         &mut self,
         min_complete: u32,
         timeout: Option<Duration>,
@@ -102,19 +99,19 @@ impl SingleIssuerRing {
         }
     }
 
-    pub fn submission(&mut self) -> SubmissionQueue<'_> {
+    pub(crate) fn sq(&mut self) -> SubmissionQueue<'_> {
         self.ring.submission()
     }
 
-    pub fn completion(&mut self) -> CompletionQueue<'_> {
+    pub(crate) fn cq(&mut self) -> CompletionQueue<'_> {
         self.ring.completion()
     }
 
-    pub fn get(&self) -> &IoUring {
+    pub(super) fn get(&self) -> &IoUring {
         &self.ring
     }
 
-    pub fn get_mut(&mut self) -> &mut IoUring {
+    pub(super) fn get_mut(&mut self) -> &mut IoUring {
         &mut self.ring
     }
 }

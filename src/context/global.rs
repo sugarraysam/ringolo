@@ -5,7 +5,7 @@ use std::collections::hash_map::Entry;
 use std::os::fd::RawFd;
 use std::sync::{Mutex, OnceLock, RwLock};
 
-pub struct GlobalContext {
+pub(crate) struct GlobalContext {
     thread_id_manager: ThreadIdManager,
 
     thread_id_to_ring_fd: RwLock<HashMap<ThreadId, RawFd>>,
@@ -22,20 +22,20 @@ impl GlobalContext {
     }
 
     // Singleton public access point, protected with OnceLock.
-    pub fn instance() -> &'static GlobalContext {
+    pub(crate) fn instance() -> &'static GlobalContext {
         static INSTANCE: OnceLock<GlobalContext> = OnceLock::new();
 
-        INSTANCE.get_or_init(|| GlobalContext::new())
+        INSTANCE.get_or_init(GlobalContext::new)
     }
 
-    pub fn release_thread_id_and_ring_fd(&self, thread_id: ThreadId) -> Result<()> {
+    pub(crate) fn release_thread_id_and_ring_fd(&self, thread_id: ThreadId) -> Result<()> {
         // Release ring_fd first to avoid race condition on a new thread being
         // spun up and re-using the same thread id to register it's ring_fd.
         let ring_fd_removed = {
             let mut map = self
                 .thread_id_to_ring_fd
                 .write()
-                .expect("Poisoned ring_fd map");
+                .expect("Poisoned ring_fd map on write");
 
             map.remove(&thread_id).is_some()
         };
@@ -52,18 +52,17 @@ impl GlobalContext {
             })
     }
 
-    pub fn register_ring_fd(&self, ring_fd: RawFd) -> Result<ThreadId> {
+    pub(crate) fn register_ring_fd(&self, ring_fd: RawFd) -> Result<ThreadId> {
         let thread_id = self.thread_id_manager.acquire_id()?;
 
         let mut map = self
             .thread_id_to_ring_fd
             .write()
-            .expect("Poisoned ring_fd map");
+            .expect("Poisoned ring_fd map on write");
 
         if let Entry::Vacant(e) = map.entry(thread_id) {
             // Safely wraps around on overflow - use to detect if we registered
             // too many threads.
-
             e.insert(ring_fd);
             Ok(thread_id)
         } else {
@@ -72,10 +71,10 @@ impl GlobalContext {
         }
     }
 
-    pub fn get_ring_fd(&self, thread_id: ThreadId) -> Result<RawFd> {
+    pub(crate) fn get_ring_fd(&self, thread_id: ThreadId) -> Result<RawFd> {
         self.thread_id_to_ring_fd
             .read()
-            .unwrap()
+            .expect("Poisoned ring_fd map on read")
             .get(&thread_id)
             .ok_or(anyhow!("Invalid thread_id"))
             .copied()
@@ -89,12 +88,12 @@ impl GlobalContext {
 // This implementation allows returning ThreadId's which is important to implement
 // autoscaling of workers. We leverage a bitset as it is very fast and memory
 // efficient.
-pub struct ThreadIdManager {
+struct ThreadIdManager {
     id_map: Mutex<[u64; 4]>,
 }
 
 impl ThreadIdManager {
-    pub fn new() -> Self {
+    fn new() -> Self {
         ThreadIdManager {
             // 256 bits/threads available
             id_map: Mutex::new([u64::MAX; 4]),
@@ -102,7 +101,7 @@ impl ThreadIdManager {
     }
 
     /// Acquires the lowest available ThreadId.
-    pub fn acquire_id(&self) -> Result<ThreadId> {
+    fn acquire_id(&self) -> Result<ThreadId> {
         let mut map = self.id_map.lock().expect("Lock poisoned");
 
         for (i, word) in map.iter_mut().enumerate() {
@@ -124,7 +123,7 @@ impl ThreadIdManager {
 
     /// Releases a ThreadId, making it available for reuse.
     /// Panics if the ID is out of bounds or was already marked as free.
-    pub fn release_id(&self, id: ThreadId) -> Result<()> {
+    fn release_id(&self, id: ThreadId) -> Result<()> {
         let mut map = self.id_map.lock().expect("Lock poisoned");
 
         let block_offset = (id / 64) as usize;
@@ -143,7 +142,7 @@ impl ThreadIdManager {
         }
     }
 
-    pub fn is_available(&self, id: ThreadId) -> bool {
+    fn is_available(&self, id: ThreadId) -> bool {
         let block_offset = (id / 64) as usize;
         let bit_idx = (id % 64) as u32;
         let mask = 1u64 << bit_idx;

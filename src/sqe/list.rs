@@ -113,9 +113,9 @@ impl Drop for SqeList {
     }
 }
 
-impl Into<Sqe<SqeList>> for SqeList {
-    fn into(self) -> Sqe<SqeList> {
-        Sqe::new(self)
+impl From<SqeList> for Sqe<SqeList> {
+    fn from(val: SqeList) -> Self {
+        Sqe::new(val)
     }
 }
 
@@ -125,6 +125,12 @@ impl Into<Sqe<SqeList>> for SqeList {
 // - will only wake up Future when all SQEs have completed
 pub struct SqeBatchBuilder {
     inner: SqeListBuilder,
+}
+
+impl Default for SqeBatchBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqeBatchBuilder {
@@ -154,6 +160,12 @@ impl SqeBatchBuilder {
 // - We only wake up the Future after all SQEs have completed
 pub struct SqeChainBuilder {
     inner: SqeListBuilder,
+}
+
+impl Default for SqeChainBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SqeChainBuilder {
@@ -354,7 +366,7 @@ mod tests {
             assert_eq!(waker_data.get_pending_io(), 1);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.submission().len(), size);
+                assert_eq!(ctx.ring.sq().len(), size);
 
                 // Waker only set on head in batch/chain setup
                 let res = ctx.slab.get(head_idx).and_then(|sqe| {
@@ -453,7 +465,7 @@ mod tests {
             assert_eq!(waker_data.get_pending_io(), 1);
 
             with_context_mut(|ctx| {
-                assert_eq!(ctx.ring.submission().len(), size);
+                assert_eq!(ctx.ring.sq().len(), size);
 
                 // Waker only set on head in batch/chain setup
                 let res = ctx.slab.get(head_idx).and_then(|sqe| {
@@ -506,10 +518,10 @@ mod tests {
 
     #[test]
     fn test_overflow_slab() -> Result<()> {
-        let slab_size = 32;
-        let batch_size = slab_size * 2;
+        let ring_size = 32;
+        let batch_size = (ring_size * 2) + 1;
 
-        init_context(slab_size);
+        init_context(ring_size);
 
         let mut builder = SqeBatchBuilder::new();
         for _ in 0..batch_size {

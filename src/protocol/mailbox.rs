@@ -21,6 +21,12 @@ pub struct Mailbox {
     expired: BTreeSet<(Instant, MsgId)>,
 }
 
+impl Default for Mailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Mailbox {
     pub fn new() -> Self {
         Self {

@@ -1,12 +1,10 @@
 #![allow(unused_imports)]
 
-pub mod mailbox;
-pub use mailbox::Mailbox;
+pub(crate) mod mailbox;
+pub use self::mailbox::Mailbox;
 
-pub mod message;
-pub use message::MsgId;
-pub use message::OpCode;
-pub use message::RingMessage;
+pub(crate) mod message;
+pub use self::message::{MsgId, OpCode, RingMessage};
 
-pub mod state;
-pub use state::ProtocolStateful;
+pub(crate) mod state;
+pub use self::state::ProtocolStateful;

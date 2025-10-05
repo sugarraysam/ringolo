@@ -65,9 +65,9 @@ impl DerefMut for MsgId {
     }
 }
 
-impl Into<i32> for MsgId {
-    fn into(self) -> i32 {
-        self.0
+impl From<MsgId> for i32 {
+    fn from(val: MsgId) -> Self {
+        val.0
     }
 }
 
@@ -109,9 +109,9 @@ impl TryFrom<i32> for OpCode {
     }
 }
 
-impl Into<u8> for OpCode {
-    fn into(self) -> u8 {
-        self as u8
+impl From<OpCode> for u8 {
+    fn from(val: OpCode) -> Self {
+        val as u8
     }
 }
 
@@ -129,7 +129,6 @@ impl RingMessage {
             RingMessage::Shutdown { msg_id, .. } => *msg_id,
             RingMessage::StealTask { msg_id, .. } => *msg_id,
         }
-        .into()
     }
 
     pub fn opcode(&self) -> OpCode {
@@ -203,7 +202,7 @@ impl RingMessage {
                 task_address,
             } => {
                 let opcode = (OpCode::StealTask as i32) << MSG_ID_BITS;
-                ((magic | opcode | **msg_id), *task_address as u64)
+                ((magic | opcode | **msg_id), (*task_address))
             }
         };
 

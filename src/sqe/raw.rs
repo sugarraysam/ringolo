@@ -9,7 +9,7 @@ use std::task::Waker;
 use crate::sqe::stream::SqeStreamError;
 
 #[derive(Debug)]
-pub enum StreamCompletion {
+pub(crate) enum StreamCompletion {
     // The operation completes after a known number of events (e.g., `Timeout`).
     ByCount { remaining: Arc<AtomicUsize> },
 
@@ -18,7 +18,7 @@ pub enum StreamCompletion {
 }
 
 impl StreamCompletion {
-    pub fn new(count: Option<usize>) -> Self {
+    pub(crate) fn new(count: Option<usize>) -> Self {
         if let Some(count) = count {
             StreamCompletion::ByCount {
                 remaining: Arc::new(AtomicUsize::new(count)),
@@ -28,7 +28,7 @@ impl StreamCompletion {
         }
     }
 
-    pub fn has_more(&self) -> bool {
+    pub(crate) fn has_more(&self) -> bool {
         match self {
             StreamCompletion::ByCount { remaining } => remaining.load(Ordering::Relaxed) > 0,
             StreamCompletion::ByFlag { done } => !*done,
@@ -39,7 +39,7 @@ impl StreamCompletion {
 // Enum to hold the data that is different for each completion type. RawSqe is
 // responsible to implement the logic.
 #[derive(Debug)]
-pub enum CompletionHandler {
+pub(crate) enum CompletionHandler {
     Single {
         result: Option<io::Result<i32>>,
     },
@@ -63,11 +63,14 @@ pub enum CompletionHandler {
 }
 
 impl CompletionHandler {
-    pub fn new_single() -> CompletionHandler {
+    pub(crate) fn new_single() -> CompletionHandler {
         CompletionHandler::Single { result: None }
     }
 
-    pub fn new_batch_or_chain(head: usize, remaining: Arc<AtomicUsize>) -> CompletionHandler {
+    pub(crate) fn new_batch_or_chain(
+        head: usize,
+        remaining: Arc<AtomicUsize>,
+    ) -> CompletionHandler {
         CompletionHandler::BatchOrChain {
             head,
             remaining,
@@ -75,26 +78,26 @@ impl CompletionHandler {
         }
     }
 
-    pub fn new_stream(count: Option<usize>) -> CompletionHandler {
+    pub(crate) fn new_stream(count: Option<usize>) -> CompletionHandler {
         CompletionHandler::Stream {
             results: VecDeque::new(),
             completion: StreamCompletion::new(count),
         }
     }
 
-    pub fn new_message() -> CompletionHandler {
+    pub(crate) fn new_message() -> CompletionHandler {
         CompletionHandler::Message
     }
 }
 
 #[derive(Debug, Clone)]
-pub enum CompletionEffect {
+pub(crate) enum CompletionEffect {
     None,
     WakeHead { head: usize },
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub enum RawSqeState {
+pub(crate) enum RawSqeState {
     // Up for grabs
     Available,
 
@@ -109,18 +112,18 @@ pub enum RawSqeState {
 }
 
 #[derive(Debug)]
-pub struct RawSqe {
-    pub entry: Option<Entry>,
+pub(crate) struct RawSqe {
+    pub(crate) entry: Option<Entry>,
 
-    pub waker: Option<Waker>,
+    pub(crate) waker: Option<Waker>,
 
-    pub state: RawSqeState,
+    pub(crate) state: RawSqeState,
 
-    pub handler: CompletionHandler,
+    pub(crate) handler: CompletionHandler,
 }
 
 impl RawSqe {
-    pub fn new(entry: Entry, handler: CompletionHandler) -> Self {
+    pub(crate) fn new(entry: Entry, handler: CompletionHandler) -> Self {
         Self {
             entry: Some(entry),
             handler,
@@ -129,23 +132,23 @@ impl RawSqe {
         }
     }
 
-    pub fn get_entry(&self) -> Result<&Entry> {
+    pub(crate) fn get_entry(&self) -> Result<&Entry> {
         self.entry.as_ref().ok_or_else(|| anyhow!("Entry is None"))
     }
 
-    pub fn set_available(&mut self) {
+    pub(crate) fn set_available(&mut self) {
         self.state = RawSqeState::Available;
     }
 
-    pub fn get_state(&self) -> RawSqeState {
+    pub(crate) fn get_state(&self) -> RawSqeState {
         self.state
     }
 
-    pub fn has_waker(&self) -> bool {
+    pub(crate) fn has_waker(&self) -> bool {
         self.waker.is_some()
     }
 
-    pub fn set_waker(&mut self, waker: &Waker) {
+    pub(crate) fn set_waker(&mut self, waker: &Waker) {
         if let Some(waker_ref) = self.waker.as_ref() {
             // No need to override waker if they are related.
             if waker_ref.will_wake(waker) {
@@ -157,7 +160,7 @@ impl RawSqe {
         self.waker = Some(waker.clone());
     }
 
-    pub fn set_user_data(&mut self, user_data: u64) -> Result<()> {
+    pub(crate) fn set_user_data(&mut self, user_data: u64) -> Result<()> {
         if !matches!(self.state, RawSqeState::Available) {
             return Err(anyhow!("unexpected state {:?}", self.state));
         }
@@ -174,7 +177,7 @@ impl RawSqe {
     }
 
     // Optionally returns a "head" to wake if we're working with BatchOrChain.
-    pub fn on_completion(
+    pub(crate) fn on_completion(
         &mut self,
         cqe_res: i32,
         cqe_flags: Option<u32>,
@@ -225,7 +228,7 @@ impl RawSqe {
                     StreamCompletion::ByFlag { done } => {
                         // If we have the `IORING_CQE_F_MORE` flags set, it means we are
                         // expecting more results, otherwise this was the final result.
-                        *done = cqe_flags.map_or(false, io_uring::cqueue::more);
+                        *done = cqe_flags.is_some_and(io_uring::cqueue::more);
                         *done
                     }
                 };
@@ -247,7 +250,7 @@ impl RawSqe {
         }
     }
 
-    pub fn pop_next_result(&mut self) -> Result<Option<i32>, SqeStreamError> {
+    pub(crate) fn pop_next_result(&mut self) -> Result<Option<i32>, SqeStreamError> {
         if matches!(self.state, RawSqeState::Pending) {
             return Ok(None);
         }
@@ -281,7 +284,7 @@ impl RawSqe {
         .into())
     }
 
-    pub fn take_final_result(&mut self) -> Result<(Entry, io::Result<i32>)> {
+    pub(crate) fn take_final_result(&mut self) -> Result<(Entry, io::Result<i32>)> {
         if !matches!(self.state, RawSqeState::Ready) {
             return Err(anyhow!("unexpected state: {:?}", self.state));
         }
@@ -304,23 +307,25 @@ impl RawSqe {
         Ok((entry, result))
     }
 
-    pub fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         matches!(self.state, RawSqeState::Ready)
     }
 
-    pub fn wake(&mut self) -> Result<()> {
-        Ok(self.waker.take().context("No waker to wake")?.wake())
+    pub(crate) fn wake(&mut self) -> Result<()> {
+        let _: () = self.waker.take().context("No waker to wake")?.wake();
+        Ok(())
     }
 
     // Wakes up the task without consuming the waker. Useful for `SqeMore` where
     // we get N cqes for a single SQE. Prefer using consuming `wake()` version
     // when possible as this has a performance cost.
-    pub fn wake_by_ref(&self) -> Result<()> {
-        Ok(self
+    pub(crate) fn wake_by_ref(&self) -> Result<()> {
+        let _: () = self
             .waker
             .as_ref()
             .context("No waker to wake")?
-            .wake_by_ref())
+            .wake_by_ref();
+        Ok(())
     }
 }
 

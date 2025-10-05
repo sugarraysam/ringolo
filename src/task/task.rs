@@ -49,6 +49,17 @@ impl<S: 'static> Task<S> {
         // Safety: The header pointer is valid.
         unsafe { Header::get_id(self.raw.header_ptr()) }
     }
+
+    /// Returns true if the task can safely be stolen by another thread. This is
+    /// true if there are no pending IO operations on the current thread's
+    /// iouring.
+    ///
+    // We keep track of inflight IO operations through the waker, and
+    // the Submittable interface.
+    pub(crate) fn is_stealable(&self) -> bool {
+        // Safety: The header pointer is valid.
+        unsafe { Header::is_stealable(self.raw.header_ptr()) }
+    }
 }
 
 impl<S: Schedule> Task<S> {
@@ -106,6 +117,10 @@ impl<S: 'static> Notified<S> {
 
     pub(crate) fn task_id(&self) -> crate::task::Id {
         self.0.id()
+    }
+
+    pub(crate) fn is_stealable(&self) -> bool {
+        self.0.is_stealable()
     }
 }
 

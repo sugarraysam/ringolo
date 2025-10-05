@@ -1,3 +1,5 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::context::RawSqeSlab;
 use crate::sqe::{CompletionEffect, RawSqeState};
 use crate::task::Id;
@@ -13,21 +15,37 @@ use crate::protocol::message::{MAX_MSG_COUNTER_VALUE, MSG_COUNTER_BITS, MsgId};
 
 pub(crate) struct LocalContext {
     // Global thread_id
-    pub thread_id: ThreadId,
+    pub(crate) thread_id: ThreadId,
 
     // Slab to manage RawSqe allocations for this thread.
-    pub slab: RawSqeSlab,
+    pub(crate) slab: RawSqeSlab,
 
     // IoUring to submit and complete IO operations.
-    pub ring_fd: RawFd,
-    pub ring: SingleIssuerRing,
+    pub(crate) ring_fd: RawFd,
+    pub(crate) ring: SingleIssuerRing,
 
     // TODO: add to mailbox
-    pub ring_msg_counter: u32,
+    pub(crate) ring_msg_counter: u32,
 
     // Task that is currently executing on this thread.
-    pub current_task_id: Option<Id>,
+    pub(crate) current_task_id: Option<Id>,
 }
+
+// Final size of slab will be `sq_ring_size * SLAB_SIZE_MULTIPLIER`.
+// Default is 2 to reflect the size of the CQ ring that is also twice the SQ ring.
+//
+// Why? We have SQE primitives like SqeStream which will post N CQEs for each SQE.
+// Since each SQE is associated with a RawSqe in the slab, we need to have a buffer
+// as most of the time CQ >> SQ.
+//
+// The other reason is that if the SQ ring is full, we can recover from the error.
+// We can simply retry to `poll()` the task in the next `event_loop` pass. BUT
+// if the RawSqeSlab is the same size as the SQ ring, we will overflow in the slab
+// and won't be able to gracefully handle SQ ring going above capacity.
+//
+// In all cases, if the SQ ring goes above capacity, the program should send a
+// loud signal to the user and runtim configuration needs to be changed ASAP.
+const SLAB_SIZE_MULTIPLIER: usize = 2;
 
 impl LocalContext {
     pub(super) fn try_new(sq_ring_size: usize) -> Result<Self> {
@@ -38,7 +56,7 @@ impl LocalContext {
 
         Ok(Self {
             thread_id,
-            slab: RawSqeSlab::new(sq_ring_size),
+            slab: RawSqeSlab::new(sq_ring_size * SLAB_SIZE_MULTIPLIER),
             ring_fd: ring.as_raw_fd(),
             ring,
             ring_msg_counter: 0,
@@ -55,14 +73,14 @@ impl LocalContext {
     ) -> io::Result<i32> {
         // Need to manually access the fields to avoid immutable vs. mutable
         // borrow issues or double borrow problem.
-        let mut sq = self.ring.submission();
+        let mut sq = self.ring.sq();
 
         for idx in indices {
             let entry = self
                 .slab
                 .get(*idx)
                 .and_then(|sqe| sqe.get_entry())
-                .map_err(|_e| io::Error::new(io::ErrorKind::Other, "Can't find RawSqe in slab."))?;
+                .map_err(|_e| io::Error::other("Can't find RawSqe in slab."))?;
 
             unsafe { sq.push(entry) }
                 .map_err(|_e| io::Error::new(io::ErrorKind::ResourceBusy, "SQ ring full."))?;
@@ -92,17 +110,17 @@ impl LocalContext {
     // this will result in an infinite loop.
     pub(crate) fn process_cqes(&mut self, num_to_complete: Option<usize>) -> Result<usize> {
         let mut num_completed = 0;
-        let to_complete = num_to_complete.unwrap_or(self.ring.completion().len());
+        let to_complete = num_to_complete.unwrap_or(self.ring.cq().len());
 
         let mut should_sync = false;
 
         while num_completed < to_complete {
             // Avoid syncing on first pass
             if should_sync {
-                self.ring.completion().sync();
+                self.ring.cq().sync();
             }
 
-            for cqe in self.ring.completion() {
+            for cqe in self.ring.cq() {
                 let raw_sqe = match self.slab.get_mut(cqe.user_data() as usize) {
                     Err(e) => {
                         eprintln!("CQE user data not found in RawSqeSlab: {:?}", e);
@@ -142,6 +160,7 @@ impl LocalContext {
     // RingMessage protocol. The reasoning is we want to avoid collisions when
     // storing MsgIds in the Mailbox. We achieve this goal by including the
     // unique `thread_id` in the upper 8 bits of the MsgId.
+    #[allow(dead_code)]
     pub(crate) fn next_ring_msg_id(&mut self) -> MsgId {
         let prev_msg_counter = self.ring_msg_counter as i32;
 

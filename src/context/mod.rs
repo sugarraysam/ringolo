@@ -5,10 +5,10 @@ use std::thread_local;
 
 // Exports
 mod global;
-pub(crate) use global::GlobalContext;
+pub(crate) use self::global::GlobalContext;
 
 mod local;
-pub(crate) use local::LocalContext;
+pub(crate) use self::local::LocalContext;
 
 mod ring;
 mod slab;
@@ -20,7 +20,7 @@ mod slab;
 pub(crate) type ThreadId = u8;
 
 thread_local! {
-    static CONTEXT: OnceCell<RefCell<LocalContext>> = OnceCell::new();
+    static CONTEXT: OnceCell<RefCell<LocalContext>> = const { OnceCell::new() };
 }
 
 // Lazily initialize LocalContext /w custom args.
@@ -90,23 +90,23 @@ mod tests {
 
         init_context(THREAD_A_RING_SIZE);
         with_context_mut(|ctx| {
-            assert_eq!(ctx.slab.capacity(), THREAD_A_RING_SIZE);
-            assert_eq!(ctx.ring.submission().capacity(), THREAD_A_RING_SIZE);
+            assert_eq!(ctx.slab.capacity(), THREAD_A_RING_SIZE * 2);
+            assert_eq!(ctx.ring.sq().capacity(), THREAD_A_RING_SIZE);
         });
 
         let handle = thread::spawn(move || {
             init_context(THREAD_B_RING_SIZE);
             with_context_mut(|ctx| {
-                assert_eq!(ctx.slab.capacity(), THREAD_B_RING_SIZE);
-                assert_eq!(ctx.ring.submission().capacity(), THREAD_B_RING_SIZE);
+                assert_eq!(ctx.slab.capacity(), THREAD_B_RING_SIZE * 2);
+                assert_eq!(ctx.ring.sq().capacity(), THREAD_B_RING_SIZE);
             });
         });
 
         assert!(handle.join().is_ok());
 
         with_context_mut(|ctx| {
-            assert_eq!(ctx.slab.capacity(), THREAD_A_RING_SIZE);
-            assert_eq!(ctx.ring.submission().capacity(), THREAD_A_RING_SIZE);
+            assert_eq!(ctx.slab.capacity(), THREAD_A_RING_SIZE * 2);
+            assert_eq!(ctx.ring.sq().capacity(), THREAD_A_RING_SIZE);
         });
     }
 
@@ -152,6 +152,7 @@ mod tests {
         pub thread_ids: HashSet<ThreadId>,
         pub ring_fds: HashSet<RawFd>,
     }
+
     impl ThreadData {
         pub fn new() -> Self {
             Self {
@@ -208,7 +209,6 @@ mod tests {
         assert_eq!(data.thread_ids.len(), expected);
         assert_eq!(data.ring_fds.len(), expected);
 
-        // TODO: thread unregisters itself upon exit
         Ok(())
     }
 }

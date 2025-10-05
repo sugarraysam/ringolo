@@ -10,7 +10,7 @@ use std::task::{Poll, Waker};
 // TODO: this is largely unusable as of now, need to re-implement the protocol
 // we need to send multiple messages and support ACK to be truly useful.
 #[derive(Debug)]
-pub struct SqeRingMessage {
+pub(crate) struct SqeRingMessage {
     // Index to RawSqe in thread-local Slab
     idx: usize,
     // id :: returned by Mailbox, will be able to retrieve answers
@@ -19,7 +19,7 @@ pub struct SqeRingMessage {
 }
 
 impl SqeRingMessage {
-    pub fn try_new(entry: Entry) -> Result<Self> {
+    pub(crate) fn try_new(entry: Entry) -> Result<Self> {
         let idx = with_context_mut(|ctx| -> Result<usize> {
             let (idx, _) = ctx
                 .slab
@@ -62,8 +62,8 @@ impl Drop for SqeRingMessage {
     }
 }
 
-impl Into<Sqe<SqeRingMessage>> for SqeRingMessage {
-    fn into(self) -> Sqe<SqeRingMessage> {
-        Sqe::new(self)
+impl From<SqeRingMessage> for Sqe<SqeRingMessage> {
+    fn from(val: SqeRingMessage) -> Self {
+        Sqe::new(val)
     }
 }

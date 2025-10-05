@@ -1,10 +1,14 @@
-// Re-exports
+// Public API
 pub mod abort;
 pub use self::abort::AbortHandle;
 
 mod error;
 pub use self::error::JoinError;
 
+mod join;
+pub use self::join::JoinHandle;
+
+// Re-exports
 pub mod id;
 pub(crate) use self::id::Id;
 
@@ -12,9 +16,6 @@ mod harness;
 
 mod header;
 pub(crate) use self::header::Header;
-
-mod join;
-pub use self::join::JoinHandle;
 
 mod layout;
 
