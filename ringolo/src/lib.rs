@@ -1,9 +1,13 @@
-// TODO: clean this up expose public API
+#[doc(inline)]
+pub use ringolo_macros::main;
+
+#[doc(inline)]
+pub use ringolo_macros::test;
+
 pub mod context;
 
 pub mod future;
 
-#[allow(dead_code, unused)]
 pub mod runtime;
 
 pub mod sqe;

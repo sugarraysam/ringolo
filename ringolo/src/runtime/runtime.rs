@@ -1,16 +1,11 @@
-use crate::context::ThreadId;
 use crate::runtime::Scheduler;
 use crate::runtime::local;
 use crate::runtime::stealing;
-use anyhow::{Error, Result};
+use anyhow::Result;
 use std::convert::TryFrom;
-use std::default;
-use std::f64::MAX;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
-use std::thread::Thread;
 
 pub struct Runtime {
     scheduler: Scheduler,
@@ -19,6 +14,15 @@ pub struct Runtime {
 impl Runtime {
     pub(super) fn new(scheduler: Scheduler) -> Runtime {
         Runtime { scheduler }
+    }
+
+    // (1) For Local runtime, this blocks current thread, and executes web of future to completion.
+    // (2) For stealing runtime, calling `try_build()` spins up N-1 workers, and initializes the thread
+    //     on which the runtime is built to be part of the runtime. It is expected that the user will
+    //     call `block_on` after `try_build`, which will cause the current thread to start executing
+    //     futures.
+    pub fn block_on<F: Future>(&self, f: F) {
+        // unimplemented!("TODO");
     }
 
     pub(crate) fn expect_local_scheduler(&self) -> local::Handle {

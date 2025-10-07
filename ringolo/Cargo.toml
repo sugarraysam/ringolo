@@ -1,0 +1,24 @@
+[package]
+name = "ringolo"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+doctest = false # TODO: fix doctest and enable
+
+[dependencies]
+anyhow = "^1.0.99"
+async-trait = "^0.1.89"
+crossbeam-deque = "0.8.6"
+either = "^1.15.0"
+futures = "0.3.31"
+libc = { version = "0.2.98", default-features = false }
+paste = "1.0.15"
+# io-uring = "^0.7.10"
+io-uring = { git = "https://github.com/sugarraysam/io-uring.git", branch = "origin/expose-enter-flags" }
+ringolo-macros = { version = "0.1.0", path = "../ringolo-macros" }
+rstest = "0.26.1"
+slab = "0.4.11"
+static_assertions = "1.1.0"
+thiserror = "2.0.17"
+tracing = "0.1.41"
