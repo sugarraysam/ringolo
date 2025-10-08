@@ -1,3 +1,4 @@
+#![allow(dead_code, unused)]
 //! Implementation of a work stealing scheduler.
 
 // Public API
@@ -11,4 +12,3 @@ pub(crate) use context::Context;
 pub(crate) use scheduler::Scheduler;
 
 pub mod worker;
-pub(crate) use worker::Worker;

@@ -11,5 +11,7 @@ pub(crate) use context::Context;
 
 pub(crate) use scheduler::Scheduler;
 
+#[cfg(test)]
+mod tests;
+
 pub(crate) mod worker;
-pub(crate) use worker::Worker;

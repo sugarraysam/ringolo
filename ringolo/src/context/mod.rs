@@ -2,7 +2,6 @@ use crate::runtime::{RuntimeConfig, local, stealing};
 use crate::task::Id;
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
-use std::rc::Rc;
 use std::thread_local;
 
 // Exports
@@ -27,14 +26,10 @@ thread_local! {
     static CONTEXT: OnceCell<RefCell<ContextWrapper>> = const { OnceCell::new() };
 }
 
-pub(crate) fn init_local_context(
-    cfg: &RuntimeConfig,
-    scheduler: local::Handle,
-    worker: Rc<local::Worker>,
-) -> Result<()> {
+pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) -> Result<()> {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
-            let ctx = local::Context::try_new(cfg, scheduler, worker)
+            let ctx = local::Context::try_new(cfg, scheduler)
                 .expect("Failed to initialize thread-local context");
             RefCell::new(ContextWrapper::Local(ctx))
         });
@@ -43,26 +38,17 @@ pub(crate) fn init_local_context(
     Ok(())
 }
 
-pub(crate) fn with_context<F, R>(f: F) -> R
+pub(crate) fn expect_local_context<F, R>(f: F) -> R
 where
-    F: FnOnce(&ContextWrapper) -> R,
+    F: FnOnce(&local::Context) -> R,
 {
-    CONTEXT.with(|ctx| {
-        let ctx = ctx.get().expect("Context not initialized").borrow();
-        f(&ctx)
+    with_context(|outer| match outer {
+        ContextWrapper::Local(ctx) => f(ctx),
+        _ => panic!("Thread not initialized with local context."),
     })
 }
 
-pub(crate) fn with_context_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut ContextWrapper) -> R,
-{
-    CONTEXT.with(|ctx| {
-        let mut ctx = ctx.get().expect("Context not initialized").borrow_mut();
-        f(&mut ctx)
-    })
-}
-
+#[inline(always)]
 pub(crate) fn with_core<F, R>(f: F) -> R
 where
     F: FnOnce(&Core) -> R,
@@ -73,6 +59,7 @@ where
     })
 }
 
+#[inline(always)]
 pub(crate) fn with_core_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Core) -> R,
@@ -83,6 +70,7 @@ where
     })
 }
 
+#[inline(always)]
 pub(crate) fn with_slab<F, R>(f: F) -> R
 where
     F: FnOnce(&RawSqeSlab) -> R,
@@ -90,6 +78,7 @@ where
     with_core(|core| f(&core.slab.borrow()))
 }
 
+#[inline(always)]
 pub(crate) fn with_slab_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut RawSqeSlab) -> R,
@@ -97,6 +86,7 @@ where
     with_core_mut(|core| f(&mut core.slab.borrow_mut()))
 }
 
+#[inline(always)]
 pub(crate) fn with_ring<F, R>(f: F) -> R
 where
     F: FnOnce(&SingleIssuerRing) -> R,
@@ -104,6 +94,7 @@ where
     with_core(|core| f(&core.ring.borrow()))
 }
 
+#[inline(always)]
 pub(crate) fn with_ring_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SingleIssuerRing) -> R,
@@ -111,6 +102,7 @@ where
     with_core_mut(|core| f(&mut core.ring.borrow_mut()))
 }
 
+#[inline(always)]
 pub(crate) fn with_slab_and_ring<F, R>(f: F) -> R
 where
     F: FnOnce(&RawSqeSlab, &SingleIssuerRing) -> R,
@@ -118,6 +110,7 @@ where
     with_slab(|slab| with_ring(|ring| f(slab, ring)))
 }
 
+#[inline(always)]
 pub(crate) fn with_slab_and_ring_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut RawSqeSlab, &mut SingleIssuerRing) -> R,
@@ -147,6 +140,29 @@ pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
     with_context(|outer| match outer {
         ContextWrapper::Local(c) => c.core.borrow().current_task_id.replace(id),
         ContextWrapper::Stealing(c) => c.core.borrow().current_task_id.replace(id),
+    })
+}
+
+// Private helpers.
+#[inline(always)]
+fn with_context<F, R>(f: F) -> R
+where
+    F: FnOnce(&ContextWrapper) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let ctx = ctx.get().expect("Context not initialized").borrow();
+        f(&ctx)
+    })
+}
+
+#[inline(always)]
+fn with_context_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut ContextWrapper) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let mut ctx = ctx.get().expect("Context not initialized").borrow_mut();
+        f(&mut ctx)
     })
 }
 

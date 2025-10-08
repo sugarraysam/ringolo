@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use crate::context::ring::SingleIssuerRing;
 
-/// Core Thread-local context required by all flavors of schedulers.
+/// Core Thread-local context required by all flavors of schedulers. Requires
+/// interior mutability on ALL fields for best interface. Will allow borrowing
+/// multiple fields as mut in the same context. Otherwise we will run in borrow
+/// checker issues.
 pub(crate) struct Core {
     pub(crate) thread_id: ThreadId,
 
@@ -35,7 +38,9 @@ impl Core {
 
         Ok(Self {
             thread_id: ThreadId::next(),
-            slab: RefCell::new(RawSqeSlab::new(cfg.sq_ring_size * cfg.slab_size_multiplier)),
+            slab: RefCell::new(RawSqeSlab::new(
+                cfg.sq_ring_size * cfg.cq_ring_size_multiplier,
+            )),
             ring_fd: ring.as_raw_fd(),
             ring: RefCell::new(ring),
             current_task_id: Cell::new(None),
@@ -77,10 +82,6 @@ impl Core {
 
     pub(crate) fn submit_no_wait(&mut self) -> io::Result<usize> {
         self.ring.get_mut().submit_no_wait()
-    }
-
-    pub(crate) fn has_pending_cqes(&self) -> bool {
-        self.ring.borrow().has_pending_cqes()
     }
 
     // Will busy loop until `num_to_complete` has been achieved. It is the caller's
@@ -125,10 +126,11 @@ impl Core {
 
                 num_completed += 1;
 
-                if let CompletionEffect::WakeHead { head } =
-                    raw_sqe.on_completion(cqe.result(), cqe_flags)?
-                {
-                    slab.get_mut(head)?.wake()?;
+                for effect in raw_sqe.on_completion(cqe.result(), cqe_flags)? {
+                    match effect {
+                        CompletionEffect::DecrementPendingIo => slab.pending_ios -= 1,
+                        CompletionEffect::WakeHead { head } => slab.get_mut(head)?.wake()?,
+                    }
                 }
             }
 
@@ -136,6 +138,14 @@ impl Core {
         }
 
         Ok(num_completed)
+    }
+
+    pub(crate) fn num_unsubmitted_sqes(&self) -> usize {
+        self.ring.borrow_mut().sq().len()
+    }
+
+    pub(crate) fn has_ready_cqes(&self) -> bool {
+        self.ring.borrow_mut().has_ready_cqes()
     }
 }
 

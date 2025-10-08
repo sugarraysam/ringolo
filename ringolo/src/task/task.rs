@@ -113,6 +113,12 @@ impl<S: 'static> Notified<S> {
         raw
     }
 
+    /// Runs the task.
+    pub(crate) fn run(self) {
+        let raw = self.into_raw();
+        raw.poll();
+    }
+
     fn header(&self) -> &Header {
         self.0.header()
     }

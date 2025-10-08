@@ -13,8 +13,6 @@ use std::sync::RwLock;
 pub(crate) struct Context {
     pub(crate) scheduler: stealing::Handle,
 
-    pub(crate) worker: &'static stealing::Worker,
-
     pub(crate) core: RefCell<Core>,
 
     pub(crate) shared: Arc<Shared>,
@@ -30,7 +28,6 @@ impl Context {
     pub(crate) fn try_new(
         cfg: &RuntimeConfig,
         scheduler: stealing::Handle,
-        worker: &'static stealing::Worker,
         shared: Arc<Shared>,
     ) -> Result<Self> {
         let core = Core::try_new(cfg)?;
@@ -39,15 +36,10 @@ impl Context {
 
         Ok(Self {
             scheduler,
-            worker,
             core: RefCell::new(core),
             shared,
             ring_msg_counter: 0,
         })
-    }
-
-    pub(crate) fn get_worker(&self) -> &stealing::Worker {
-        self.worker
     }
 
     pub(crate) fn with_core<F, R>(&self, f: F) -> R

@@ -1,9 +1,9 @@
-use std::iter;
-use std::sync::Arc;
-
 use crate::runtime::stealing::scheduler::StealableTask;
 use crate::runtime::{EventLoop, RuntimeConfig};
+use anyhow::Result;
 use crossbeam_deque::{Injector, Stealer, Worker as CbWorker};
+use std::iter;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
@@ -79,7 +79,7 @@ impl EventLoop for Worker {
         })
     }
 
-    fn event_loop(&self) {
+    fn event_loop<F: Future>(&self, _root_future: Option<F>) -> Result<F::Output> {
         unimplemented!("TODO");
     }
 }

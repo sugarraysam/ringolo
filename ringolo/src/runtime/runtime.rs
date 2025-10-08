@@ -4,8 +4,13 @@ use crate::runtime::stealing;
 use anyhow::Result;
 use std::convert::TryFrom;
 use std::fmt;
+use std::mem;
 use std::sync::Arc;
 use std::thread;
+
+/// Boundary value to prevent stack overflow caused by a large-sized
+/// Future being placed in the stack.
+pub(crate) const BOX_FUTURE_THRESHOLD: usize = if cfg!(debug_assertions) { 2048 } else { 16384 };
 
 pub struct Runtime {
     scheduler: Scheduler,
@@ -21,10 +26,29 @@ impl Runtime {
     //     on which the runtime is built to be part of the runtime. It is expected that the user will
     //     call `block_on` after `try_build`, which will cause the current thread to start executing
     //     futures.
-    pub fn block_on<F: Future>(&self, f: F) {
-        // unimplemented!("TODO");
+    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
+        let fut_size = mem::size_of::<F>();
+        if fut_size > BOX_FUTURE_THRESHOLD {
+            self.block_on_inner(Box::pin(future))
+        } else {
+            self.block_on_inner(future)
+        }
     }
+}
 
+// Private functions
+impl Runtime {
+    fn block_on_inner<F: Future>(&self, future: F) -> F::Output {
+        match &self.scheduler {
+            Scheduler::Local(handle) => handle.block_on(future),
+            Scheduler::Stealing(_handle) => unimplemented!("TODO"),
+        }
+    }
+}
+
+// Test-only helpers
+#[cfg(test)]
+impl Runtime {
     pub(crate) fn expect_local_scheduler(&self) -> local::Handle {
         match &self.scheduler {
             Scheduler::Local(handle) => handle.clone(),
@@ -38,28 +62,32 @@ impl Runtime {
             _ => panic!("Runtime not using stealing sheduler"),
         }
     }
-
-    // TODO:
-    // - block_on
-    // - shutdown
-    // - methods just forward to scheduler
 }
 
 // TODO missing from tokio:
 // - UnhandledPanic
 // - metrics
 
-/// How many ticks before yielding to check I/O completions
-const EVENT_INTERVAL: u32 = 61;
-
 /// Unimplemented!
 const MAX_BLOCKING_THREADS: usize = 512;
 
 /// Default size for io_uring SQ ring.
-const SQ_RING_SIZE: usize = 1024;
+const SQ_RING_SIZE: usize = 64;
 
-/// Final slab size is SQ_RING_SIZE * multipler
-const SLAB_SIZE_MULTIPLIER: usize = 2;
+/// Final cq ring size is SQ_RING_SIZE * multipler
+const CQ_RING_SIZE_MULTIPLIER: usize = 2;
+
+///
+/// Event Loop policies
+//
+/// Fairly arbitrary, copied from tokio `event_interval`.
+const PROCESS_CQES_INTERVAL: u32 = 61;
+
+/// Submit 4 times as frequently as we complete to keep kernel busy.
+const SUBMIT_INTERVAL: u32 = PROCESS_CQES_INTERVAL / 4;
+
+/// Submit if sq ring 33% full
+const MAX_UNSUBMITTED_SQES: usize = SQ_RING_SIZE / 3;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Kind {
@@ -115,27 +143,32 @@ pub struct Builder {
     /// self-tuning strategy based on mean task poll times.
     pub(super) global_queue_interval: Option<u32>,
 
-    /// How many ticks before yielding to check I/O completions
-    pub(super) event_interval: u32,
+    /// Submit SQEs every N ticks
+    pub(super) submit_interval: u32,
+
+    /// Process CQEs every N ticks
+    pub(super) process_cqes_interval: u32,
+
+    /// Maximum amount of unsubmitted sqes before we force submit
+    pub(super) max_unsubmitted_sqes: usize,
 
     /// Size of io_uring SQ ring
     pub(super) sq_ring_size: usize,
 
-    /// Final size of slab will be `sq_ring_size * slab_size_multiplier`.
-    /// Default is 2 to reflect the size of the CQ ring that is also twice the SQ ring.
-    ///
-    /// Why? We have SQE primitives like SqeStream which will post N CQEs for each SQE.
-    /// Since each SQE is associated with a RawSqe in the slab, we need to have a buffer
+    /// Final size of cq ring will be `sq_ring_size * cq_ring_size_multiplier`.
+    /// Default is 2 as per `io_uring`'s own default value. Why? We have SQE primitives
+    /// like SqeStream which will post N CQEs for each SQE so we need to have a buffer
     /// as most of the time CQ >> SQ.
     ///
-    /// The other reason is that if the SQ ring is full, we can recover from the error
-    /// by simply retrying to `poll()` the task in the next `event_loop` pass. But
+    /// The size of the RawSqeSlab will also match the size of the cq ring. The
+    /// reason is that if the SQ ring is full, we can recover from the error by
+    /// simply retrying to `poll()` the task in the next `event_loop` pass. But
     /// if the RawSqeSlab is the same size as the SQ ring, we will overflow in the slab
     /// and won't be able to gracefully handle SQ ring going above capacity.
     ///
     /// In all cases, if the SQ ring goes above capacity, the program should send a
     /// loud signal to the user and runtim configuration needs to be changed ASAP.
-    pub(super) slab_size_multiplier: usize,
+    pub(super) cq_ring_size_multiplier: usize,
 }
 
 impl Builder {
@@ -147,9 +180,11 @@ impl Builder {
             thread_name: default_thread_name_fn(),
             thread_stack_size: None,
             global_queue_interval: None,
-            event_interval: EVENT_INTERVAL,
+            submit_interval: SUBMIT_INTERVAL,
+            process_cqes_interval: PROCESS_CQES_INTERVAL,
+            max_unsubmitted_sqes: MAX_UNSUBMITTED_SQES,
             sq_ring_size: SQ_RING_SIZE,
-            slab_size_multiplier: SLAB_SIZE_MULTIPLIER,
+            cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
         }
     }
 
@@ -171,7 +206,7 @@ impl Builder {
     }
 
     // TODO
-    fn max_blocking_threads(mut self, val: usize) -> Self {
+    fn max_blocking_threads(self, _val: usize) -> Self {
         unimplemented!("TODO");
         // assert!(val > 0, "Max blocking threads cannot be set to 0");
         // self.max_blocking_threads = val;
@@ -236,24 +271,18 @@ impl Builder {
         self
     }
 
-    /// Sets the number of scheduler ticks after which the scheduler will poll for
-    /// I/O completions.
-    ///
-    /// A scheduler "tick" roughly corresponds to one `poll` invocation on a task.
-    ///
-    /// By default, the event interval is `61` for all scheduler types.
-    ///
-    /// Setting the event interval determines the effective "priority" of delivering
-    /// these external events (which may wake up additional tasks), compared to
-    /// executing tasks that are currently ready to run. A smaller value is useful
-    /// when tasks frequently spend a long time in polling, or frequently yield,
-    /// which can result in overly long delays picking up I/O events. Conversely,
-    /// picking up new events requires extra synchronization and syscall overhead,
-    /// so if tasks generally complete their polling quickly, a higher event interval
-    /// will minimize that overhead while still keeping the scheduler responsive to
-    /// events.
-    pub fn event_interval(mut self, val: u32) -> Self {
-        self.event_interval = val;
+    pub fn submit_interval(mut self, val: u32) -> Self {
+        self.submit_interval = val;
+        self
+    }
+
+    pub fn process_cqes_interval(mut self, val: u32) -> Self {
+        self.process_cqes_interval = val;
+        self
+    }
+
+    pub fn max_unsubmitted_sqes(mut self, val: usize) -> Self {
+        self.max_unsubmitted_sqes = val;
         self
     }
 
@@ -262,8 +291,8 @@ impl Builder {
         self
     }
 
-    pub fn slab_size_multiplier(mut self, val: usize) -> Self {
-        self.slab_size_multiplier = val;
+    pub fn cq_ring_size_multiplier(mut self, val: usize) -> Self {
+        self.cq_ring_size_multiplier = val;
         self
     }
 
@@ -302,9 +331,11 @@ pub(crate) struct RuntimeConfig {
     pub(crate) thread_name: ThreadNameFn,
     pub(crate) thread_stack_size: Option<usize>,
     pub(crate) global_queue_interval: Option<u32>,
-    pub(crate) event_interval: u32,
+    pub(crate) submit_interval: u32,
+    pub(crate) process_cqes_interval: u32,
+    pub(crate) max_unsubmitted_sqes: usize,
     pub(crate) sq_ring_size: usize,
-    pub(crate) slab_size_multiplier: usize,
+    pub(crate) cq_ring_size_multiplier: usize,
 }
 
 impl TryFrom<Builder> for RuntimeConfig {
@@ -321,9 +352,11 @@ impl TryFrom<Builder> for RuntimeConfig {
             thread_name: builder.thread_name,
             thread_stack_size: builder.thread_stack_size,
             global_queue_interval: builder.global_queue_interval,
-            event_interval: builder.event_interval,
+            submit_interval: builder.submit_interval,
+            process_cqes_interval: builder.process_cqes_interval,
+            max_unsubmitted_sqes: builder.max_unsubmitted_sqes,
             sq_ring_size: builder.sq_ring_size,
-            slab_size_multiplier: builder.slab_size_multiplier,
+            cq_ring_size_multiplier: builder.cq_ring_size_multiplier,
         })
     }
 }

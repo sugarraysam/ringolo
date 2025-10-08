@@ -1,11 +1,14 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+
 use crate::runtime::Schedule;
 use crate::task::layout::vtable;
 use crate::task::{Header, Notified, State, Task};
 use std::future::Ready;
+use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
 use std::sync::{
     Arc,
-    atomic::{AtomicU32, Ordering},
+    atomic::{AtomicUsize, Ordering},
 };
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
@@ -30,7 +33,7 @@ pub(crate) struct WakerData {
     // to NonNull<Header>.
     pub header: Header,
 
-    pub wake_count: AtomicU32,
+    pub wake_count: AtomicUsize,
 }
 
 impl WakerData {
@@ -39,11 +42,11 @@ impl WakerData {
 
         Self {
             header: Header::new(State::new(), vtable),
-            wake_count: AtomicU32::new(0),
+            wake_count: AtomicUsize::new(0),
         }
     }
 
-    pub(crate) fn get_count(&self) -> u32 {
+    pub(crate) fn get_count(&self) -> usize {
         self.wake_count.load(Ordering::Relaxed)
     }
 
@@ -64,7 +67,7 @@ impl WakerData {
 
 unsafe fn mock_wake(data: *const ()) {
     // Need to consume 1 Arc reference
-    let data = unsafe { Arc::from_raw(data as *const WakerData) };
+    let data = Arc::<WakerData>::from_raw(data.cast());
     data.wake_count.fetch_add(1, Ordering::Relaxed);
 
     // We mock decrementing pending_io on consuming wake. This is how we hook
@@ -75,25 +78,20 @@ unsafe fn mock_wake(data: *const ()) {
 
 unsafe fn mock_wake_by_ref(data: *const ()) {
     // Not consuming any Arc ref
-    let data = unsafe { &*(data as *const WakerData) };
+    let data = ManuallyDrop::new(Arc::<WakerData>::from_raw(data.cast()));
     data.wake_count.fetch_add(1, Ordering::Relaxed);
 }
 
 // Drop the Waker Arc reference.
 unsafe fn mock_drop(data: *const ()) {
     if !data.is_null() {
-        let _data = unsafe { Arc::from_raw(data as *const WakerData) };
+        drop(Arc::<WakerData>::from_raw(data.cast()));
     }
 }
 
 unsafe fn mock_clone(data: *const ()) -> RawWaker {
-    let data = unsafe { Arc::from_raw(data as *const WakerData) };
-    let raw_data = Arc::into_raw(Arc::clone(&data));
-
-    // Need to leak data again avoid decrementing Arc ref count
-    _ = Arc::into_raw(data);
-
-    RawWaker::new(raw_data as *const (), &MOCK_VTABLE)
+    Arc::<WakerData>::increment_strong_count(data.cast());
+    RawWaker::new(data, &MOCK_VTABLE)
 }
 
 // The custom VTable (vtable) for our mock Waker.

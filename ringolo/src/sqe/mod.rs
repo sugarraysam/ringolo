@@ -344,7 +344,7 @@ mod tests {
 
             // Process CQEs :: wakes up Waker
             assert_eq!(core.process_cqes(None)?, n_sqes);
-            assert_eq!(waker_data.get_count(), num_lists as u32);
+            assert_eq!(waker_data.get_count(), num_lists);
             assert_eq!(waker_data.get_pending_io(), 0);
             Ok(())
         })?;

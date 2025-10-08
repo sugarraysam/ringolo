@@ -5,35 +5,24 @@ use crate::runtime::RuntimeConfig;
 use crate::runtime::local;
 use anyhow::Result;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub(crate) struct Context {
-    pub scheduler: local::Handle,
+    pub(crate) scheduler: local::Handle,
 
-    pub worker: Rc<local::Worker>,
-
-    pub core: RefCell<Core>,
+    pub(crate) core: RefCell<Core>,
 }
 
 impl Context {
-    pub(crate) fn try_new(
-        cfg: &RuntimeConfig,
-        scheduler: local::Handle,
-        worker: Rc<local::Worker>,
-    ) -> Result<Self> {
+    pub(crate) fn try_new(cfg: &RuntimeConfig, scheduler: local::Handle) -> Result<Self> {
         let core = Core::try_new(cfg)?;
 
         Ok(Self {
             scheduler,
-            worker,
             core: RefCell::new(core),
         })
     }
 
-    pub(crate) fn get_worker(&self) -> &local::Worker {
-        &self.worker
-    }
-
+    #[inline(always)]
     pub(crate) fn with_core<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&Core) -> R,
@@ -41,6 +30,7 @@ impl Context {
         f(&self.core.borrow())
     }
 
+    #[inline(always)]
     pub(crate) fn with_core_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut Core) -> R,
@@ -48,6 +38,7 @@ impl Context {
         f(&mut self.core.borrow_mut())
     }
 
+    #[inline(always)]
     pub(crate) fn with_slab<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&RawSqeSlab) -> R,
@@ -57,6 +48,7 @@ impl Context {
         f(&slab)
     }
 
+    #[inline(always)]
     pub(crate) fn with_slab_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut RawSqeSlab) -> R,
@@ -66,6 +58,7 @@ impl Context {
         f(&mut slab)
     }
 
+    #[inline(always)]
     pub(crate) fn with_ring<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&SingleIssuerRing) -> R,
@@ -75,6 +68,7 @@ impl Context {
         f(&slab)
     }
 
+    #[inline(always)]
     pub(crate) fn with_ring_mut<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&mut SingleIssuerRing) -> R,

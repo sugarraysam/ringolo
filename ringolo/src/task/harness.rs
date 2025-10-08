@@ -109,15 +109,15 @@ impl<T: Future, S: Schedule> Harness<T, S> {
         match self.poll_inner() {
             PollFuture::Notified => {
                 // The `poll_inner` call has given us two ref-counts back.
-                // We give one of them to a new task and call `yield_now`.
+                // We give one of them to a new task and schedule it.
                 self.core()
                     .scheduler
                     .schedule(false, Notified::new(self.get_new_task()));
 
                 // The remaining ref-count is now dropped. We kept the extra
-                // ref-count until now to ensure that even if the `yield_now`
+                // ref-count until now to ensure that even if the `schedule`
                 // call drops the provided task, the task isn't deallocated
-                // before after `yield_now` returns.
+                // before `schedule` returns.
                 self.drop_reference();
             }
             PollFuture::Complete => {

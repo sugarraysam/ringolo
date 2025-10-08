@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use io_uring::squeue::Entry;
+use smallvec::{SmallVec, smallvec};
 use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
@@ -90,9 +91,9 @@ impl CompletionHandler {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionEffect {
-    None,
+    DecrementPendingIo,
     WakeHead { head: usize },
 }
 
@@ -176,12 +177,11 @@ impl RawSqe {
         Ok(())
     }
 
-    // Optionally returns a "head" to wake if we're working with BatchOrChain.
     pub(crate) fn on_completion(
         &mut self,
         cqe_res: i32,
         cqe_flags: Option<u32>,
-    ) -> Result<CompletionEffect> {
+    ) -> Result<SmallVec<[CompletionEffect; 2]>> {
         if !matches!(self.state, RawSqeState::Pending | RawSqeState::Ready) {
             return Err(anyhow!("unexpected state: {:?}", self.state));
         }
@@ -199,7 +199,7 @@ impl RawSqe {
                 *result = Some(cqe_res);
                 self.wake()?;
 
-                Ok(CompletionEffect::None)
+                Ok(smallvec![CompletionEffect::DecrementPendingIo])
             }
             CompletionHandler::BatchOrChain {
                 result,
@@ -208,10 +208,14 @@ impl RawSqe {
             } => {
                 *result = Some(cqe_res);
                 let count = remaining.fetch_sub(1, Ordering::Relaxed) - 1;
+
                 if count == 0 {
-                    Ok(CompletionEffect::WakeHead { head: *head })
+                    Ok(smallvec![
+                        CompletionEffect::DecrementPendingIo,
+                        CompletionEffect::WakeHead { head: *head },
+                    ])
                 } else {
-                    Ok(CompletionEffect::None)
+                    Ok(smallvec![CompletionEffect::DecrementPendingIo])
                 }
             }
             CompletionHandler::Stream {
@@ -238,11 +242,11 @@ impl RawSqe {
                 // task when invoking the consuming wake() call.
                 if done {
                     self.wake()?;
+                    Ok(smallvec![CompletionEffect::DecrementPendingIo])
                 } else {
                     self.wake_by_ref()?;
+                    Ok(smallvec![])
                 }
-
-                Ok(CompletionEffect::None)
             }
             CompletionHandler::Message => {
                 unimplemented!("RingMessage are not yet implemented.")
@@ -377,10 +381,10 @@ mod tests {
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
-        assert!(matches!(
-            sqe.on_completion(res, None)?,
-            CompletionEffect::None
-        ));
+        assert_eq!(
+            *sqe.on_completion(res, None)?,
+            [CompletionEffect::DecrementPendingIo]
+        );
 
         assert!(sqe.is_ready());
         let (entry, got) = sqe.take_final_result()?;
@@ -426,10 +430,10 @@ mod tests {
             head.set_user_data(user_data)?;
 
             // Not woken up yet, we have `n_sqes - 1` remaining
-            assert!(matches!(
-                head.on_completion(res, None)?,
-                CompletionEffect::None
-            ));
+            assert_eq!(
+                *head.on_completion(res, None)?,
+                [CompletionEffect::DecrementPendingIo]
+            );
 
             vacant.insert(head);
 
@@ -443,13 +447,14 @@ mod tests {
             );
             sqe.set_user_data(user_data)?;
 
-            let effect = sqe.on_completion(res, None)?;
+            let effects = sqe.on_completion(res, None)?;
 
             // Last SQE to complete triggers completion
             if remaining.load(Ordering::Relaxed) == 0 {
-                assert!(matches!(effect, CompletionEffect::WakeHead { .. }));
+                assert!(matches!(effects[0], CompletionEffect::DecrementPendingIo));
+                assert!(matches!(effects[1], CompletionEffect::WakeHead { .. }));
             } else {
-                assert!(matches!(effect, CompletionEffect::None));
+                assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
             }
         }
 

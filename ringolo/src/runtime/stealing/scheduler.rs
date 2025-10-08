@@ -1,16 +1,11 @@
-use crate::context::{ThreadId, current_thread_id};
-use crate::runtime::EventLoop;
 use crate::runtime::Schedule;
-use crate::runtime::runtime::{RuntimeConfig, ThreadNameFn};
+use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
 use crate::task::{Notified, Task};
-use std::collections::HashMap;
-use std::ops::Deref;
-
 use crossbeam_deque::{Injector, Worker as CbWorker};
+use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) type StealableTask = Notified<Handle>;
 
@@ -61,12 +56,12 @@ impl Scheduler {
         let _handles = workers
             .into_iter()
             .map(|w| {
-                let shared_clone = Arc::clone(&shared);
+                let _shared_clone = Arc::clone(&shared);
 
                 std::thread::spawn(move || {
-                    let worker = w;
+                    let _worker = w;
                     // init_stealing_context(shared_clone, &worker);
-                    worker.event_loop();
+                    // worker.event_loop();
                 })
             })
             .collect::<Vec<_>>();
@@ -109,18 +104,27 @@ impl Schedule for Handle {
 }
 
 impl Handle {
-    pub fn spawn<F: Future>(f: F) {
+    pub fn spawn<F: Future>(_f: F) {
         unimplemented!("TODO");
     }
 
-    pub fn block_on<F: Future>(f: F) {
+    pub fn block_on<F: Future>(_f: F) {
         unimplemented!("TODO");
     }
 }
 
 impl Deref for Handle {
-    type Target = Scheduler;
+    type Target = Arc<Scheduler>;
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_assertions::assert_impl_all;
+
+    assert_impl_all!(Scheduler: Send, Sync);
+    assert_impl_all!(Handle: Send, Sync, Schedule);
 }

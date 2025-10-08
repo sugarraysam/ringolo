@@ -1,6 +1,4 @@
-use crate::context::{
-    with_core_mut, with_slab_mut,
-};
+use crate::context::{with_core_mut, with_slab_mut};
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use crate::task::Header;
 use anyhow::{Result, anyhow};
@@ -138,8 +136,8 @@ impl SqeBatchBuilder {
         }
     }
 
-    pub fn add_entry(&mut self, entry: Entry, flags: Option<Flags>) -> &mut Self {
-        self.inner.add_entry(entry, flags);
+    pub fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
+        self.inner = self.inner.add_entry(entry, flags);
         self
     }
 
@@ -173,8 +171,8 @@ impl SqeChainBuilder {
         }
     }
 
-    pub fn add_entry(&mut self, entry: Entry, flags: Option<Flags>) -> &mut Self {
-        self.inner.add_entry(entry, flags);
+    pub fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
+        self.inner = self.inner.add_entry(entry, flags);
         self
     }
 
@@ -199,7 +197,7 @@ impl SqeListBuilder {
         }
     }
 
-    fn add_entry(&mut self, entry: Entry, flags: Option<Flags>) -> &mut Self {
+    fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
         if let Some(f) = flags {
             self.list.push(entry.flags(f));
         } else {
@@ -325,7 +323,7 @@ mod tests {
                 }
             }
             Ok(())
-        });
+        })?;
 
         assert_eq!(num_heads, 1, "expected one unique head node");
         Ok(())
@@ -526,7 +524,7 @@ mod tests {
 
         let mut builder = SqeBatchBuilder::new();
         for _ in 0..batch_size {
-            builder.add_entry(nop(), None);
+            builder = builder.add_entry(nop(), None);
         }
 
         // In the current setup, we always overflow the Slab before we overflow

@@ -1,5 +1,5 @@
 use crate::task::{Notified, Task};
-use std::sync::Arc;
+use anyhow::Result;
 
 // Public API
 pub mod runtime;
@@ -11,6 +11,11 @@ pub(crate) mod local;
 pub(crate) use runtime::RuntimeConfig;
 
 pub(crate) mod stealing;
+
+mod ticker;
+use ticker::{Ticker, TickerData, TickerEvents};
+
+mod waker;
 
 #[derive(Debug)]
 pub(crate) enum Scheduler {
@@ -43,5 +48,11 @@ pub(crate) trait EventLoop {
 
     fn find_task(&self) -> Option<Self::Task>;
 
-    fn event_loop(&self);
+    /// Event loop to drive work to completion. One of the worker will be given
+    /// the "root_future", which corresponds to the entry point of the runtime,
+    /// what the passes to the `block_on` function.
+    //
+    // Can't do &mut because scheduler needs access to the worker to schedule
+    // tasks. Worker needs interior mutability.
+    fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output>;
 }
