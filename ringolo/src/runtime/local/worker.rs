@@ -1,20 +1,21 @@
-use crate::context::{Core, expect_local_context, with_core_mut, with_slab};
-use crate::runtime::EventLoop;
+use crate::context::{expect_local_context, with_core_mut, with_slab};
 use crate::runtime::local;
 use crate::runtime::local::scheduler::LocalTask;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::waker_ref;
+use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
 use anyhow::{Result, anyhow};
 use crossbeam_deque::Worker as CbWorker;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::pin::pin;
 use std::task::Poll;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
     /// Handle to single local queue.
-    pollable: crossbeam_deque::Worker<LocalTask>,
+    pollable: RefCell<VecDeque<LocalTask>>,
 
     /// Determines how we run the event loop.
     cfg: RefCell<EventLoopConfig>,
@@ -26,7 +27,7 @@ pub(crate) struct Worker {
 impl Worker {
     pub(super) fn new(cfg: &RuntimeConfig) -> Self {
         Self {
-            pollable: CbWorker::new_lifo(),
+            pollable: RefCell::new(VecDeque::new()),
             cfg: RefCell::new(cfg.into()),
             ticker: RefCell::new(Ticker::new()),
         }
@@ -54,9 +55,11 @@ struct EventLoopConfig {
 
 impl EventLoopConfig {
     #[inline(always)]
-    fn update(&mut self, core: &Core) {
-        self.unsubmitted_sqes = core.num_unsubmitted_sqes();
-        self.has_ready_cqes = core.has_ready_cqes();
+    fn update(&mut self, ctx: &local::Context) {
+        ctx.with_core(|core| {
+            self.unsubmitted_sqes = core.num_unsubmitted_sqes();
+            self.has_ready_cqes = core.has_ready_cqes();
+        });
     }
 
     #[inline(always)]
@@ -85,12 +88,12 @@ impl From<&RuntimeConfig> for EventLoopConfig {
 }
 
 impl TickerData for EventLoopConfig {
-    type Context = Core;
+    type Context = local::Context;
 
     #[inline(always)]
-    fn update_and_check(&mut self, core: &Self::Context, tick: u32) -> TickerEvents {
+    fn update_and_check(&mut self, ctx: &Self::Context, tick: u32) -> TickerEvents {
         // (1) Update data
-        self.update(core);
+        self.update(ctx);
 
         // (2) Check policies
         let mut events = TickerEvents::empty();
@@ -114,18 +117,24 @@ impl TickerData for EventLoopConfig {
 impl EventLoop for Worker {
     type Task = LocalTask;
 
-    fn add_task(&self, task: Self::Task) {
-        self.pollable.push(task);
+    fn add_task(&self, task: Self::Task, mode: AddMode) {
+        let mut q = self.pollable.borrow_mut();
+
+        // We always pop from the back, so the start of the q is the back, and
+        // the end corresponds to the front.
+        match mode {
+            AddMode::FIFO => q.push_front(task),
+            AddMode::LIFO => q.push_back(task),
+        }
     }
 
     fn find_task(&self) -> Option<Self::Task> {
-        self.pollable.pop()
+        self.pollable.borrow_mut().pop_back()
     }
 
     fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output> {
         if let Some(root) = root_future {
-            let scheduler = expect_local_context(|ctx| ctx.scheduler.clone());
-            self.event_loop_inner(scheduler, root)
+            expect_local_context(|ctx| self.event_loop_inner(ctx, root))
         } else {
             Err(anyhow!("Unexpected empty root_future"))
         }
@@ -133,49 +142,48 @@ impl EventLoop for Worker {
 }
 
 // TODO:
-// - need poll_initial special case, retry until submit succeeds (add it to back of queue?)
-//     > Important!: if a task returns Pending, check if it's still in `State::Initial`,
-//     > if so keep polling need to retry until we reach `State::Submitted`
+// - need poll_initial special case, retry until submit succeeds (add it to back of queue?), OR return `Poll::Ready` /w
+//   the error, and have special `poll` wrapper that does a few things, including handling this + task budget, wont have
+//   access to Sqe<T> internal state.
+//   - true for all Sqe tasks :: return poll retry? special `thiserror` wrapper
 //
 // - handle ring full errors gracefully (-EINTR on submit)
 // - set current task id ? tracing?
 impl Worker {
     fn event_loop_inner<F: Future>(
         &self,
-        scheduler: local::Handle,
+        ctx: &local::Context,
         root_future: F,
     ) -> Result<F::Output> {
         let mut data = self.cfg.borrow_mut();
         let mut root = pin!(root_future);
 
-        let waker = waker_ref(&scheduler);
+        let waker = waker_ref(&ctx.scheduler);
         let mut cx = std::task::Context::from_waker(&waker);
 
         loop {
-            if scheduler.reset_root_woken()
-                && let Poll::Ready(v) = root.as_mut().poll(&mut cx)
-            {
-                return Ok(v);
+            if ctx.scheduler.reset_root_woken() {
+                let _g = ctx.set_polling_root();
+
+                if let Poll::Ready(v) = root.as_mut().poll(&mut cx) {
+                    return Ok(v);
+                }
             }
 
-            with_core_mut(|core| -> Result<()> {
-                let events = self.tick(core, &mut *data);
-                self.process_ticker_events(core, events)?;
-                Ok(())
-            })?;
+            let events = self.tick(ctx, &mut *data);
+            self.process_ticker_events(ctx, events)?;
 
             if let Some(task) = self.find_task() {
                 task.run();
             } else {
                 // No more work to do. This means it is time to poll the root future.
                 if with_slab(|slab| slab.pending_ios) == 0 {
-                    // By definition if there are no inflight IOs, then we have no `ready_cqes`
-                    // and no `unsubmitted_sqes` because all RawSqe have been returned to the
-                    // slab and we have a 1:1 mapping between RawSqe <-> SQE.
+                    // By definition if there are no pending IOs, then we should have no `ready_cqes`
+                    // and no `unsubmitted_sqes` because we have a 1:1 mapping between RawSqe <-> SQE.
                     debug_assert!(!data.has_ready_cqes);
                     debug_assert!(data.unsubmitted_sqes == 0);
 
-                    scheduler.set_root_woken();
+                    ctx.scheduler.set_root_woken();
                 } else {
                     // "Park" the thread waiting for next completion.
                     with_core_mut(|core| -> Result<()> {
@@ -189,7 +197,7 @@ impl Worker {
     }
 
     #[inline(always)]
-    fn process_ticker_events(&self, core: &mut Core, events: TickerEvents) -> Result<()> {
+    fn process_ticker_events(&self, ctx: &local::Context, events: TickerEvents) -> Result<()> {
         if events.contains(TickerEvents::SHUTDOWN) {
             unimplemented!("TODO");
 
@@ -197,12 +205,14 @@ impl Worker {
         // to process pending kernel `task_work` and post CQEs. It would be silly to not submit
         // pending SQEs in same syscall.
         } else if events.contains(TickerEvents::PROCESS_CQES) {
-            core.submit_and_wait(1, None)?;
-            core.process_cqes(None)?;
+            ctx.with_core_mut(|core| {
+                core.submit_and_wait(1, None)?;
+                core.process_cqes(None)
+            })?;
 
         // Only submit, no need to wait for anything.
         } else if events.contains(TickerEvents::SUBMIT_SQES) {
-            core.submit_no_wait()?;
+            ctx.with_core_mut(|core| core.submit_no_wait())?;
         }
 
         Ok(())

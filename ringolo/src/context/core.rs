@@ -4,12 +4,15 @@ use crate::context::RawSqeSlab;
 use crate::runtime::RuntimeConfig;
 use crate::sqe::{CompletionEffect, RawSqeState};
 use crate::task::Id;
+use crate::util::ScopeGuard;
 use anyhow::Result;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::num::NonZeroU64;
 use std::os::unix::io::RawFd;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll;
 use std::time::Duration;
 
 use crate::context::ring::SingleIssuerRing;
@@ -30,6 +33,9 @@ pub(crate) struct Core {
 
     /// Task that is currently executing on this thread.
     pub(crate) current_task_id: Cell<Option<Id>>,
+
+    /// Set to true if we are currently polling root future.
+    pub(crate) polling_root_future: Cell<bool>,
 }
 
 impl Core {
@@ -44,7 +50,12 @@ impl Core {
             ring_fd: ring.as_raw_fd(),
             ring: RefCell::new(ring),
             current_task_id: Cell::new(None),
+            polling_root_future: Cell::new(false),
         })
+    }
+
+    pub(crate) fn is_polling_root(&self) -> bool {
+        self.polling_root_future.get()
     }
 
     // Queues SQEs in the SQ ring, fetching them from the slab using the provided

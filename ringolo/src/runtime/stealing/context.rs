@@ -21,7 +21,7 @@ pub(crate) struct Context {
     /// with each other. Most interesting use case is ringolo-console CLI to
     /// send various commands from a TUI/GUI.
     #[allow(unused)]
-    pub(crate) ring_msg_counter: u32,
+    pub(crate) ring_msg_counter: RefCell<u32>,
 }
 
 impl Context {
@@ -38,7 +38,7 @@ impl Context {
             scheduler,
             core: RefCell::new(core),
             shared,
-            ring_msg_counter: 0,
+            ring_msg_counter: RefCell::new(0),
         })
     }
 

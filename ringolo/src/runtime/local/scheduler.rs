@@ -1,8 +1,8 @@
-use crate::context::init_local_context;
+use crate::context::{init_local_context, with_core_mut};
 use crate::runtime::local::worker::Worker;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
-use crate::runtime::{EventLoop, Schedule};
+use crate::runtime::{AddMode, EventLoop, Schedule, YieldReason};
 use crate::task::{Notified, Task};
 use anyhow::{Result, anyhow};
 use std::cell::Cell;
@@ -99,8 +99,37 @@ unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
 
 impl Schedule for Handle {
+    /// Schedule a task to run next (i.e.: front of queue).
     fn schedule(&self, _is_new: bool, task: LocalTask) {
-        self.get_worker().add_task(task)
+        self.get_worker().add_task(task, AddMode::LIFO);
+    }
+
+    /// Schedule a task to run soon but not next (i.e.: back of queue).
+    fn yield_now(&self, task: LocalTask, reason: YieldReason) {
+        match reason {
+            YieldReason::SqRingFull => {
+                if let Err(e) = with_core_mut(|core| core.submit_and_wait(1, None)) {
+                    panic!(
+                        "FATAL: scheduler error. Unable to submit SQEs and retrying to submit failed again: {:?}",
+                        e
+                    );
+                }
+            }
+            YieldReason::SlabFull => {
+                if let Err(e) = with_core_mut(|core| -> Result<usize> {
+                    core.submit_and_wait(1, None)?;
+                    core.process_cqes(None)
+                }) {
+                    panic!(
+                        "FATAL: scheduler error. SlabFull and could not submit or process cqes: {:?}",
+                        e
+                    );
+                }
+            }
+            YieldReason::NoTaskBudget => { /* nothing to do */ }
+        }
+
+        self.get_worker().add_task(task, AddMode::FIFO);
     }
 
     fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {

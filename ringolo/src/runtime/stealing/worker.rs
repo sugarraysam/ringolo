@@ -1,5 +1,5 @@
 use crate::runtime::stealing::scheduler::StealableTask;
-use crate::runtime::{EventLoop, RuntimeConfig};
+use crate::runtime::{AddMode, EventLoop, RuntimeConfig};
 use anyhow::Result;
 use crossbeam_deque::{Injector, Stealer, Worker as CbWorker};
 use std::iter;
@@ -43,7 +43,7 @@ impl Worker {
 impl EventLoop for Worker {
     type Task = StealableTask;
 
-    fn add_task(&self, task: Self::Task) {
+    fn add_task(&self, task: Self::Task, mode: AddMode) {
         if task.is_stealable() {
             self.stealable.push(task);
         } else {

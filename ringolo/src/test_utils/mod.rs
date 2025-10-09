@@ -35,51 +35,50 @@ pub(crate) fn build_chain_write_fsync_read_a_tempfile() -> Result<(SqeList, Vec<
             Read::new(fd, data_in.as_mut_ptr(), data_out.len() as u32).build(),
             None,
         )
-        .try_build()?;
+        .build();
 
     Ok((chain, data_out, data_in, tmp))
 }
 
-pub(crate) fn build_list_with_entries(kind: SqeListKind, entries: Vec<Entry>) -> Result<SqeList> {
-    let sqe_list = match kind {
+pub(crate) fn build_list_with_entries(kind: SqeListKind, entries: Vec<Entry>) -> SqeList {
+    match kind {
         SqeListKind::Batch => build_batch_with_entries(entries),
         SqeListKind::Chain => build_chain_with_entries(entries),
-    }?;
-    Ok(sqe_list)
+    }
 }
 
-pub(crate) fn build_batch(size: usize) -> Result<SqeList> {
+pub(crate) fn build_batch(size: usize) -> SqeList {
     (0..size)
         .fold(SqeBatchBuilder::new(), |batch, _| {
             batch.add_entry(nop(), None)
         })
-        .try_build()
+        .build()
 }
 
-pub(crate) fn build_batch_with_entries(entries: Vec<Entry>) -> Result<SqeList> {
+pub(crate) fn build_batch_with_entries(entries: Vec<Entry>) -> SqeList {
     entries
         .into_iter()
         .fold(SqeBatchBuilder::new(), |batch, entry| {
             batch.add_entry(entry, None)
         })
-        .try_build()
+        .build()
 }
 
-pub(crate) fn build_chain(size: usize) -> Result<SqeList> {
+pub(crate) fn build_chain(size: usize) -> SqeList {
     (0..size)
         .fold(SqeChainBuilder::new(), |chain, _| {
             chain.add_entry(nop(), None)
         })
-        .try_build()
+        .build()
 }
 
-pub(crate) fn build_chain_with_entries(entries: Vec<Entry>) -> Result<SqeList> {
+pub(crate) fn build_chain_with_entries(entries: Vec<Entry>) -> SqeList {
     entries
         .into_iter()
         .fold(SqeChainBuilder::new(), |chain, entry| {
             chain.add_entry(entry, None)
         })
-        .try_build()
+        .build()
 }
 
 pub(crate) fn openat(fd: i32, path: &str) -> Entry {

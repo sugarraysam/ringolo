@@ -1,7 +1,7 @@
-use crate::runtime::Schedule;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
+use crate::runtime::{Schedule, YieldReason};
 use crate::task::{Notified, Task};
 use crossbeam_deque::{Injector, Worker as CbWorker};
 use std::ops::Deref;
@@ -90,12 +90,16 @@ impl Schedule for Handle {
             self.0.injector.push(task);
         } else {
             // TODO:
-            // - expect_stealing_context
-            // - get_worker
-            // - worker stores itself (a RefCell in context)
-            // let ctx = expect_stealing_context();
-            // ctx.get_worker().add_task(task);
+            // - get_worker from thread_id (workers map in Shared)
+            // with_shared(|shared| {
+            //     let mode = ...;
+            //     shared.get_worker().add_task(task, mode);
+            // });
         }
+    }
+
+    fn yield_now(&self, task: StealableTask, reason: YieldReason) {
+        unimplemented!("todo");
     }
 
     fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {

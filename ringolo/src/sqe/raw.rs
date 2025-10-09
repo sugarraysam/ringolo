@@ -1,28 +1,27 @@
-use anyhow::{Context, Result, anyhow};
 use io_uring::squeue::Entry;
 use smallvec::{SmallVec, smallvec};
 use std::collections::VecDeque;
-use std::io;
+use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::Waker;
 
-use crate::sqe::stream::SqeStreamError;
+use crate::sqe::IoError;
 
 #[derive(Debug)]
 pub(crate) enum StreamCompletion {
     // The operation completes after a known number of events (e.g., `Timeout`).
-    ByCount { remaining: Arc<AtomicUsize> },
+    ByCount { remaining: Arc<AtomicU32> },
 
     // The operation completes when a CQE arrives without the `IORING_CQE_F_MORE` flag.
     ByFlag { done: bool },
 }
 
 impl StreamCompletion {
-    pub(crate) fn new(count: Option<usize>) -> Self {
+    pub(crate) fn new(count: Option<u32>) -> Self {
         if let Some(count) = count {
             StreamCompletion::ByCount {
-                remaining: Arc::new(AtomicUsize::new(count)),
+                remaining: Arc::new(AtomicU32::new(count)),
             }
         } else {
             StreamCompletion::ByFlag { done: false }
@@ -42,10 +41,10 @@ impl StreamCompletion {
 #[derive(Debug)]
 pub(crate) enum CompletionHandler {
     Single {
-        result: Option<io::Result<i32>>,
+        result: Option<Result<i32>>,
     },
     BatchOrChain {
-        result: Option<io::Result<i32>>,
+        result: Option<Result<i32>>,
 
         // Waker only set on the head, so we store a pointer to the head SQE.
         head: usize,
@@ -56,7 +55,7 @@ pub(crate) enum CompletionHandler {
     Stream {
         // We use the SqeStreamError to be able to distinguish between an IO
         // error or an application error.
-        results: VecDeque<Result<i32, SqeStreamError>>,
+        results: VecDeque<anyhow::Result<i32, IoError>>,
 
         completion: StreamCompletion,
     },
@@ -79,7 +78,7 @@ impl CompletionHandler {
         }
     }
 
-    pub(crate) fn new_stream(count: Option<usize>) -> CompletionHandler {
+    pub(crate) fn new_stream(count: Option<u32>) -> CompletionHandler {
         CompletionHandler::Stream {
             results: VecDeque::new(),
             completion: StreamCompletion::new(count),
@@ -134,7 +133,15 @@ impl RawSqe {
     }
 
     pub(crate) fn get_entry(&self) -> Result<&Entry> {
-        self.entry.as_ref().ok_or_else(|| anyhow!("Entry is None"))
+        self.entry
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "entry is none"))
+    }
+
+    pub(crate) fn take_entry(&mut self) -> Result<Entry> {
+        self.entry
+            .take()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "entry is none"))
     }
 
     pub(crate) fn set_available(&mut self) {
@@ -161,18 +168,25 @@ impl RawSqe {
         self.waker = Some(waker.clone());
     }
 
+    pub(crate) fn get_waker(&self) -> Result<&Waker> {
+        self.waker
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "waker is none"))
+    }
+
+    pub(crate) fn take_waker(&mut self) -> Result<Waker> {
+        self.waker
+            .take()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "waker is none"))
+    }
+
     pub(crate) fn set_user_data(&mut self, user_data: u64) -> Result<()> {
         if !matches!(self.state, RawSqeState::Available) {
-            return Err(anyhow!("unexpected state {:?}", self.state));
+            return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        let old = self
-            .entry
-            .take()
-            .with_context(|| anyhow!("Entry is None"))?;
-
         self.state = RawSqeState::Pending;
-        self.entry = Some(old.user_data(user_data));
+        self.entry = Some(self.take_entry()?.user_data(user_data));
 
         Ok(())
     }
@@ -183,13 +197,13 @@ impl RawSqe {
         cqe_flags: Option<u32>,
     ) -> Result<SmallVec<[CompletionEffect; 2]>> {
         if !matches!(self.state, RawSqeState::Pending | RawSqeState::Ready) {
-            return Err(anyhow!("unexpected state: {:?}", self.state));
+            return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        let cqe_res: io::Result<i32> = if cqe_res >= 0 {
+        let cqe_res: Result<i32> = if cqe_res >= 0 {
             Ok(cqe_res)
         } else {
-            Err(io::Error::from_raw_os_error(-cqe_res))
+            Err(Error::from_raw_os_error(-cqe_res))
         };
 
         let _prev_state = std::mem::replace(&mut self.state, RawSqeState::Ready);
@@ -222,7 +236,7 @@ impl RawSqe {
                 results,
                 completion,
             } => {
-                results.push_back(cqe_res.map_err(SqeStreamError::Io));
+                results.push_back(cqe_res.map_err(IoError::from));
 
                 let done = match completion {
                     StreamCompletion::ByCount { remaining } => {
@@ -254,7 +268,7 @@ impl RawSqe {
         }
     }
 
-    pub(crate) fn pop_next_result(&mut self) -> Result<Option<i32>, SqeStreamError> {
+    pub(crate) fn pop_next_result(&mut self) -> anyhow::Result<Option<i32>, IoError> {
         if matches!(self.state, RawSqeState::Pending) {
             return Ok(None);
         }
@@ -281,30 +295,33 @@ impl RawSqe {
             return next.transpose();
         }
 
-        Err(anyhow!(
+        Err(anyhow::anyhow!(
             "Misused API: pop_next_result called with non-stream handler: {:?}",
             self.handler
         )
         .into())
     }
 
-    pub(crate) fn take_final_result(&mut self) -> Result<(Entry, io::Result<i32>)> {
+    pub(crate) fn take_final_result(&mut self) -> Result<(Entry, Result<i32>)> {
         if !matches!(self.state, RawSqeState::Ready) {
-            return Err(anyhow!("unexpected state: {:?}", self.state));
+            return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        let entry = self.entry.take().context("No entry")?;
+        let entry = self.take_entry()?;
         let result = match &mut self.handler {
             CompletionHandler::Single { result } => result.take(),
             CompletionHandler::BatchOrChain { result, .. } => result.take(),
             _ => {
-                return Err(anyhow!(
-                    "Misused API: only call with single or batch handlers: {:?}",
-                    self.handler
+                return Err(Error::new(
+                    ErrorKind::Unsupported,
+                    format!(
+                        "Misused API: only call with single or batch handlers: {:?}",
+                        self.handler
+                    ),
                 ));
             }
         }
-        .context("No result")?;
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "no result"))?;
 
         self.state = RawSqeState::Completed;
 
@@ -316,7 +333,7 @@ impl RawSqe {
     }
 
     pub(crate) fn wake(&mut self) -> Result<()> {
-        let _: () = self.waker.take().context("No waker to wake")?.wake();
+        self.take_waker()?.wake();
         Ok(())
     }
 
@@ -324,11 +341,7 @@ impl RawSqe {
     // we get N cqes for a single SQE. Prefer using consuming `wake()` version
     // when possible as this has a performance cost.
     pub(crate) fn wake_by_ref(&self) -> Result<()> {
-        let _: () = self
-            .waker
-            .as_ref()
-            .context("No waker to wake")?
-            .wake_by_ref();
+        self.get_waker()?.wake_by_ref();
         Ok(())
     }
 }
@@ -338,6 +351,7 @@ mod tests {
     use super::*;
     use crate::context::with_slab_mut;
     use crate::test_utils::*;
+    use anyhow::Result;
     use rstest::rstest;
     use std::io::{self, ErrorKind};
     use std::sync::atomic::Ordering;

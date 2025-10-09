@@ -8,7 +8,7 @@ use anyhow::Result;
 fn test_local_worker_single_nop() -> Result<()> {
     let builder = Builder::new_local().try_build()?;
     builder.block_on(async {
-        let fut = NopBuilder::new().build()?;
+        let fut = NopBuilder::new().build();
         let res = fut.await;
 
         assert!(res.is_ok());
@@ -24,7 +24,7 @@ fn test_local_worker_single_nop() -> Result<()> {
 fn test_local_worker_batch_of_nops() -> Result<()> {
     let builder = Builder::new_local().try_build()?;
     builder.block_on(async {
-        let batch = Sqe::new(build_batch(10)?);
+        let batch = Sqe::new(build_batch(10));
         let res = batch.await;
 
         assert!(res.is_ok());

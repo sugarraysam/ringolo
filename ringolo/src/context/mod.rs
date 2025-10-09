@@ -1,3 +1,6 @@
+// Keep unused context methods to provide rich API for future developers.
+#![allow(unused)]
+
 use crate::runtime::{RuntimeConfig, local, stealing};
 use crate::task::Id;
 use anyhow::Result;
@@ -64,7 +67,7 @@ pub(crate) fn with_core_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut Core) -> R,
 {
-    with_context_mut(|outer| match outer {
+    with_context(|outer| match outer {
         ContextWrapper::Local(c) => c.with_core_mut(f),
         ContextWrapper::Stealing(c) => c.with_core_mut(f),
     })
@@ -155,17 +158,6 @@ where
     })
 }
 
-#[inline(always)]
-fn with_context_mut<F, R>(f: F) -> R
-where
-    F: FnOnce(&mut ContextWrapper) -> R,
-{
-    CONTEXT.with(|ctx| {
-        let mut ctx = ctx.get().expect("Context not initialized").borrow_mut();
-        f(&mut ctx)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use crate::runtime::Builder;
@@ -217,27 +209,25 @@ mod tests {
     }
 
     #[test]
-    fn test_context_is_not_reentrant() -> Result<()> {
+    fn test_context_has_interior_mutability() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
         assert!(
             catch_unwind(|| {
-                with_context(|_outer_ctx| {
-                    with_context_mut(|_inner_ctx| {});
-                })
+                with_context(|_outer_ctx| with_slab_and_ring_mut(|_slab, _ring| {}))
             })
-            .is_err(),
-            "Nesting mutable access inside immutable access must panic due to RefCell rules."
+            .is_ok(),
+            "Can borrow two root fields as mut because interior mutability."
         );
 
         assert!(
             catch_unwind(|| {
-                with_context_mut(|_outer_ctx| {
-                    with_context_mut(|_inner_ctx| {});
+                with_context(|_outer_ctx| {
+                    with_context(|_inner_ctx| {});
                 })
             })
-            .is_err(),
-            "Nesting mutable access inside immutable access must panic due to RefCell rules."
+            .is_ok(),
+            "Can have N immutable borrows of root context."
         );
 
         Ok(())

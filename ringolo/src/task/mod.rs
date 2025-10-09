@@ -1,4 +1,4 @@
-use crate::runtime::Schedule;
+use crate::runtime::{Schedule, TaskOpts};
 
 // Public API
 pub mod abort;
@@ -44,13 +44,18 @@ pub(crate) type Result<T> = std::result::Result<T, JoinError>;
 /// created. The first task reference is usually put into an `OwnedTasks`
 /// immediately. The Notified is sent to the scheduler as an ordinary
 /// notification.
-fn new_task<T, S>(task: T, scheduler: S, id: Id) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
+fn new_task<T, S>(
+    task: T,
+    task_opts: Option<TaskOpts>,
+    scheduler: S,
+    id: Id,
+) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
 where
     S: Schedule,
     T: Future + 'static,
     T::Output: 'static,
 {
-    let raw = RawTask::new::<T, S>(task, scheduler, id);
+    let raw = RawTask::new::<T, S>(task, task_opts, scheduler, id);
     let task = Task::new(raw);
     let notified = Notified::new(Task::new(raw));
     let join = JoinHandle::new(raw);

@@ -1,6 +1,8 @@
+use crate::sqe::errors::IoError;
 use crate::sqe::raw::RawSqe;
-use anyhow::{Context, Result, anyhow};
+// use anyhow::{Context, Result, anyhow};
 use slab::{Slab, VacantEntry};
+use std::io::{self, Error, ErrorKind};
 
 pub struct RawSqeSlab {
     slab: slab::Slab<RawSqe>,
@@ -21,32 +23,38 @@ impl RawSqeSlab {
 
     /// Always rely on our SlabVacantEntry wrapper for insertions as it will
     /// take care of incrementing the number of `pending_ios`.
-    pub(crate) fn vacant_entry(&'_ mut self) -> Result<SlabVacantEntry<'_>> {
+    pub(crate) fn vacant_entry(&'_ mut self) -> Result<SlabVacantEntry<'_>, IoError> {
         if self.slab.len() == self.slab.capacity() {
-            return Err(anyhow!("RawSqeSlab is full"));
+            return Err(IoError::SlabFull);
         }
 
         let v = self.slab.vacant_entry();
         Ok(SlabVacantEntry::new(v, &mut self.pending_ios))
     }
 
-    pub(crate) fn insert(&mut self, mut raw_sqe: RawSqe) -> Result<(usize, &mut RawSqe)> {
+    pub(crate) fn insert(&mut self, mut raw_sqe: RawSqe) -> Result<(usize, &mut RawSqe), IoError> {
         let entry = self.vacant_entry()?;
         raw_sqe.set_user_data(entry.key() as u64)?;
 
         Ok((entry.key(), entry.insert(raw_sqe)))
     }
 
-    pub(crate) fn get(&self, key: usize) -> Result<&RawSqe> {
-        self.slab
-            .get(key)
-            .with_context(|| format!("Key {} not found in RawSqeSlab", key))
+    pub(crate) fn get(&self, key: usize) -> io::Result<&RawSqe> {
+        self.slab.get(key).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("Key {:?} not found in slab.", key),
+            )
+        })
     }
 
-    pub(crate) fn get_mut(&mut self, key: usize) -> Result<&mut RawSqe> {
-        self.slab
-            .get_mut(key)
-            .with_context(|| format!("Key {} not found in RawSqeSlab", key))
+    pub(crate) fn get_mut(&mut self, key: usize) -> io::Result<&mut RawSqe> {
+        self.slab.get_mut(key).ok_or_else(|| {
+            Error::new(
+                ErrorKind::NotFound,
+                format!("Key {:?} not found in slab.", key),
+            )
+        })
     }
 
     // Removes and drop the entry if it exists. Returns true if an entry was dropped.
@@ -98,6 +106,7 @@ mod tests {
     use crate::sqe::CompletionEffect;
     use crate::sqe::raw::CompletionHandler;
     use crate::test_utils::*;
+    use anyhow::Result;
 
     #[test]
     fn test_new_and_capacity() {
@@ -153,7 +162,9 @@ mod tests {
                 .map(|_| {
                     let mut raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
                     raw_sqe.set_waker(&waker);
-                    slab.insert(raw_sqe).map(|(idx, _)| idx)
+                    slab.insert(raw_sqe)
+                        .map(|(idx, _)| idx)
+                        .map_err(|e| e.into())
                 })
                 .collect::<Result<Vec<_>>>()?;
 

@@ -1,5 +1,6 @@
 use crate::task::{Notified, Task};
 use anyhow::Result;
+use bitflags::bitflags;
 
 // Public API
 pub mod runtime;
@@ -17,15 +18,16 @@ use ticker::{Ticker, TickerData, TickerEvents};
 
 mod waker;
 
-#[derive(Debug)]
-pub(crate) enum Scheduler {
-    Local(local::Handle),
-    Stealing(stealing::Handle),
-}
-
 /// Scheduler trait
 pub(crate) trait Schedule: Sync + Sized + 'static {
+    /// Schedule a task to run soon.
     fn schedule(&self, is_new: bool, task: Notified<Self>);
+
+    /// Mechanism through which a task can suspend itself, with the intention
+    /// of running again soon without being woken up. Very useful if a task was
+    /// unable to register the waker for example, can fallback to yielding and
+    /// try to register the waker again.
+    fn yield_now(&self, task: Notified<Self>, reason: YieldReason);
 
     /// The task has completed work and is ready to be released. The scheduler
     /// should release it immediately and return it. The task module will batch
@@ -40,11 +42,24 @@ pub(crate) trait Schedule: Sync + Sized + 'static {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum YieldReason {
+    SlabFull,
+    SqRingFull,
+    NoTaskBudget,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum AddMode {
+    FIFO,
+    LIFO,
+}
+
 /// Abstraction of everything needed to build an event loop.
 pub(crate) trait EventLoop {
     type Task;
 
-    fn add_task(&self, task: Self::Task);
+    fn add_task(&self, task: Self::Task, mode: AddMode);
 
     fn find_task(&self) -> Option<Self::Task>;
 
@@ -55,4 +70,18 @@ pub(crate) trait EventLoop {
     // Can't do &mut because scheduler needs access to the worker to schedule
     // tasks. Worker needs interior mutability.
     fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output>;
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub(crate) struct TaskOpts: u32 {
+        /// Task will stick to the thread onto which it is created.
+        const STICKY = 1;
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum Scheduler {
+    Local(local::Handle),
+    Stealing(stealing::Handle),
 }

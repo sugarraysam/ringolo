@@ -226,7 +226,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
             // Panics are delivered to the user via the `JoinHandle`. Given that
             // they are dropping the `JoinHandle`, we assume they are not
             // interested in the panic and swallow it.
-            let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
                 self.core().drop_future_or_output();
             }));
         }
@@ -262,7 +262,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
 
         // We catch panics here in case dropping the future or waking the
         // JoinHandle panics.
-        let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
             if !snapshot.is_join_interested() {
                 // The `JoinHandle` is not interested in the output of
                 // this task. It is our responsibility to drop the

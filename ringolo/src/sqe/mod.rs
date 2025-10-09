@@ -1,30 +1,37 @@
-use anyhow::{Result, anyhow};
+use crate::runtime::YieldReason;
+use crate::task::Header;
 use std::future::Future;
-use std::io;
 use std::pin::Pin;
+use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
 // Public API
 pub mod single;
+use crate::context::with_core;
+
 pub use self::single::SqeSingle;
 
 pub mod list;
 pub use self::list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
 
 pub mod stream;
-pub use self::stream::{SqeStream, SqeStreamError};
+pub use self::stream::SqeStream;
 
 // Re-exports
-#[allow(dead_code)]
-pub mod message;
+pub(crate) mod errors;
+pub(crate) use errors::IoError;
 
-pub mod raw;
+// TODO: revive this module to impl RingMessage protocol
+// #[allow(dead_code)]
+// pub mod message;
+
+pub(crate) mod raw;
 pub(crate) use self::raw::RawSqe;
 pub(crate) use self::raw::{CompletionEffect, CompletionHandler, RawSqeState};
 
 pub trait Submittable {
     /// We pas the waker so we get access to the RawTask Header.
-    fn submit(&self, waker: &Waker) -> io::Result<i32>;
+    fn submit(&mut self, waker: &Waker) -> Result<i32, IoError>;
 }
 
 pub trait Completable {
@@ -65,9 +72,10 @@ impl<T: Submittable + Completable> Sqe<T> {
     }
 }
 
+// TODO: remove this with `pin-project`?
 impl<T: Submittable + Completable> Unpin for Sqe<T> {}
 
-impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<T> {
+impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future for Sqe<T> {
     type Output = T::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -77,16 +85,22 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for Sqe<
             match this.state {
                 State::Initial => {
                     if let Err(e) = this.inner.submit(cx.waker()) {
-                        if e.kind() == io::ErrorKind::ResourceBusy {
-                            // TODO: log error this is real bad, need to double SQ ring size
-                            // Submission queue is full, yield and try again later.
-                            //
-                            // TODO BUG: will never be woken up?
-                            eprintln!("Warning: Submission queue is full, double SQ ring size");
-                            return Poll::Pending;
-                        } else {
-                            this.state = State::Completed;
-                            return Poll::Ready(Err(anyhow!("failed to submit: {:?}", e)));
+                        match e {
+                            IoError::SqRingFull | IoError::SlabFull => {
+                                let _reason = if matches!(e, IoError::SqRingFull) {
+                                    YieldReason::SqRingFull
+                                } else {
+                                    YieldReason::SlabFull
+                                };
+
+                                // TODO: `try_yield_now` on context :: fails if root_future
+                                eprintln!("Warning: Submission queue is full, double SQ ring size");
+                                return Poll::Pending;
+                            }
+                            _ => {
+                                this.state = State::Completed;
+                                return Poll::Ready(Err(e));
+                            }
                         }
                     }
 
@@ -140,7 +154,9 @@ impl<T: Submittable + Completable> SqeCollection<T> {
 
 impl<T: Submittable + Completable> Unpin for SqeCollection<T> {}
 
-impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeCollection<T> {
+impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
+    for SqeCollection<T>
+{
     type Output = Vec<T::Output>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -155,17 +171,24 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeC
                     // syscall.
                     for (_, sqe) in &mut this.inner {
                         if let Err(e) = sqe.submit(cx.waker()) {
-                            if e.kind() == io::ErrorKind::ResourceBusy {
-                                // TODO: log error this is real bad, need to double SQ ring size
-                                // Submission queue is full, yield and try again later.
-                                eprintln!("Warning: Submission queue is full, double SQ ring size");
-                                return Poll::Pending;
-                            } else {
-                                this.state = State::Completed;
-                                return Poll::Ready(vec![Err(anyhow!(
-                                    "failed to submit: {:?}",
-                                    e
-                                ))]);
+                            match e {
+                                IoError::SqRingFull | IoError::SlabFull => {
+                                    let _reason = if matches!(e, IoError::SqRingFull) {
+                                        YieldReason::SqRingFull
+                                    } else {
+                                        YieldReason::SlabFull
+                                    };
+
+                                    // TODO: `try_yield_now` on context :: fails if root_future
+                                    eprintln!(
+                                        "Warning: Submission queue is full, double SQ ring size"
+                                    );
+                                    return Poll::Pending;
+                                }
+                                _ => {
+                                    this.state = State::Completed;
+                                    return Poll::Ready(vec![Err(e)]);
+                                }
                             }
                         }
                     }
@@ -209,11 +232,29 @@ impl<E, T: Submittable + Completable<Output = Result<E>> + Send> Future for SqeC
     }
 }
 
+// In our submit implementation, we keep track of each task's pending IO. This is
+// our signal to determine if a task can be safely stolen by another thread. It
+// will also influence the scheduling logic (e.g.: place on a stealable queue).
+//
+// BUT, the root future is different. It gets a Waker implementation where the
+// data ptr is actually the Scheduler, and not a task Header. We use `thread_local`
+// trick to detect if we are polling the root future, and avoid accessing invalid
+// memory location.
+pub(super) fn increment_pending_io(waker: &Waker) {
+    unsafe {
+        if !with_core(|core| core.is_polling_root()) {
+            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+            Header::increment_pending_io(ptr);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::{with_core_mut, with_ring_mut};
     use crate::test_utils::*;
+    use anyhow::Result;
     use either::Either;
     use io_uring::squeue::Entry;
     use rstest::rstest;
@@ -318,7 +359,7 @@ mod tests {
             .into_iter()
             .zip(entries.into_iter())
             .map(|(kind, entries)| build_list_with_entries(kind, entries))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Vec<_>>();
 
         let mut sqe_fut = pin!(SqeCollection::new(collection));
 
@@ -353,7 +394,7 @@ mod tests {
             assert_eq!(results.len(), num_lists);
             assert!(results.iter().all(Result::is_ok));
 
-            let results = results.into_iter().collect::<Result<Vec<_>>>()?;
+            let results = results.into_iter().collect::<Result<Vec<_>, IoError>>()?;
 
             // SqeCollection contract is the results order has to respect the insertion order.
             for (got, expected) in results.iter().zip(expected_results) {

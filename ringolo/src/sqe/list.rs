@@ -1,10 +1,10 @@
 use crate::context::{with_core_mut, with_slab_mut};
-use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
-use crate::task::Header;
-use anyhow::{Result, anyhow};
+use crate::sqe::errors::IoError;
+use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
+use anyhow::anyhow;
 use io_uring::squeue::{Entry, Flags};
-use std::io;
-use std::ptr::NonNull;
+use std::io::{self, Error, ErrorKind};
+use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
@@ -21,91 +21,126 @@ pub enum SqeListKind {
     Chain,
 }
 
+pub(crate) enum SqeListState {
+    Preparing {
+        builder: SqeListBuilder,
+    },
+    Indexed {
+        indices: Vec<usize>,
+        remaining: Arc<AtomicUsize>,
+
+        #[allow(unused)]
+        kind: SqeListKind,
+    },
+}
+
 // Batch and Chain APIs resolve to this type
 //
 // We use Arc<Atomic> for remaining counter as we need SqeList to be Sync + Send.
-#[derive(Debug)]
 pub struct SqeList {
-    list: Vec<usize>,
-    remaining: Arc<AtomicUsize>,
-
-    #[allow(dead_code)]
-    kind: SqeListKind,
+    state: SqeListState,
 }
 
 impl SqeList {
-    pub fn new(list: Vec<usize>, remaining: Arc<AtomicUsize>, kind: SqeListKind) -> Self {
+    fn new(builder: SqeListBuilder) -> Self {
         Self {
-            list,
-            remaining,
-            kind,
+            state: SqeListState::Preparing { builder },
         }
     }
 
-    pub fn head_idx(&self) -> usize {
-        self.list[0]
+    fn with_indexed<F, R>(&self, f: F) -> io::Result<R>
+    where
+        F: FnOnce(&Vec<usize>, &Arc<AtomicUsize>) -> R,
+    {
+        match &self.state {
+            SqeListState::Indexed {
+                indices, remaining, ..
+            } => Ok(f(indices, remaining)),
+            _ => Err(Error::other("state not indexed")),
+        }
     }
 
-    pub fn set_waker(&self, waker: &Waker) -> Result<()> {
-        with_slab_mut(|slab| slab.get_mut(self.list[0]).map(|sqe| sqe.set_waker(waker)))
+    pub fn head_idx(&self) -> io::Result<usize> {
+        self.with_indexed(|indices, _| indices[0])
     }
 
-    pub fn is_ready(&self) -> bool {
-        self.remaining.load(Ordering::Relaxed) == 0
+    // We set the waker on the head of the list.
+    pub fn set_waker(&self, waker: &Waker) -> io::Result<()> {
+        self.with_indexed(|indices, _| {
+            with_slab_mut(|slab| slab.get_mut(indices[0]).map(|sqe| sqe.set_waker(waker)))
+        })?
     }
 
-    pub fn len(&self) -> usize {
-        self.list.len()
+    pub fn is_ready(&self) -> io::Result<bool> {
+        self.with_indexed(|_, remaining| remaining.load(Ordering::Relaxed) == 0)
+    }
+
+    pub fn len(&self) -> io::Result<usize> {
+        self.with_indexed(|indices, _| indices.len())
     }
 }
 
 impl Submittable for SqeList {
-    fn submit(&self, waker: &Waker) -> io::Result<i32> {
-        unsafe {
-            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
-            Header::increment_pending_io(ptr);
+    fn submit(&mut self, waker: &Waker) -> Result<i32, IoError> {
+        if let SqeListState::Preparing { builder } = &self.state {
+            // Important: clone entries so we can easily retry when Slab is full.
+            let builder = builder.clone();
+
+            _ = mem::replace(&mut self.state, builder.try_build()?);
+
+            increment_pending_io(waker);
         }
-        with_core_mut(|ctx| ctx.push_sqes(&self.list))
+
+        self.with_indexed(|indices, _| with_core_mut(|ctx| ctx.push_sqes(indices)))?
+            .map_err(IoError::from)
     }
 }
 
 impl Completable for SqeList {
-    type Output = Result<Vec<(Entry, io::Result<i32>)>>;
+    type Output = Result<Vec<(Entry, io::Result<i32>)>, IoError>;
 
     fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output> {
-        if !self.is_ready() {
+        if !self.is_ready()? {
             // In normal operations, the Completable is only woken up when it's last RawSqe
             // completes. We still want to account for spurious wakeups or complex future
             // interactions so let's update the waker every time.
             return match self.set_waker(waker) {
                 Ok(_) => Poll::Pending,
-                Err(e) => Poll::Ready(Err(e)),
+                Err(e) => Poll::Ready(Err(e.into())),
             };
         }
 
-        let res = with_slab_mut(|slab| -> Self::Output {
-            self.list
-                .iter()
-                .map(|idx| -> Result<(Entry, io::Result<i32>)> {
-                    slab.get_mut(*idx)?.take_final_result()
-                })
-                .collect::<Result<Vec<_>>>()
-        });
+        self.with_indexed(|indices, _| {
+            let res = with_slab_mut(|slab| -> Self::Output {
+                indices
+                    .iter()
+                    .map(|idx| -> Result<(Entry, io::Result<i32>), IoError> {
+                        slab.get_mut(*idx)?
+                            .take_final_result()
+                            .map_err(IoError::from)
+                    })
+                    .collect::<Result<Vec<_>, IoError>>()
+            });
 
-        Poll::Ready(res)
+            Poll::Ready(res)
+        })?
     }
 }
 
 // RAII: walk the SqeList and free every RawSqe from slab.
 impl Drop for SqeList {
     fn drop(&mut self) {
-        with_slab_mut(|slab| {
-            self.list.iter().for_each(|idx| {
-                if slab.try_remove(*idx).is_none() {
-                    eprintln!("Warning: SQE {} not found in slab during drop", idx);
-                }
+        if let Err(e) = self.with_indexed(|indices, _| {
+            with_slab_mut(|slab| {
+                indices.iter().for_each(|idx| {
+                    if slab.try_remove(*idx).is_none() {
+                        eprintln!("Warning: SQE {} not found in slab during drop", idx);
+                    }
+                });
             });
-        });
+        }) {
+            eprintln!("{:?}", e);
+        }
     }
 }
 
@@ -141,8 +176,8 @@ impl SqeBatchBuilder {
         self
     }
 
-    pub fn try_build(self) -> Result<SqeList> {
-        self.inner.try_build()
+    pub fn build(self) -> SqeList {
+        SqeList::new(self.inner)
     }
 }
 
@@ -176,12 +211,13 @@ impl SqeChainBuilder {
         self
     }
 
-    pub fn try_build(self) -> Result<SqeList> {
-        self.inner.try_build()
+    pub fn build(self) -> SqeList {
+        SqeList::new(self.inner)
     }
 }
 
-struct SqeListBuilder {
+#[derive(Debug, Clone)]
+pub(crate) struct SqeListBuilder {
     list: Vec<Entry>,
     kind: SqeListKind,
 }
@@ -229,13 +265,10 @@ impl SqeListBuilder {
     // Build the linked list of RawSqe for either SqeChain or SqeBatch abstractions.
     // This builder maintains the order of insertion, and the contract is that we will also
     // respect this order when returning results.
-    fn try_build(self) -> Result<SqeList> {
+    fn try_build(self) -> Result<SqeListState, IoError> {
         let n_sqes = self.list.len();
         if n_sqes < 2 {
-            return Err(anyhow!(
-                "SqeListBuilder requires at least 2 sqes, got {}",
-                n_sqes
-            ));
+            return Err(anyhow!("SqeListBuilder requires at least 2 sqes, got {}", n_sqes).into());
         }
 
         let kind = self.kind;
@@ -248,7 +281,7 @@ impl SqeListBuilder {
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
         let mut indices = Vec::with_capacity(entries.len());
 
-        with_slab_mut(|slab| -> Result<()> {
+        with_slab_mut(|slab| -> Result<(), IoError> {
             let vacant = slab.vacant_entry()?;
             indices.push(vacant.key());
 
@@ -271,7 +304,11 @@ impl SqeListBuilder {
             Ok(())
         })?;
 
-        Ok(SqeList::new(indices, remaining, kind))
+        Ok(SqeListState::Indexed {
+            indices,
+            remaining,
+            kind,
+        })
     }
 }
 
@@ -282,6 +319,7 @@ mod tests {
     use crate::runtime::Builder;
     use crate::sqe::RawSqeState;
     use crate::test_utils::*;
+    use anyhow::Result;
     use either::Either;
     use rstest::rstest;
     use std::pin::pin;
@@ -295,34 +333,39 @@ mod tests {
         init_local_runtime_and_context(None)?;
 
         let n = 4;
-        let list = match kind {
+        let mut list = match kind {
             SqeListKind::Batch => build_batch(n),
             SqeListKind::Chain => build_chain(n),
-        }?;
+        };
 
+        // Need to submit for slab to be populated.
         let (waker, _) = mock_waker();
+        list.submit(&waker)?;
         list.set_waker(&waker)?;
+
         let mut num_heads = 0;
 
         with_slab(|slab| -> Result<()> {
-            for idx in list.list.iter() {
-                let sqe = slab.get(*idx)?;
-                assert_eq!(sqe.get_state(), RawSqeState::Pending);
+            list.with_indexed(|indices, _| -> Result<()> {
+                for idx in indices {
+                    let sqe = slab.get(*idx)?;
+                    assert_eq!(sqe.get_state(), RawSqeState::Pending);
 
-                match &sqe.handler {
-                    CompletionHandler::BatchOrChain {
-                        head, remaining, ..
-                    } => {
-                        assert_eq!(remaining.load(Ordering::Relaxed), list.len());
-                        if sqe.has_waker() {
-                            assert_eq!(*idx, *head, "sqe with waker should be head node");
-                            num_heads += 1;
+                    match &sqe.handler {
+                        CompletionHandler::BatchOrChain {
+                            head, remaining, ..
+                        } => {
+                            assert_eq!(remaining.load(Ordering::Relaxed), indices.len());
+                            if sqe.has_waker() {
+                                assert_eq!(*idx, *head, "sqe with waker should be head node");
+                                num_heads += 1;
+                            }
                         }
+                        _ => assert!(false, "unexpected completion handler"),
                     }
-                    _ => assert!(false, "unexpected completion handler"),
                 }
-            }
-            Ok(())
+                Ok(())
+            })?
         })?;
 
         assert_eq!(num_heads, 1, "expected one unique head node");
@@ -345,38 +388,38 @@ mod tests {
         let list = match kind {
             SqeListKind::Batch => build_batch(size),
             SqeListKind::Chain => build_chain(size),
-        }?;
-        let sqe_list = Sqe::new(list);
-
-        let head_idx = sqe_list.get().head_idx();
-        let expected_user_data = sqe_list.get().list.clone();
-
-        let mut sqe_fut = pin!(sqe_list);
+        };
 
         let (waker, waker_data) = mock_waker();
         let mut ctx = Context::from_waker(&waker);
 
-        // Polling once will submit the batch SQE and set the waker.
-        // Polling N more times after this won't change the state.
+        let sqe_list = Sqe::new(list);
+        let mut sqe_fut = pin!(sqe_list);
+
+        // Polling once will populate the slab and SQ ring. It will also set the
+        // waker. Polling N more times after this won't change the state.
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
-
-            with_slab_and_ring_mut(|slab, ring| {
-                assert_eq!(ring.sq().len(), size);
-
-                // Waker only set on head in batch/chain setup
-                let res = slab.get(head_idx).and_then(|sqe| {
-                    assert!(!sqe.is_ready());
-                    assert!(sqe.has_waker());
-                    assert_eq!(sqe.get_state(), RawSqeState::Pending);
-                    Ok(())
-                });
-
-                assert!(res.is_ok());
-            });
         }
+
+        let expected_user_data = sqe_fut.get().with_indexed(|indices, _| indices.clone())?;
+        let head_idx = expected_user_data[0];
+
+        with_slab_and_ring_mut(|slab, ring| {
+            assert_eq!(ring.sq().len(), size);
+
+            // Waker only set on head in batch/chain setup
+            let res = slab.get(head_idx).and_then(|sqe| {
+                assert!(!sqe.is_ready());
+                assert!(sqe.has_waker());
+                assert_eq!(sqe.get_state(), RawSqeState::Pending);
+                Ok(())
+            });
+
+            assert!(res.is_ok());
+        });
 
         with_core_mut(|core| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
@@ -445,10 +488,7 @@ mod tests {
         init_local_runtime_and_context(None)?;
 
         let size = entries.len();
-        let sqe_list = Sqe::new(build_list_with_entries(kind, entries)?);
-
-        let head_idx = sqe_list.get().head_idx();
-        let expected_user_data = sqe_list.get().list.clone();
+        let sqe_list = Sqe::new(build_list_with_entries(kind, entries));
 
         let mut sqe_fut = pin!(sqe_list);
 
@@ -461,20 +501,23 @@ mod tests {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
-
-            with_slab_and_ring_mut(|slab, ring| {
-                assert_eq!(ring.sq().len(), size);
-
-                // Waker only set on head in batch/chain setup
-                let res = slab.get(head_idx).and_then(|sqe| {
-                    assert!(!sqe.is_ready());
-                    assert!(sqe.has_waker());
-                    Ok(())
-                });
-
-                assert!(res.is_ok());
-            });
         }
+
+        let expected_user_data = sqe_fut.get().with_indexed(|indices, _| indices.clone())?;
+        let head_idx = expected_user_data[0];
+
+        with_slab_and_ring_mut(|slab, ring| {
+            assert_eq!(ring.sq().len(), size);
+
+            // Waker only set on head in batch/chain setup
+            let res = slab.get(head_idx).and_then(|sqe| {
+                assert!(!sqe.is_ready());
+                assert!(sqe.has_waker());
+                Ok(())
+            });
+
+            assert!(res.is_ok());
+        });
 
         with_core_mut(|core| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
@@ -527,9 +570,16 @@ mod tests {
             builder = builder.add_entry(nop(), None);
         }
 
+        let (waker, _) = mock_waker();
+
+        let mut list = builder.build();
+        let res = list.submit(&waker);
+
         // In the current setup, we always overflow the Slab before we overflow
         // the ring. So we can detect this error first.
-        assert!(matches!(builder.try_build(), Err(_)));
+        assert!(res.is_err());
+        assert_eq!(res.unwrap_err(), IoError::SlabFull);
+
         Ok(())
     }
 }

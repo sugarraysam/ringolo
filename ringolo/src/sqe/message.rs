@@ -31,7 +31,7 @@ impl SqeRingMessage {
 
 impl Submittable for SqeRingMessage {
     // TODO: impl ACK + mailbox
-    fn submit(&self, waker: &Waker) -> io::Result<i32> {
+    fn submit(&mut self, waker: &Waker) -> io::Result<i32> {
         unsafe {
             let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
             Header::increment_pending_io(ptr);

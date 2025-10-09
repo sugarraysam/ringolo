@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::Schedule;
+use crate::runtime::{Schedule, TaskOpts};
 
 use crate::task::harness::Harness;
 use crate::task::id::TaskIdGuard;
@@ -47,11 +47,17 @@ pub(super) struct TaskLayout<T: Future, S> {
 impl<T: Future, S: Schedule> TaskLayout<T, S> {
     /// Allocates a new task cell, containing the header, trailer, and core
     /// structures.
-    pub(super) fn new(future: T, scheduler: S, state: State, id: Id) -> Box<TaskLayout<T, S>> {
+    pub(super) fn new(
+        future: T,
+        task_opts: Option<TaskOpts>,
+        scheduler: S,
+        state: State,
+        id: Id,
+    ) -> Box<TaskLayout<T, S>> {
         let vtable = vtable::<T, S>();
 
         let result = Box::new(TaskLayout {
-            header: Header::new(state, vtable),
+            header: Header::new(state, vtable, task_opts),
             core: Core {
                 scheduler,
                 id,

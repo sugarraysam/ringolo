@@ -1,8 +1,7 @@
 #![allow(clippy::all)]
 
 // Required imports for the macro and the generated code.
-use crate::sqe::{Sqe, SqeSingle};
-use anyhow::Result;
+use crate::sqe::{IoError, Sqe, SqeSingle};
 use io_uring::squeue::Entry;
 use io_uring::types::{
     DestinationSlot, Fd, Fixed, FsyncFlags, OpenHow, TimeoutFlags, Timespec, epoll_event, statx,
@@ -67,16 +66,16 @@ macro_rules! generate_io_uring_future {
             )*
 
             // The `build` method consumes the builder and returns the final struct.
-            pub fn build(self) -> Result<$name> {
-                Ok($name {
-                    sqe: Sqe::new(SqeSingle::try_new(self.op.build())?),
-                })
+            pub fn build(self) -> $name {
+                $name {
+                    sqe: Sqe::new(SqeSingle::new(self.op.build())),
+                }
             }
         }
 
         // The `Future` implementation is consistent across all generated structs.
         impl Future for $name {
-            type Output = Result<(Entry, io::Result<i32>)>;
+            type Output = Result<(Entry, io::Result<i32>), IoError>;
 
             fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
                 let mut pinned = pin!(&mut self.sqe);

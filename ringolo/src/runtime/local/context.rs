@@ -1,8 +1,12 @@
+// Expose rich API for developers even if unused.
+#![allow(unused)]
+
 use crate::context::Core;
 use crate::context::RawSqeSlab;
 use crate::context::SingleIssuerRing;
 use crate::runtime::RuntimeConfig;
 use crate::runtime::local;
+use crate::util::ScopeGuard;
 use anyhow::Result;
 use std::cell::RefCell;
 
@@ -19,6 +23,13 @@ impl Context {
         Ok(Self {
             scheduler,
             core: RefCell::new(core),
+        })
+    }
+
+    pub(crate) fn set_polling_root(&self) -> ScopeGuard<'_, impl FnOnce()> {
+        self.with_core(|c| c.polling_root_future.replace(true));
+        ScopeGuard::new(|| {
+            self.with_core(|c| c.polling_root_future.replace(false));
         })
     }
 

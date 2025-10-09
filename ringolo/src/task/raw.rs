@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::Schedule;
+use crate::runtime::{Schedule, TaskOpts};
 use crate::task::layout::TaskLayout;
 use crate::task::state::{Snapshot, State, TransitionToNotifiedByRef, TransitionToNotifiedByVal};
 use crate::task::trailer::Trailer;
@@ -16,12 +16,18 @@ pub(crate) struct RawTask {
 }
 
 impl RawTask {
-    pub(super) fn new<T, S>(task: T, scheduler: S, id: Id) -> RawTask
+    pub(super) fn new<T, S>(task: T, task_opts: Option<TaskOpts>, scheduler: S, id: Id) -> RawTask
     where
         T: Future + 'static,
         S: Schedule,
     {
-        let ptr = Box::into_raw(TaskLayout::<_, S>::new(task, scheduler, State::new(), id));
+        let ptr = Box::into_raw(TaskLayout::<_, S>::new(
+            task,
+            task_opts,
+            scheduler,
+            State::new(),
+            id,
+        ));
         let ptr = unsafe { NonNull::new_unchecked(ptr.cast()) };
 
         RawTask { ptr }

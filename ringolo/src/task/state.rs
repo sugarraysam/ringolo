@@ -317,7 +317,7 @@ impl State {
     pub(super) fn transition_to_shutdown(&self) -> bool {
         let mut prev = Snapshot(0);
 
-        let _ = self.fetch_update(|mut snapshot| {
+        _ = self.fetch_update(|mut snapshot| {
             prev = snapshot;
 
             if snapshot.is_idle() {

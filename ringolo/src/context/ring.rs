@@ -109,7 +109,7 @@ mod tests {
     use crate::context::with_core_mut;
     use crate::future::opcodes::TimeoutBuilder;
     use crate::runtime::Builder;
-    use crate::sqe::{CompletionHandler, RawSqe};
+    use crate::sqe::{CompletionHandler, IoError, RawSqe};
     use crate::test_utils::*;
     use rstest::rstest;
     use std::pin::pin;
@@ -121,7 +121,7 @@ mod tests {
 
         let timespec = Timespec::from(Duration::from_millis(30));
 
-        let mut sqe_fut = pin!(TimeoutBuilder::new(&timespec).build()?);
+        let mut sqe_fut = pin!(TimeoutBuilder::new(&timespec).build());
         let (waker, _) = mock_waker();
 
         let mut ctx = Context::from_waker(&waker);
@@ -175,7 +175,9 @@ mod tests {
                 (0..n)
                     .map(|_| {
                         let raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
-                        slab.insert(raw_sqe).map(|(idx, _)| idx)
+                        slab.insert(raw_sqe)
+                            .map(|(idx, _)| idx)
+                            .map_err(IoError::into)
                     })
                     .collect::<Result<Vec<_>>>()
             }?;
@@ -224,7 +226,9 @@ mod tests {
                     .map(|_| {
                         let mut raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
                         raw_sqe.set_waker(&waker);
-                        slab.insert(raw_sqe).map(|(idx, _)| idx)
+                        slab.insert(raw_sqe)
+                            .map(|(idx, _)| idx)
+                            .map_err(IoError::into)
                     })
                     .collect::<Result<Vec<_>>>()
             }?;

@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::runtime::TaskOpts;
 use crate::task::id::Id;
 use crate::task::layout::Vtable;
 use crate::task::state::State;
@@ -7,6 +8,14 @@ use crate::task::trailer::Trailer;
 use std::cell::Cell;
 use std::ptr::NonNull;
 
+/// Headers are accessed all the time and represent thin-pointers to Task (i.e.: future).
+/// We need them to be memory efficient, and ideally have an optimal alignment.
+/// The structure now stands at 32 bytes:
+/// - 8 bytes :: state (atomic_usize)
+/// - 8 bytes :: vtable (ptr)
+/// - 8 bytes :: id (u64)
+/// - 4 bytes :: pending_io (i32)
+/// - 4 bytes :: task_opts (u32)
 #[repr(C)]
 pub(crate) struct Header {
     /// Task state.
@@ -26,18 +35,26 @@ pub(crate) struct Header {
     /// because completion will arrive on the thread that registered the
     /// submissions.
     pub(super) pending_io: Cell<i32>,
+
+    /// Special task options to modify scheduling behaviour.
+    pub(super) opts: Cell<TaskOpts>,
 }
 
 unsafe impl Send for Header {}
 unsafe impl Sync for Header {}
 
 impl Header {
-    pub(crate) fn new(state: State, vtable: &'static Vtable) -> Header {
+    pub(crate) fn new(
+        state: State,
+        vtable: &'static Vtable,
+        task_opts: Option<TaskOpts>,
+    ) -> Header {
         Header {
             state,
             vtable,
             id: Id::next(),
             pending_io: Cell::new(0),
+            opts: Cell::new(task_opts.unwrap_or(TaskOpts::empty())),
         }
     }
 
@@ -71,7 +88,7 @@ impl Header {
     /// # Safety
     ///
     /// The provided raw pointer must point at the header of a task.
-    pub(super) unsafe fn get_id(me: NonNull<Header>) -> Id {
+    pub(crate) unsafe fn get_id(me: NonNull<Header>) -> Id {
         me.as_ref().id
     }
 
