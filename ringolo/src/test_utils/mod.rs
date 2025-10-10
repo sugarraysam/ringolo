@@ -14,6 +14,9 @@ pub(crate) use context::init_local_runtime_and_context;
 pub(crate) mod mocks;
 pub(crate) use mocks::mock_waker;
 
+pub(crate) mod spy;
+pub(crate) use spy::SpyScheduler;
+
 // Make sure to keep `data` and `File` alive until SQ has been submitted.
 // We write-fsync-read and skip open+close because the tempfile library is
 // already doing this work, so we want to avoid conflicts.

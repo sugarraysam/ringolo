@@ -27,6 +27,7 @@ impl Trailer {
         (*ptr).as_ref().unwrap().will_wake(waker)
     }
 
+    #[track_caller]
     pub(super) fn wake_join(&self) {
         let ptr = self.waker.get();
         match unsafe { &*ptr } {

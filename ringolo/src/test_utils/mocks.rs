@@ -18,7 +18,7 @@ impl Schedule for DummyScheduler {
         unimplemented!("dummy scheduler");
     }
 
-    fn yield_now(&self, _task: Notified<Self>, _reason: YieldReason) {
+    fn yield_now(&self, _waker: &Waker, _reason: YieldReason) {
         unimplemented!("dummy scheduler");
     }
 

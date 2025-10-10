@@ -3,7 +3,7 @@ use crate::sqe::errors::IoError;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
 use anyhow::anyhow;
 use io_uring::squeue::{Entry, Flags};
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error};
 use std::mem;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -56,7 +56,7 @@ impl SqeList {
             SqeListState::Indexed {
                 indices, remaining, ..
             } => Ok(f(indices, remaining)),
-            _ => Err(Error::other("state not indexed")),
+            _ => Err(Error::other("SqeList invalid state: expected Indexed")),
         }
     }
 
@@ -83,7 +83,7 @@ impl SqeList {
 impl Submittable for SqeList {
     fn submit(&mut self, waker: &Waker) -> Result<i32, IoError> {
         if let SqeListState::Preparing { builder } = &self.state {
-            // Important: clone entries so we can easily retry when Slab is full.
+            // Important: clone entries so we can retry if Slab is full.
             let builder = builder.clone();
 
             _ = mem::replace(&mut self.state, builder.try_build()?);

@@ -1,5 +1,6 @@
-use crate::runtime::YieldReason;
+use crate::runtime::{Schedule, YieldReason};
 use crate::task::Header;
+use crate::with_scheduler;
 use std::future::Future;
 use std::pin::Pin;
 use std::ptr::NonNull;
@@ -78,6 +79,7 @@ impl<T: Submittable + Completable> Unpin for Sqe<T> {}
 impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future for Sqe<T> {
     type Output = T::Output;
 
+    #[track_caller]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
@@ -87,14 +89,18 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
                     if let Err(e) = this.inner.submit(cx.waker()) {
                         match e {
                             IoError::SqRingFull | IoError::SlabFull => {
-                                let _reason = if matches!(e, IoError::SqRingFull) {
+                                let reason = if matches!(e, IoError::SqRingFull) {
                                     YieldReason::SqRingFull
                                 } else {
                                     YieldReason::SlabFull
                                 };
 
-                                // TODO: `try_yield_now` on context :: fails if root_future
-                                eprintln!("Warning: Submission queue is full, double SQ ring size");
+                                // We were unable to register the waker, and submit our IO to local uring.
+                                // Yield to scheduler so we can take corrective action and retry later.
+                                with_scheduler!(|s| {
+                                    s.yield_now(cx.waker(), reason);
+                                });
+
                                 return Poll::Pending;
                             }
                             _ => {
@@ -159,6 +165,7 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
 {
     type Output = Vec<T::Output>;
 
+    #[track_caller]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
@@ -173,16 +180,18 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
                         if let Err(e) = sqe.submit(cx.waker()) {
                             match e {
                                 IoError::SqRingFull | IoError::SlabFull => {
-                                    let _reason = if matches!(e, IoError::SqRingFull) {
+                                    let reason = if matches!(e, IoError::SqRingFull) {
                                         YieldReason::SqRingFull
                                     } else {
                                         YieldReason::SlabFull
                                     };
 
-                                    // TODO: `try_yield_now` on context :: fails if root_future
-                                    eprintln!(
-                                        "Warning: Submission queue is full, double SQ ring size"
-                                    );
+                                    // We were unable to register the waker, and submit our IO to local uring.
+                                    // Yield to scheduler so we can take corrective action and retry later.
+                                    with_scheduler!(|s| {
+                                        s.yield_now(cx.waker(), reason);
+                                    });
+
                                     return Poll::Pending;
                                 }
                                 _ => {

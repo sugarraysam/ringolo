@@ -265,6 +265,7 @@ impl Builder {
     /// # Panics
     ///
     /// This function will panic if 0 is passed as an argument.
+    #[track_caller]
     pub fn global_queue_interval(mut self, val: u32) -> Self {
         assert!(val > 0, "global_queue_interval must be greater than 0");
         self.global_queue_interval = Some(val);

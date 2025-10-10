@@ -3,7 +3,7 @@ use anyhow::Result;
 use io_uring::types::Timespec;
 use pin_project_lite::pin_project;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 pin_project! {
@@ -28,6 +28,7 @@ impl Sleep {
 impl Future for Sleep {
     type Output = ();
 
+    #[track_caller]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 

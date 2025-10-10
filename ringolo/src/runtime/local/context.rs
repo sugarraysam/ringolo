@@ -10,8 +10,32 @@ use crate::util::ScopeGuard;
 use anyhow::Result;
 use std::cell::RefCell;
 
+// Trick to enable observability of scheduler calls for tests. This is more powerful
+// than mocks as the *real* methods are actually invoked on the *real* scheduler
+// implementation.
+#[cfg(test)]
+mod details {
+    use super::local;
+    use crate::test_utils::spy::SpyScheduler;
+
+    pub(super) type Scheduler = SpyScheduler<local::Handle>;
+    pub(super) fn wrap_scheduler(scheduler: local::Handle) -> Scheduler {
+        SpyScheduler::new(scheduler)
+    }
+}
+
+#[cfg(not(test))]
+mod details {
+    use super::local;
+
+    pub(super) type Scheduler = local::Handle;
+    pub(super) fn wrap_scheduler(scheduler: local::Handle) -> Scheduler {
+        scheduler
+    }
+}
+
 pub(crate) struct Context {
-    pub(crate) scheduler: local::Handle,
+    pub(crate) scheduler: details::Scheduler,
 
     pub(crate) core: RefCell<Core>,
 }
@@ -21,7 +45,7 @@ impl Context {
         let core = Core::try_new(cfg)?;
 
         Ok(Self {
-            scheduler,
+            scheduler: details::wrap_scheduler(scheduler),
             core: RefCell::new(core),
         })
     }

@@ -9,7 +9,7 @@ use std::task::{Poll, Waker};
 
 #[derive(Debug)]
 pub(crate) enum SqeSingleState {
-    Preparing { entry: Option<Entry> },
+    Preparing { entry: Entry },
     Indexed { idx: usize },
 }
 
@@ -21,7 +21,7 @@ pub struct SqeSingle {
 impl SqeSingle {
     pub fn new(entry: Entry) -> Self {
         Self {
-            state: SqeSingleState::Preparing { entry: Some(entry) },
+            state: SqeSingleState::Preparing { entry },
         }
     }
 
@@ -39,9 +39,8 @@ impl Submittable for SqeSingle {
             // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
             // and only insert the entry in the slab once.
             SqeSingleState::Preparing { entry } => {
-                let entry = entry
-                    .take()
-                    .ok_or_else(|| Error::new(ErrorKind::NotFound, "empty entry"))?;
+                // Important: clone entry so we can retry if Slab is full.
+                let entry = entry.clone();
 
                 let idx = with_slab_mut(|slab| {
                     slab.insert(RawSqe::new(entry, CompletionHandler::new_single()))

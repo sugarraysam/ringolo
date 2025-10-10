@@ -1,11 +1,11 @@
 use crate::sqe::{SqeStream, SqeStreamError};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use futures::Stream;
 use io_uring::opcode::Timeout;
 use io_uring::types::{TimeoutFlags, Timespec};
 use pin_project_lite::pin_project;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 use std::time::Duration;
 
 // TODO: pin_project impl drop already?
@@ -65,6 +65,7 @@ impl Drop for Tick {
 impl Stream for Tick {
     type Item = ();
 
+    #[track_caller]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
 

@@ -1,15 +1,16 @@
-use crate::context::{init_local_context, with_core_mut};
+use crate::context::{init_local_context, with_core, with_core_mut};
 use crate::runtime::local::worker::Worker;
-use crate::runtime::runtime::RuntimeConfig;
+use crate::runtime::runtime::{BOX_FUTURE_THRESHOLD, RuntimeConfig};
 use crate::runtime::waker::Wake;
-use crate::runtime::{AddMode, EventLoop, Schedule, YieldReason};
-use crate::task::{Notified, Task};
+use crate::runtime::{AddMode, EventLoop, Schedule, TaskOpts, YieldReason};
+use crate::task::{JoinHandle, Notified, Task};
 use anyhow::{Result, anyhow};
 use std::cell::Cell;
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Waker;
 
 // Use a thread_local variable to track if a runtime is already active on this thread.
 thread_local! {
@@ -101,11 +102,12 @@ unsafe impl Sync for Handle {}
 impl Schedule for Handle {
     /// Schedule a task to run next (i.e.: front of queue).
     fn schedule(&self, _is_new: bool, task: LocalTask) {
-        self.get_worker().add_task(task, AddMode::LIFO);
+        self.get_worker().add_task(task, AddMode::Lifo);
     }
 
     /// Schedule a task to run soon but not next (i.e.: back of queue).
-    fn yield_now(&self, task: LocalTask, reason: YieldReason) {
+    #[track_caller]
+    fn yield_now(&self, waker: &Waker, reason: YieldReason) {
         match reason {
             YieldReason::SqRingFull => {
                 if let Err(e) = with_core_mut(|core| core.submit_and_wait(1, None)) {
@@ -129,7 +131,16 @@ impl Schedule for Handle {
             YieldReason::NoTaskBudget => { /* nothing to do */ }
         }
 
-        self.get_worker().add_task(task, AddMode::FIFO);
+        // If the root_future is yielding, we need to handle it differently.
+        if with_core(|c| c.is_polling_root()) {
+            self.set_root_woken();
+        } else {
+            // Safety: there is two flavors of Waker in the codebase, one for
+            // tasks and one for the root_future. We just checked that we are not
+            // currently polling the root future.
+            let task = unsafe { Notified::from_waker(waker) };
+            self.get_worker().add_task(task, AddMode::Fifo);
+        }
     }
 
     fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {
@@ -138,6 +149,7 @@ impl Schedule for Handle {
 }
 
 impl Handle {
+    #[track_caller]
     pub fn block_on<F: Future>(&self, future: F) -> F::Output {
         let worker = Rc::new(self.get_worker());
 
@@ -150,6 +162,35 @@ impl Handle {
             Err(e) => panic!("Failed to drive future to completion: {:?}", e),
         }
     }
+
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let fut_size = std::mem::size_of::<F>();
+        if fut_size > BOX_FUTURE_THRESHOLD {
+            self.spawn_inner(Box::pin(future))
+        } else {
+            self.spawn_inner(future)
+        }
+    }
+
+    fn spawn_inner<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let id = crate::task::Id::next();
+
+        // TODO: where to store `task` ?
+        let (_task, notified, join_handle) =
+            crate::task::new_task(future, Some(TaskOpts::STICKY), self.clone(), id);
+
+        self.schedule(true /* is_new */, notified);
+
+        join_handle
+    }
 }
 
 impl Deref for Handle {
@@ -157,13 +198,4 @@ impl Deref for Handle {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use static_assertions::assert_impl_all;
-
-    assert_impl_all!(Scheduler: Send, Sync, Wake);
-    assert_impl_all!(Handle: Send, Sync, Schedule);
 }

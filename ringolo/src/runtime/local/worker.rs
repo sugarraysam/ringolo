@@ -6,7 +6,6 @@ use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
 use anyhow::{Result, anyhow};
-use crossbeam_deque::Worker as CbWorker;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::pin::pin;
@@ -123,8 +122,8 @@ impl EventLoop for Worker {
         // We always pop from the back, so the start of the q is the back, and
         // the end corresponds to the front.
         match mode {
-            AddMode::FIFO => q.push_front(task),
-            AddMode::LIFO => q.push_back(task),
+            AddMode::Fifo => q.push_front(task),
+            AddMode::Lifo => q.push_back(task),
         }
     }
 

@@ -33,6 +33,13 @@ impl SingleIssuerRing {
             .setup_taskrun_flag()
             .build(sq_ring_size)?;
 
+        // Check features and warn users.
+        if !ring.params().is_feature_nodrop() {
+            eprintln!(
+                "Warning: IORING_FEAT_NODROP is not enabled for this kernel. The kernel will silently drop completions if the CQ ring is full."
+            )
+        }
+
         Ok(SingleIssuerRing { ring })
     }
 

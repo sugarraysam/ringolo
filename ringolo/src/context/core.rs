@@ -2,7 +2,7 @@
 
 use crate::context::RawSqeSlab;
 use crate::runtime::RuntimeConfig;
-use crate::sqe::{CompletionEffect, RawSqeState};
+use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 use crate::task::Id;
 use crate::util::ScopeGuard;
 use anyhow::Result;
@@ -64,7 +64,7 @@ impl Core {
     pub(crate) fn push_sqes<'a>(
         &mut self,
         indices: impl IntoIterator<Item = &'a usize>,
-    ) -> io::Result<i32> {
+    ) -> Result<i32, IoError> {
         // Need to manually access the fields to avoid immutable vs. mutable
         // borrow issues or double borrow problem.
         let mut sq = self.ring.get_mut().sq();
@@ -76,8 +76,7 @@ impl Core {
                 .and_then(|sqe| sqe.get_entry())
                 .map_err(|_e| io::Error::other("Can't find RawSqe in slab."))?;
 
-            unsafe { sq.push(entry) }
-                .map_err(|_e| io::Error::new(io::ErrorKind::ResourceBusy, "SQ ring full."))?;
+            unsafe { sq.push(entry) }.map_err(|_| IoError::SqRingFull)?;
         }
 
         Ok(0)

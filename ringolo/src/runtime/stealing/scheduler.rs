@@ -6,6 +6,7 @@ use crate::task::{Notified, Task};
 use crossbeam_deque::{Injector, Worker as CbWorker};
 use std::ops::Deref;
 use std::sync::Arc;
+use std::task::Waker;
 
 pub(crate) type StealableTask = Notified<Handle>;
 
@@ -98,7 +99,7 @@ impl Schedule for Handle {
         }
     }
 
-    fn yield_now(&self, task: StealableTask, reason: YieldReason) {
+    fn yield_now(&self, waker: &Waker, reason: YieldReason) {
         unimplemented!("todo");
     }
 

@@ -12,23 +12,24 @@ experimental = []
 doctest = false # TODO: fix doctest and enable
 
 [dependencies]
-anyhow = "^1.0.99"
-bitflags = "2.9.4"
-crossbeam-deque = "0.8.6"
-either = "^1.15.0"
-futures = "0.3.31"
+anyhow = "~1.0.99"
+bitflags = "~2.9.4"
+crossbeam-deque = "~0.8.6"
+dashmap = "~6.1.0"
+either = "~1.15.0"
+futures = "~0.3.31"
 # io-uring = "^0.7.10"
 io-uring = { git = "https://github.com/sugarraysam/io-uring.git", branch = "origin/expose-enter-flags" }
-libc = { version = "0.2.98", default-features = false }
-paste = "1.0.15"
-pin-project-lite = "0.2.16"
+libc = { version = "~0.2.98", default-features = false }
+paste = "~1.0.15"
+pin-project-lite = "~0.2.16"
 ringolo-macros = { version = "0.1.0", path = "../ringolo-macros" }
-slab = "0.4.11"
-smallvec = "1.15.1"
-thiserror = "2.0.17"
-tracing = "0.1.41"
+slab = "~0.4.11"
+smallvec = "~1.15.1"
+thiserror = "~2.0.17"
+tracing = "~0.1.41"
 
 [dev-dependencies]
-rstest = "0.26.1"
-static_assertions = "1.1.0"
-tempfile = "3.23.0"
+rstest = "~0.26.1"
+static_assertions = "~1.1.0"
+tempfile = "~3.23.0"

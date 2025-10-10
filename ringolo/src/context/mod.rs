@@ -1,7 +1,7 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(unused)]
 
-use crate::runtime::{RuntimeConfig, local, stealing};
+use crate::runtime::{RuntimeConfig, Schedule, local, stealing};
 use crate::task::Id;
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
@@ -41,6 +41,7 @@ pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) 
     Ok(())
 }
 
+#[track_caller]
 pub(crate) fn expect_local_context<F, R>(f: F) -> R
 where
     F: FnOnce(&local::Context) -> R,
@@ -148,7 +149,7 @@ pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
 
 // Private helpers.
 #[inline(always)]
-fn with_context<F, R>(f: F) -> R
+pub(crate) fn with_context<F, R>(f: F) -> R
 where
     F: FnOnce(&ContextWrapper) -> R,
 {
@@ -156,6 +157,31 @@ where
         let ctx = ctx.get().expect("Context not initialized").borrow();
         f(&ctx)
     })
+}
+
+/// The macro accepts a pattern that looks just like a closure.
+/// |$scheduler:ident| is the argument name (e.g., |s| or |scheduler|)
+/// $body:block is the code block that follows.
+//
+// Could not make this work without a macro. Tried a few things but:
+// - can't coerce a scheduler reference to &dyn Schedule because of Sized bound
+// - can't impl enum static dispatch (impl Schedule on ContextWrapper) because
+//   Task<Self> arguments
+// - `for<S: Schedule> FnOnce(&S)` HRBT not yet supported: https://github.com/rust-lang/rust/issues/108185
+#[macro_export]
+macro_rules! with_scheduler {
+    (|$scheduler:ident| $body:block) => {
+        $crate::context::with_context(|outer| match outer {
+            $crate::context::ContextWrapper::Local(c) => {
+                let $scheduler = &c.scheduler;
+                $body
+            }
+            $crate::context::ContextWrapper::Stealing(c) => {
+                let $scheduler = &c.scheduler;
+                $body
+            }
+        })
+    };
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::Waker;
 
 /// An owned handle to the task, tracked by ref count.
 #[repr(transparent)]
@@ -101,6 +102,13 @@ unsafe impl<S: Schedule> Sync for Notified<S> {}
 impl<S: 'static> Notified<S> {
     pub(super) fn new(task: Task<S>) -> Notified<S> {
         Notified(task)
+    }
+
+    // The waker carries our Header ptr unless we are currently polling the root
+    // future. We can reconstruct a Notified task from this waker data ptr.
+    pub(crate) unsafe fn from_waker(waker: &Waker) -> Notified<S> {
+        let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+        Notified::from_raw(RawTask::from_raw(ptr))
     }
 
     pub(crate) unsafe fn from_raw(ptr: RawTask) -> Notified<S> {

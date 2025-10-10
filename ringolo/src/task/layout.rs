@@ -193,6 +193,7 @@ impl<T: Future, S: 'static> Core<T, S> {
     /// # Safety
     ///
     /// The caller must ensure it is safe to mutate the `stage` field.
+    #[track_caller]
     pub(super) fn take_output(&self) -> super::Result<T::Output> {
         self.stage.with_mut(|ptr| {
             // Safety:: the caller ensures mutual exclusion to the field.

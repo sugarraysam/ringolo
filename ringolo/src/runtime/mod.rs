@@ -1,6 +1,7 @@
 use crate::task::{Notified, Task};
 use anyhow::Result;
 use bitflags::bitflags;
+use std::task::Waker;
 
 // Public API
 pub mod runtime;
@@ -27,7 +28,11 @@ pub(crate) trait Schedule: Sync + Sized + 'static {
     /// of running again soon without being woken up. Very useful if a task was
     /// unable to register the waker for example, can fallback to yielding and
     /// try to register the waker again.
-    fn yield_now(&self, task: Notified<Self>, reason: YieldReason);
+    //
+    // We pass the Waker as this is how we are able to reconstruct the appropriate
+    // task. The Waker data ptr carries the task information if we are not polling
+    // the root future.
+    fn yield_now(&self, waker: &Waker, reason: YieldReason);
 
     /// The task has completed work and is ready to be released. The scheduler
     /// should release it immediately and return it. The task module will batch
@@ -51,8 +56,8 @@ pub(crate) enum YieldReason {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum AddMode {
-    FIFO,
-    LIFO,
+    Fifo,
+    Lifo,
 }
 
 /// Abstraction of everything needed to build an event loop.

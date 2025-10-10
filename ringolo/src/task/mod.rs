@@ -44,7 +44,7 @@ pub(crate) type Result<T> = std::result::Result<T, JoinError>;
 /// created. The first task reference is usually put into an `OwnedTasks`
 /// immediately. The Notified is sent to the scheduler as an ordinary
 /// notification.
-fn new_task<T, S>(
+pub(crate) fn new_task<T, S>(
     task: T,
     task_opts: Option<TaskOpts>,
     scheduler: S,

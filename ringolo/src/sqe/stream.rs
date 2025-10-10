@@ -1,28 +1,22 @@
 use crate::context::{with_core_mut, with_slab_mut};
-use crate::runtime::YieldReason;
+use crate::runtime::{Schedule, YieldReason};
 use crate::sqe::{
     CompletionHandler, IoError, RawSqe, RawSqeState, Submittable, increment_pending_io,
 };
+use crate::with_scheduler;
 use anyhow::anyhow;
 use futures::Stream;
 use io_uring::squeue::Entry;
-use std::io::{self, Error, ErrorKind};
+use std::io;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 #[derive(Debug)]
 pub(crate) enum SqeStreamState {
-    Preparing {
-        entry: Option<Entry>,
-        count: Option<u32>,
-    },
-    Indexed {
-        idx: usize,
-    },
-    Submitted {
-        idx: usize,
-    },
+    Preparing { entry: Entry, count: Option<u32> },
+    Indexed { idx: usize },
+    Submitted { idx: usize },
     Completed,
 }
 
@@ -43,10 +37,7 @@ impl SqeStream {
         // Which SQE flags to set?
 
         Ok(Self {
-            state: SqeStreamState::Preparing {
-                entry: Some(entry),
-                count,
-            },
+            state: SqeStreamState::Preparing { entry, count },
         })
     }
 
@@ -63,10 +54,9 @@ impl Submittable for SqeStream {
         // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
         // and only insert the entry in the slab once.
         if let SqeStreamState::Preparing { entry, count } = &mut self.state {
-            let count = count.take();
-            let entry = entry
-                .take()
-                .ok_or_else(|| Error::new(ErrorKind::NotFound, "empty entry"))?;
+            // Important: clone entry + count so we can retry if Slab is full.
+            let count = count.clone();
+            let entry = entry.clone();
 
             let idx = with_slab_mut(|slab| {
                 slab.insert(RawSqe::new(entry, CompletionHandler::new_stream(count)))
@@ -81,7 +71,7 @@ impl Submittable for SqeStream {
             SqeStreamState::Indexed { idx } => {
                 with_core_mut(|core| core.push_sqes(&[*idx])).map_err(IoError::from)
             }
-            _ => Err(anyhow!("state not indexed").into()),
+            _ => Err(anyhow!("SqeStream invalid state: expected state indexed").into()),
         }
     }
 }
@@ -110,17 +100,19 @@ impl Stream for SqeStream {
                             continue;
                         }
                         Err(e) => {
-                            if matches!(e, IoError::SqRingFull | IoError::SlabFull) {
-                                let _reason = if matches!(e, IoError::SqRingFull) {
-                                    YieldReason::SqRingFull
-                                } else {
-                                    YieldReason::SlabFull
-                                };
+                            let reason = if matches!(e, IoError::SqRingFull) {
+                                YieldReason::SqRingFull
+                            } else {
+                                YieldReason::SlabFull
+                            };
 
-                                // TODO: `try_yield_now` on context :: fails if root_future
-                                eprintln!("Warning: Submission queue is full, double SQ ring size");
-                                return Poll::Pending;
-                            }
+                            // We were unable to register the waker, and submit our IO to local uring.
+                            // Yield to scheduler so we can take corrective action and retry later.
+                            with_scheduler!(|s| {
+                                s.yield_now(cx.waker(), reason);
+                            });
+
+                            return Poll::Pending;
                         }
                     }
                 }

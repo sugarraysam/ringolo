@@ -171,13 +171,13 @@ impl RawSqe {
     pub(crate) fn get_waker(&self) -> Result<&Waker> {
         self.waker
             .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "waker is none"))
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "get_waker failed: waker is none"))
     }
 
     pub(crate) fn take_waker(&mut self) -> Result<Waker> {
         self.waker
             .take()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "waker is none"))
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "take_waker failed: waker is none"))
     }
 
     pub(crate) fn set_user_data(&mut self, user_data: u64) -> Result<()> {
