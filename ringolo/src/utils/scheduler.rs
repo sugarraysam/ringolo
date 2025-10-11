@@ -1,0 +1,58 @@
+use crate::runtime::YieldReason;
+use crate::task::Id;
+use dashmap::DashMap;
+use std::sync::Arc;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum Method {
+    Schedule,
+    YieldNow,
+    Release,
+    Spawn,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Call {
+    Schedule { is_new: bool, id: Id },
+    YieldNow { reason: YieldReason },
+    Release { id: Id },
+    Spawn,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct Tracker {
+    calls: Arc<DashMap<Method, Vec<Call>>>,
+}
+
+impl Tracker {
+    pub(crate) fn new() -> Self {
+        let map = DashMap::new();
+        map.insert(Method::Schedule, Vec::new());
+        map.insert(Method::YieldNow, Vec::new());
+        map.insert(Method::Release, Vec::new());
+        map.insert(Method::Spawn, Vec::new());
+
+        Self {
+            calls: Arc::new(map),
+        }
+    }
+
+    pub(crate) fn record(&self, method: Method, call: Call) {
+        self.calls
+            .get_mut(&method)
+            .expect("method not found")
+            .push(call)
+    }
+
+    pub(crate) fn get_calls(&self, method: &Method) -> Vec<Call> {
+        self.calls
+            .get(&method)
+            .expect("method not found")
+            .value()
+            .clone()
+    }
+
+    pub(crate) fn num_calls(&self, method: &Method) -> usize {
+        self.calls.get(&method).map_or(0, |calls| calls.len())
+    }
+}

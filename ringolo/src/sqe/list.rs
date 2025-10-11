@@ -1,4 +1,4 @@
-use crate::context::{with_core_mut, with_slab_mut};
+use crate::context::{with_core_mut, with_slab, with_slab_mut};
 use crate::sqe::errors::IoError;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
 use anyhow::anyhow;
@@ -83,7 +83,10 @@ impl SqeList {
 impl Submittable for SqeList {
     fn submit(&mut self, waker: &Waker) -> Result<i32, IoError> {
         if let SqeListState::Preparing { builder } = &self.state {
-            // Important: clone entries so we can retry if Slab is full.
+            // Important: clone entries so we can retry if Slab is full. This is because
+            // `try_build()` is *atomic*, where either all SQEs are added to slab or none are.
+            // This allows yielding to the scheduler, having the scheduler take corrective actions
+            // (e.g.: submit + process cqes) and retry later.
             let builder = builder.clone();
 
             _ = mem::replace(&mut self.state, builder.try_build()?);
@@ -91,8 +94,7 @@ impl Submittable for SqeList {
             increment_pending_io(waker);
         }
 
-        self.with_indexed(|indices, _| with_core_mut(|ctx| ctx.push_sqes(indices)))?
-            .map_err(IoError::from)
+        self.with_indexed(|indices, _| with_core_mut(|ctx| ctx.push_sqes(indices.iter())))?
     }
 }
 
@@ -271,6 +273,12 @@ impl SqeListBuilder {
             return Err(anyhow!("SqeListBuilder requires at least 2 sqes, got {}", n_sqes).into());
         }
 
+        // Ensure we can add all SQEs in slab otherwise return an error. This is important to
+        // uphold the chain + batch contract which is that all SQEs are submitted at once.
+        if with_slab(|slab| slab.len() + n_sqes >= slab.capacity()) {
+            return Err(IoError::SlabFull);
+        }
+
         let kind = self.kind;
         let mut entries = match kind {
             SqeListKind::Chain => self.into_chain(),
@@ -302,7 +310,11 @@ impl SqeListBuilder {
             }
 
             Ok(())
-        })?;
+        })
+        // If we fail for any reason here, we will be in an inconsistent state, where
+        // some of our batch entries are in the slab and others are not. Let's return
+        // invalid state error as this is unrecoverable.
+        .map_err(|_| IoError::SlabInvalidState)?;
 
         Ok(SqeListState::Indexed {
             indices,

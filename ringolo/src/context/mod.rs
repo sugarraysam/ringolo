@@ -1,7 +1,7 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(unused)]
 
-use crate::runtime::{RuntimeConfig, Schedule, local, stealing};
+use crate::runtime::{RuntimeConfig, Schedule, Scheduler, local, stealing};
 use crate::task::Id;
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
@@ -17,24 +17,45 @@ pub(crate) use ring::SingleIssuerRing;
 pub(crate) mod slab;
 pub(crate) use slab::RawSqeSlab;
 
+pub(crate) struct RootContext {
+    context: Context,
+    scheduler: Scheduler,
+}
+
+impl RootContext {
+    fn new_local(ctx: local::Context, scheduler: local::Handle) -> Self {
+        Self {
+            context: Context::Local(ctx),
+            scheduler: Scheduler::Local(scheduler),
+        }
+    }
+
+    fn new_stealing(ctx: stealing::Context, scheduler: stealing::Handle) -> Self {
+        Self {
+            context: Context::Stealing(ctx),
+            scheduler: Scheduler::Stealing(scheduler),
+        }
+    }
+}
+
 // We need type erasure in Thread-local storage so we hide the runtime context
 // impl behind this enum and unfortunately have to match everywhere. This is
 // still better than doing dynamic dispatch.
-pub(crate) enum ContextWrapper {
+pub(crate) enum Context {
     Local(local::Context),
     Stealing(stealing::Context),
 }
 
 thread_local! {
-    static CONTEXT: OnceCell<RefCell<ContextWrapper>> = const { OnceCell::new() };
+    static CONTEXT: OnceCell<RefCell<RootContext>> = const { OnceCell::new() };
 }
 
 pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) -> Result<()> {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
-            let ctx = local::Context::try_new(cfg, scheduler)
-                .expect("Failed to initialize thread-local context");
-            RefCell::new(ContextWrapper::Local(ctx))
+            let ctx =
+                local::Context::try_new(cfg).expect("Failed to initialize thread-local context");
+            RefCell::new(RootContext::new_local(ctx, scheduler))
         });
     });
 
@@ -42,13 +63,36 @@ pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) 
 }
 
 #[track_caller]
-pub(crate) fn expect_local_context<F, R>(f: F) -> R
+pub(crate) fn expect_local_scheduler<F, R>(f: F) -> R
 where
-    F: FnOnce(&local::Context) -> R,
+    F: FnOnce(&local::Context, &local::Handle) -> R,
 {
-    with_context(|outer| match outer {
-        ContextWrapper::Local(ctx) => f(ctx),
-        _ => panic!("Thread not initialized with local context."),
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+
+        match (&root.context, &root.scheduler) {
+            (Context::Local(ctx), Scheduler::Local(scheduler)) => f(ctx, scheduler),
+            _ => {
+                panic!("Expected local scheduler to be initialized.");
+            }
+        }
+    })
+}
+
+#[track_caller]
+pub(crate) fn expect_stealing_scheduler<F, R>(f: F) -> R
+where
+    F: FnOnce(&stealing::Context, &stealing::Handle) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+
+        match (&root.context, &root.scheduler) {
+            (Context::Stealing(ctx), Scheduler::Stealing(scheduler)) => f(ctx, scheduler),
+            _ => {
+                panic!("Expected stealing scheduler to be initialized.");
+            }
+        }
     })
 }
 
@@ -58,8 +102,8 @@ where
     F: FnOnce(&Core) -> R,
 {
     with_context(|outer| match outer {
-        ContextWrapper::Local(c) => c.with_core(f),
-        ContextWrapper::Stealing(c) => c.with_core(f),
+        Context::Local(c) => c.with_core(f),
+        Context::Stealing(c) => c.with_core(f),
     })
 }
 
@@ -69,8 +113,8 @@ where
     F: FnOnce(&mut Core) -> R,
 {
     with_context(|outer| match outer {
-        ContextWrapper::Local(c) => c.with_core_mut(f),
-        ContextWrapper::Stealing(c) => c.with_core_mut(f),
+        Context::Local(c) => c.with_core_mut(f),
+        Context::Stealing(c) => c.with_core_mut(f),
     })
 }
 
@@ -128,22 +172,22 @@ where
 
 pub(crate) fn current_thread_id() -> ThreadId {
     with_context(|outer| match outer {
-        ContextWrapper::Local(c) => c.core.borrow().thread_id,
-        ContextWrapper::Stealing(c) => c.core.borrow().thread_id,
+        Context::Local(c) => c.core.borrow().thread_id,
+        Context::Stealing(c) => c.core.borrow().thread_id,
     })
 }
 
 pub(crate) fn current_task_id() -> Option<Id> {
     with_context(|outer| match outer {
-        ContextWrapper::Local(c) => c.core.borrow().current_task_id.get(),
-        ContextWrapper::Stealing(c) => c.core.borrow().current_task_id.get(),
+        Context::Local(c) => c.core.borrow().current_task_id.get(),
+        Context::Stealing(c) => c.core.borrow().current_task_id.get(),
     })
 }
 
 pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
     with_context(|outer| match outer {
-        ContextWrapper::Local(c) => c.core.borrow().current_task_id.replace(id),
-        ContextWrapper::Stealing(c) => c.core.borrow().current_task_id.replace(id),
+        Context::Local(c) => c.core.borrow().current_task_id.replace(id),
+        Context::Stealing(c) => c.core.borrow().current_task_id.replace(id),
     })
 }
 
@@ -151,11 +195,22 @@ pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
 #[inline(always)]
 pub(crate) fn with_context<F, R>(f: F) -> R
 where
-    F: FnOnce(&ContextWrapper) -> R,
+    F: FnOnce(&Context) -> R,
 {
     CONTEXT.with(|ctx| {
-        let ctx = ctx.get().expect("Context not initialized").borrow();
-        f(&ctx)
+        let root = ctx.get().expect("Context not initialized").borrow();
+        f(&root.context)
+    })
+}
+
+#[inline(always)]
+pub(crate) fn with_scheduler<F, R>(f: F) -> R
+where
+    F: FnOnce(&Scheduler) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+        f(&root.scheduler)
     })
 }
 
@@ -165,19 +220,19 @@ where
 //
 // Could not make this work without a macro. Tried a few things but:
 // - can't coerce a scheduler reference to &dyn Schedule because of Sized bound
-// - can't impl enum static dispatch (impl Schedule on ContextWrapper) because
+// - can't impl enum static dispatch (impl Schedule on Context) because
 //   Task<Self> arguments
 // - `for<S: Schedule> FnOnce(&S)` HRBT not yet supported: https://github.com/rust-lang/rust/issues/108185
 #[macro_export]
 macro_rules! with_scheduler {
     (|$scheduler:ident| $body:block) => {
-        $crate::context::with_context(|outer| match outer {
-            $crate::context::ContextWrapper::Local(c) => {
-                let $scheduler = &c.scheduler;
+        $crate::context::with_scheduler(|root| match root {
+            $crate::runtime::Scheduler::Local(s) => {
+                let $scheduler = s;
                 $body
             }
-            $crate::context::ContextWrapper::Stealing(c) => {
-                let $scheduler = &c.scheduler;
+            $crate::runtime::Scheduler::Stealing(s) => {
+                let $scheduler = s;
                 $body
             }
         })

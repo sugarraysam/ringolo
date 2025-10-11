@@ -170,7 +170,6 @@ mod tests {
 
             assert_eq!(slab.pending_ios, n_sqes);
 
-            // TODO: fix re-entry problem
             // Waking sqes decrement counter
             for idx in indices {
                 let effects = slab.get_mut(idx)?.on_completion(0, None)?;

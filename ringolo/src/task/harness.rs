@@ -1,4 +1,5 @@
 use crate::runtime::Schedule;
+use crate::sqe::IoError;
 use crate::task::layout::{Core, TaskLayout};
 use crate::task::raw::can_read_output;
 use crate::task::state::{State, TransitionToIdle, TransitionToRunning};

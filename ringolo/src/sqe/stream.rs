@@ -55,7 +55,7 @@ impl Submittable for SqeStream {
         // and only insert the entry in the slab once.
         if let SqeStreamState::Preparing { entry, count } = &mut self.state {
             // Important: clone entry + count so we can retry if Slab is full.
-            let count = count.clone();
+            let count = *count;
             let entry = entry.clone();
 
             let idx = with_slab_mut(|slab| {
@@ -68,9 +68,7 @@ impl Submittable for SqeStream {
         }
 
         match &self.state {
-            SqeStreamState::Indexed { idx } => {
-                with_core_mut(|core| core.push_sqes(&[*idx])).map_err(IoError::from)
-            }
+            SqeStreamState::Indexed { idx } => with_core_mut(|core| core.push_sqes([*idx].iter())),
             _ => Err(anyhow!("SqeStream invalid state: expected state indexed").into()),
         }
     }

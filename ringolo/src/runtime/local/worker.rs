@@ -1,4 +1,4 @@
-use crate::context::{expect_local_context, with_core_mut, with_slab};
+use crate::context::{expect_local_scheduler, with_core_mut, with_slab};
 use crate::runtime::local;
 use crate::runtime::local::scheduler::LocalTask;
 use crate::runtime::runtime::RuntimeConfig;
@@ -133,35 +133,28 @@ impl EventLoop for Worker {
 
     fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output> {
         if let Some(root) = root_future {
-            expect_local_context(|ctx| self.event_loop_inner(ctx, root))
+            expect_local_scheduler(|ctx, scheduler| self.event_loop_inner(ctx, scheduler, root))
         } else {
             Err(anyhow!("Unexpected empty root_future"))
         }
     }
 }
 
-// TODO:
-// - need poll_initial special case, retry until submit succeeds (add it to back of queue?), OR return `Poll::Ready` /w
-//   the error, and have special `poll` wrapper that does a few things, including handling this + task budget, wont have
-//   access to Sqe<T> internal state.
-//   - true for all Sqe tasks :: return poll retry? special `thiserror` wrapper
-//
-// - handle ring full errors gracefully (-EINTR on submit)
-// - set current task id ? tracing?
 impl Worker {
     fn event_loop_inner<F: Future>(
         &self,
         ctx: &local::Context,
+        scheduler: &local::Handle,
         root_future: F,
     ) -> Result<F::Output> {
         let mut data = self.cfg.borrow_mut();
         let mut root = pin!(root_future);
 
-        let waker = waker_ref(&ctx.scheduler);
+        let waker = waker_ref(scheduler);
         let mut cx = std::task::Context::from_waker(&waker);
 
         loop {
-            if ctx.scheduler.reset_root_woken() {
+            if scheduler.reset_root_woken() {
                 let _g = ctx.set_polling_root();
 
                 if let Poll::Ready(v) = root.as_mut().poll(&mut cx) {
@@ -182,7 +175,7 @@ impl Worker {
                     debug_assert!(!data.has_ready_cqes);
                     debug_assert!(data.unsubmitted_sqes == 0);
 
-                    ctx.scheduler.set_root_woken();
+                    scheduler.set_root_woken();
                 } else {
                     // "Park" the thread waiting for next completion.
                     with_core_mut(|core| -> Result<()> {

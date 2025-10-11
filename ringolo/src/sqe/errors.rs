@@ -9,10 +9,19 @@ pub enum IoError {
     #[error("Submission queue ring is full, cannot submit IO")]
     SqRingFull,
 
+    #[error("FATAL: SQ ring is in an invalid state")]
+    SqRingInvalidState,
+
+    #[error("FATAL: SQ entry batch too large to fit in the SQ ring")]
+    SqBatchTooLarge,
+
     /// A resource slab (e.g., for storing futures or tasks) is full.
     /// This indicates the system is at its configured capacity.
     #[error("Slab allocator is full, cannot allocate new resource")]
     SlabFull,
+
+    #[error("FATAL: Slab allocator is in an invalid state")]
+    SlabInvalidState,
 
     /// An I/O error occurred.
     #[error("I/O error: {0}")]

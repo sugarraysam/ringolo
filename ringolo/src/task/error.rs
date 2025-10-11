@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 
 use crate::task::Id;
-use crate::util::SyncWrapper;
+use crate::utils::SyncWrapper;
 
 /// Task failed to execute to completion.
 pub struct JoinError {

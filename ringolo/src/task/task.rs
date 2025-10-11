@@ -131,7 +131,7 @@ impl<S: 'static> Notified<S> {
         self.0.header()
     }
 
-    pub(crate) fn task_id(&self) -> crate::task::Id {
+    pub(crate) fn id(&self) -> crate::task::Id {
         self.0.id()
     }
 

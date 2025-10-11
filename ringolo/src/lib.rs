@@ -9,13 +9,15 @@ pub mod context;
 pub mod future;
 
 pub mod runtime;
+pub use runtime::block_on;
+pub use runtime::spawn;
 
 pub mod sqe;
 
 #[allow(dead_code, unused)]
 pub mod task;
 
-pub mod util;
+pub mod utils;
 
 #[cfg(test)]
 pub mod test_utils;

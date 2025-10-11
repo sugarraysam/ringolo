@@ -2,7 +2,7 @@
 
 use crate::runtime::{Schedule, YieldReason};
 use crate::task::layout::vtable;
-use crate::task::{Header, Notified, State, Task};
+use crate::task::{Header, JoinHandle, Notified, State, Task};
 use std::future::Ready;
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};

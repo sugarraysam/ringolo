@@ -4,7 +4,7 @@ use crate::context::RawSqeSlab;
 use crate::runtime::RuntimeConfig;
 use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 use crate::task::Id;
-use crate::util::ScopeGuard;
+use crate::utils::ScopeGuard;
 use anyhow::Result;
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -63,20 +63,30 @@ impl Core {
     // make an `io_uring_enter` syscall unless kernel side SQ polling is enabled.
     pub(crate) fn push_sqes<'a>(
         &mut self,
-        indices: impl IntoIterator<Item = &'a usize>,
+        indices: impl ExactSizeIterator<Item = &'a usize>,
     ) -> Result<i32, IoError> {
-        // Need to manually access the fields to avoid immutable vs. mutable
-        // borrow issues or double borrow problem.
         let mut sq = self.ring.get_mut().sq();
+        let sq_len = sq.len();
+
+        // SQE chain and batches have a contract where they need to all be submitted
+        // at the same time. If we can't fit them all, return an error.
+        if sq_len + indices.len() >= sq.capacity() {
+            return Err(IoError::SqRingFull);
+        } else if indices.len() >= sq.capacity() {
+            return Err(IoError::SqBatchTooLarge);
+        }
+
         let slab = self.slab.borrow();
 
+        // If we fail to add an entry at this point, we might violate SQE primitive contracts.
+        // This is unrecoverable and we return invalid state errors.
         for idx in indices {
             let entry = slab
                 .get(*idx)
                 .and_then(|sqe| sqe.get_entry())
-                .map_err(|_e| io::Error::other("Can't find RawSqe in slab."))?;
+                .map_err(|_| IoError::SlabInvalidState)?;
 
-            unsafe { sq.push(entry) }.map_err(|_| IoError::SqRingFull)?;
+            unsafe { sq.push(entry) }.map_err(|_| IoError::SqRingInvalidState)?;
         }
 
         Ok(0)

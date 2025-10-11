@@ -1,4 +1,7 @@
-use crate::task::{Notified, Task};
+use crate::{
+    task::{JoinHandle, Notified, Task},
+    with_scheduler,
+};
 use anyhow::Result;
 use bitflags::bitflags;
 use std::task::Waker;
@@ -9,6 +12,9 @@ pub use runtime::{Builder, Runtime};
 
 // Exports
 pub(crate) mod local;
+
+pub(crate) mod registry;
+pub(crate) use registry::OwnedTasks;
 
 pub(crate) use runtime::RuntimeConfig;
 
@@ -45,6 +51,12 @@ pub(crate) trait Schedule: Sync + Sized + 'static {
     fn unhandled_panic(&self) {
         // By default, do nothing.
     }
+}
+
+#[derive(Debug)]
+pub(crate) enum Scheduler {
+    Local(local::Handle),
+    Stealing(stealing::Handle),
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -85,8 +97,38 @@ bitflags! {
     }
 }
 
-#[derive(Debug)]
-pub(crate) enum Scheduler {
-    Local(local::Handle),
-    Stealing(stealing::Handle),
+/// Boundary value to prevent stack overflow caused by a large-sized
+/// Future being placed in the stack.
+pub(crate) const BOX_FUTURE_THRESHOLD: usize = if cfg!(debug_assertions) { 2048 } else { 16384 };
+
+pub fn block_on<F>(future: F) -> F::Output
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    with_scheduler!(|s| {
+        let fut_size = std::mem::size_of::<F>();
+
+        if fut_size > BOX_FUTURE_THRESHOLD {
+            s.block_on(Box::pin(future))
+        } else {
+            s.block_on(future)
+        }
+    })
+}
+
+pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
+where
+    F: Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    with_scheduler!(|s| {
+        let fut_size = std::mem::size_of::<F>();
+
+        if fut_size > BOX_FUTURE_THRESHOLD {
+            s.spawn(Box::pin(future))
+        } else {
+            s.spawn(future)
+        }
+    })
 }

@@ -1,68 +1,15 @@
+use crate as ringolo;
+use crate::context::init_local_context;
 use crate::runtime::Scheduler;
 use crate::runtime::local;
 use crate::runtime::stealing;
-use anyhow::Result;
+use crate::task::JoinHandle;
+use anyhow::{Result, anyhow};
+use std::cell::Cell;
 use std::convert::TryFrom;
 use std::fmt;
-use std::mem;
 use std::sync::Arc;
 use std::thread;
-
-/// Boundary value to prevent stack overflow caused by a large-sized
-/// Future being placed in the stack.
-pub(crate) const BOX_FUTURE_THRESHOLD: usize = if cfg!(debug_assertions) { 2048 } else { 16384 };
-
-pub struct Runtime {
-    scheduler: Scheduler,
-}
-
-impl Runtime {
-    pub(super) fn new(scheduler: Scheduler) -> Runtime {
-        Runtime { scheduler }
-    }
-
-    // (1) For Local runtime, this blocks current thread, and executes web of future to completion.
-    // (2) For stealing runtime, calling `try_build()` spins up N-1 workers, and initializes the thread
-    //     on which the runtime is built to be part of the runtime. It is expected that the user will
-    //     call `block_on` after `try_build`, which will cause the current thread to start executing
-    //     futures.
-    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let fut_size = mem::size_of::<F>();
-        if fut_size > BOX_FUTURE_THRESHOLD {
-            self.block_on_inner(Box::pin(future))
-        } else {
-            self.block_on_inner(future)
-        }
-    }
-}
-
-// Private functions
-impl Runtime {
-    fn block_on_inner<F: Future>(&self, future: F) -> F::Output {
-        match &self.scheduler {
-            Scheduler::Local(handle) => handle.block_on(future),
-            Scheduler::Stealing(_handle) => unimplemented!("TODO"),
-        }
-    }
-}
-
-// Test-only helpers
-#[cfg(test)]
-impl Runtime {
-    pub(crate) fn expect_local_scheduler(&self) -> local::Handle {
-        match &self.scheduler {
-            Scheduler::Local(handle) => handle.clone(),
-            _ => panic!("Runtime not using local sheduler"),
-        }
-    }
-
-    pub(crate) fn expect_stealing_scheduler(&self) -> stealing::Handle {
-        match &self.scheduler {
-            Scheduler::Stealing(handle) => handle.clone(),
-            _ => panic!("Runtime not using stealing sheduler"),
-        }
-    }
-}
 
 // TODO missing from tokio:
 // - UnhandledPanic
@@ -308,18 +255,102 @@ impl Builder {
     }
 }
 
-// Private methods
+// Use a thread_local variable to track if a runtime is already active on this thread.
+thread_local! {
+    static IS_RUNTIME_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+// --- Private methods ---
+// The contract of the builder is that after we have called `try_build()`, the
+// runtime is properly initialized. This means that calls to `block_on` or `spawn`
+// will succeed. It means different things depending on the flavor of the runtime,
+// for example spawning on a local runtime does not *start* any task in the background.
+// We have to call `block_on` to start executing tasks.
 impl Builder {
+    #[track_caller]
     fn try_build_local_runtime(self) -> Result<Runtime> {
+        IS_RUNTIME_ACTIVE.with(|is_active| -> Result<()> {
+            if is_active.get() {
+                Err(anyhow!(
+                    "Cannot create a new LocalRuntime: a runtime is already active on this thread."
+                ))
+            } else {
+                is_active.set(true);
+                Ok(())
+            }
+        })?;
+
         let cfg = self.try_into()?;
-        let scheduler = local::Scheduler::try_new(cfg)?;
-        Ok(Runtime::new(Scheduler::Local(scheduler.into_handle())))
+        let scheduler = local::Scheduler::new(&cfg).into_handle();
+
+        if let Err(e) = init_local_context(&cfg, scheduler.clone()) {
+            panic!("Failed to initialize local context: {:?}", e);
+        }
+
+        Ok(Runtime::new(Scheduler::Local(scheduler)))
     }
 
     fn try_build_stealing_runtime(self) -> Result<Runtime> {
         let cfg = self.try_into()?;
         let scheduler = stealing::Scheduler::new(cfg);
         Ok(Runtime::new(Scheduler::Stealing(scheduler.into_handle())))
+    }
+}
+
+#[derive(Debug)]
+pub struct Runtime {
+    scheduler: Scheduler,
+}
+
+impl Runtime {
+    pub(super) fn new(scheduler: Scheduler) -> Runtime {
+        Runtime { scheduler }
+    }
+
+    pub fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        ringolo::block_on(future)
+    }
+
+    /// Spawn a future onto the runtime.
+    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        ringolo::spawn(future)
+    }
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        match self.scheduler {
+            Scheduler::Local(_) => {
+                IS_RUNTIME_ACTIVE.with(|is_active| is_active.set(false));
+            }
+            Scheduler::Stealing(_) => { /* nothing to do */ }
+        }
+    }
+}
+
+// Test-only helpers
+#[cfg(test)]
+impl Runtime {
+    pub(crate) fn expect_local_scheduler(&self) -> local::Handle {
+        match &self.scheduler {
+            Scheduler::Local(handle) => handle.clone(),
+            _ => panic!("Runtime not using local sheduler"),
+        }
+    }
+
+    pub(crate) fn expect_stealing_scheduler(&self) -> stealing::Handle {
+        match &self.scheduler {
+            Scheduler::Stealing(handle) => handle.clone(),
+            _ => panic!("Runtime not using stealing sheduler"),
+        }
     }
 }
 

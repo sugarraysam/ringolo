@@ -1,60 +1,45 @@
-use crate::context::{init_local_context, with_core, with_core_mut};
+use crate::context::{with_core, with_core_mut};
 use crate::runtime::local::worker::Worker;
-use crate::runtime::runtime::{BOX_FUTURE_THRESHOLD, RuntimeConfig};
+use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
-use crate::runtime::{AddMode, EventLoop, Schedule, TaskOpts, YieldReason};
-use crate::task::{JoinHandle, Notified, Task};
-use anyhow::{Result, anyhow};
-use std::cell::Cell;
+use crate::runtime::{AddMode, EventLoop, OwnedTasks, Schedule, TaskOpts, YieldReason};
+use crate::task::{Id, JoinHandle, Notified, Task};
+#[allow(unused)]
+use crate::utils::scheduler::{Call, Method, Tracker};
+use anyhow::Result;
 use std::cell::RefCell;
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::task::Waker;
-
-// Use a thread_local variable to track if a runtime is already active on this thread.
-thread_local! {
-    static IS_RUNTIME_ACTIVE: Cell<bool> = const { Cell::new(false) };
-}
 
 pub(crate) type LocalTask = Notified<Handle>;
 
 #[derive(Debug)]
 pub struct Scheduler {
+    #[allow(unused)]
     pub(crate) cfg: RuntimeConfig,
 
-    worker: Rc<Worker>,
+    pub(crate) worker: Worker,
+
+    pub(crate) tasks: OwnedTasks<Handle>,
 
     pub(crate) root_woken: RefCell<bool>,
+
+    #[cfg(test)]
+    pub(crate) tracker: Tracker,
 }
 
 impl Scheduler {
-    pub(crate) fn try_new(cfg: RuntimeConfig) -> Result<Self> {
-        IS_RUNTIME_ACTIVE.with(|is_active| -> Result<()> {
-            if is_active.get() {
-                Err(anyhow!(
-                    "Cannot create a new LocalRuntime: a runtime is already active on this thread."
-                ))
-            } else {
-                is_active.set(true);
-                Ok(())
-            }
-        })?;
-
-        let worker = Worker::new(&cfg);
-        Ok(Self {
-            cfg,
-            worker: Rc::new(worker),
-
-            // We should always poll the root future on first iteration of the
-            // loop. Afterwards, this will only be set to true after the waker
-            // is awakened.
+    pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
+        Self {
+            cfg: cfg.clone(),
+            worker: Worker::new(&cfg),
+            tasks: OwnedTasks::new(cfg.sq_ring_size),
             root_woken: RefCell::new(true),
-        })
-    }
 
-    pub(crate) fn get_worker(&self) -> &Rc<Worker> {
-        &self.worker
+            #[cfg(test)]
+            tracker: Tracker::new(),
+        }
     }
 
     pub(crate) fn into_handle(self) -> Handle {
@@ -67,6 +52,15 @@ impl Scheduler {
 
     pub(crate) fn reset_root_woken(&self) -> bool {
         self.root_woken.replace(false)
+    }
+
+    // Small price to pay to get introspection on all scheduler calls during
+    // testing. No op in release builds.
+    #[allow(unused)]
+    #[inline(always)]
+    fn track(&self, method: Method, call: Call) {
+        #[cfg(test)]
+        self.tracker.record(method, call);
     }
 }
 
@@ -86,12 +80,6 @@ impl Wake for Scheduler {
     }
 }
 
-impl Drop for Scheduler {
-    fn drop(&mut self) {
-        IS_RUNTIME_ACTIVE.with(|is_active| is_active.set(false));
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Handle(Arc<Scheduler>);
 
@@ -101,13 +89,21 @@ unsafe impl Sync for Handle {}
 
 impl Schedule for Handle {
     /// Schedule a task to run next (i.e.: front of queue).
-    fn schedule(&self, _is_new: bool, task: LocalTask) {
-        self.get_worker().add_task(task, AddMode::Lifo);
+    fn schedule(&self, is_new: bool, task: LocalTask) {
+        self.track(
+            Method::Schedule,
+            Call::Schedule {
+                is_new,
+                id: task.id(),
+            },
+        );
+        self.worker.add_task(task, AddMode::Lifo);
     }
 
     /// Schedule a task to run soon but not next (i.e.: back of queue).
     #[track_caller]
     fn yield_now(&self, waker: &Waker, reason: YieldReason) {
+        self.track(Method::YieldNow, Call::YieldNow { reason });
         match reason {
             YieldReason::SqRingFull => {
                 if let Err(e) = with_core_mut(|core| core.submit_and_wait(1, None)) {
@@ -139,55 +135,42 @@ impl Schedule for Handle {
             // tasks and one for the root_future. We just checked that we are not
             // currently polling the root future.
             let task = unsafe { Notified::from_waker(waker) };
-            self.get_worker().add_task(task, AddMode::Fifo);
+            self.worker.add_task(task, AddMode::Fifo);
         }
     }
 
-    fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {
-        unimplemented!("todo");
+    fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
+        self.track(Method::Release, Call::Release { id: task.id() });
+        self.tasks.remove(&task.id())
     }
 }
 
 impl Handle {
     #[track_caller]
-    pub fn block_on<F: Future>(&self, future: F) -> F::Output {
-        let worker = Rc::new(self.get_worker());
-
-        if let Err(e) = init_local_context(&self.cfg, self.clone()) {
-            panic!("Failed to initialize local context: {:?}", e);
-        }
-
-        match worker.event_loop(Some(future)) {
+    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match self.worker.event_loop(Some(future)) {
             Ok(res) => res,
             Err(e) => panic!("Failed to drive future to completion: {:?}", e),
         }
     }
 
-    pub fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let fut_size = std::mem::size_of::<F>();
-        if fut_size > BOX_FUTURE_THRESHOLD {
-            self.spawn_inner(Box::pin(future))
-        } else {
-            self.spawn_inner(future)
-        }
-    }
+        self.track(Method::Spawn, Call::Spawn);
 
-    fn spawn_inner<F>(&self, future: F) -> JoinHandle<F::Output>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        let id = crate::task::Id::next();
+        let (task, notified, join_handle) =
+            crate::task::new_task(future, Some(TaskOpts::STICKY), self.clone(), Id::next());
 
-        // TODO: where to store `task` ?
-        let (_task, notified, join_handle) =
-            crate::task::new_task(future, Some(TaskOpts::STICKY), self.clone(), id);
+        debug_assert!(self.tasks.insert(task).is_none());
 
-        self.schedule(true /* is_new */, notified);
+        self.schedule(true, notified);
 
         join_handle
     }

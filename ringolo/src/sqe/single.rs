@@ -3,7 +3,7 @@ use crate::sqe::{
     Completable, CompletionHandler, IoError, RawSqe, Sqe, Submittable, increment_pending_io,
 };
 use io_uring::squeue::Entry;
-use std::io::{self, Error, ErrorKind};
+use std::io::{self, Error};
 use std::mem;
 use std::task::{Poll, Waker};
 
@@ -55,7 +55,7 @@ impl Submittable for SqeSingle {
             SqeSingleState::Indexed { idx } => *idx,
         };
 
-        with_core_mut(|core| core.push_sqes(&[idx])).map_err(IoError::from)
+        with_core_mut(|core| core.push_sqes([idx].iter()))
     }
 }
 

@@ -2,7 +2,9 @@ use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
 use crate::runtime::{Schedule, YieldReason};
-use crate::task::{Notified, Task};
+use crate::task::{JoinHandle, Notified, Task};
+#[allow(unused)]
+use crate::utils::scheduler::{Call, Method, Tracker};
 use crossbeam_deque::{Injector, Worker as CbWorker};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -13,13 +15,16 @@ pub(crate) type StealableTask = Notified<Handle>;
 #[derive(Debug)]
 pub struct Scheduler {
     /// Runtime confguration to be injected in context and worker
-    cfg: RuntimeConfig,
+    pub(crate) cfg: RuntimeConfig,
 
     /// The global injector queue for new tasks.
-    injector: Arc<Injector<StealableTask>>,
+    pub(crate) injector: Arc<Injector<StealableTask>>,
 
     /// Shared context between workers, to be injected in every worker thread.
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
+
+    #[cfg(test)]
+    pub(crate) tracker: Tracker,
 }
 
 impl Scheduler {
@@ -71,6 +76,9 @@ impl Scheduler {
             cfg,
             injector,
             shared,
+
+            #[cfg(test)]
+            tracker: Tracker::new(),
         }
     }
 
@@ -109,12 +117,29 @@ impl Schedule for Handle {
 }
 
 impl Handle {
-    pub fn spawn<F: Future>(_f: F) {
+    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
         unimplemented!("TODO");
     }
 
-    pub fn block_on<F: Future>(_f: F) {
-        unimplemented!("TODO");
+    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        let id = crate::task::Id::next();
+
+        let (task, notified, join_handle) = crate::task::new_task(future, None, self.clone(), id);
+
+        // TODO: insert task take ownership
+        // debug_assert!(self.tasks.insert(task).is_none());
+
+        self.schedule(true, notified);
+
+        join_handle
     }
 }
 
