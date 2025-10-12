@@ -1,5 +1,5 @@
 use crate::context::{with_core_mut, with_slab_mut};
-use crate::runtime::{Schedule, YieldReason};
+use crate::runtime::Schedule;
 use crate::sqe::{
     CompletionHandler, IoError, RawSqe, RawSqeState, Submittable, increment_pending_io,
 };
@@ -54,10 +54,14 @@ impl Submittable for SqeStream {
         // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
         // and only insert the entry in the slab once.
         if let SqeStreamState::Preparing { entry, count } = &mut self.state {
+            // We run `pre_submit_validation` to make the submission *atomic*. This is
+            // because we must ensure that entries are added to both the ring and the slab
+            // to avoid corrupted state.
+            with_core_mut(|core| core.pre_push_validation(1))?;
+
             // Important: clone entry + count so we can retry if Slab is full.
             let count = *count;
             let entry = entry.clone();
-
             let idx = with_slab_mut(|slab| {
                 slab.insert(RawSqe::new(entry, CompletionHandler::new_stream(count)))
                     .map(|(idx, _)| idx)
@@ -97,20 +101,26 @@ impl Stream for SqeStream {
                             };
                             continue;
                         }
-                        Err(e) => {
-                            let reason = if matches!(e, IoError::SqRingFull) {
-                                YieldReason::SqRingFull
-                            } else {
-                                YieldReason::SlabFull
-                            };
-
+                        Err(e) if e.is_retryable() => {
                             // We were unable to register the waker, and submit our IO to local uring.
                             // Yield to scheduler so we can take corrective action and retry later.
                             with_scheduler!(|s| {
-                                s.yield_now(cx.waker(), reason);
+                                s.yield_now(cx.waker(), e.as_yield_reason());
                             });
 
                             return Poll::Pending;
+                        }
+                        Err(e) => {
+                            this.state = SqeStreamState::Completed;
+
+                            if e.is_fatal() {
+                                with_scheduler!(|s| {
+                                    s.unhandled_panic(e.as_panic_reason());
+                                });
+                                unreachable!("scheduler should panic");
+                            }
+
+                            return Poll::Ready(Some(Err(e)));
                         }
                     }
                 }

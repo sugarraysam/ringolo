@@ -189,7 +189,7 @@ mod tests {
                     .collect::<Result<Vec<_>>>()
             }?;
 
-            core.push_sqes(&nops)?;
+            core.push_sqes(nops.iter())?;
 
             {
                 let sq = core.ring.get_mut().sq();
@@ -240,7 +240,7 @@ mod tests {
                     .collect::<Result<Vec<_>>>()
             }?;
 
-            core.push_sqes(&nops)?;
+            core.push_sqes(nops.iter())?;
             core.submit_no_wait()?;
 
             // Busy loop and ensure len of cq ring monotonically increases until n.

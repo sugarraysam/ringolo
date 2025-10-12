@@ -1,4 +1,4 @@
-use crate::runtime::YieldReason;
+use crate::runtime::{PanicReason, YieldReason};
 use crate::task::Id;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -9,6 +9,7 @@ pub(crate) enum Method {
     YieldNow,
     Release,
     Spawn,
+    UnhandledPanic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub(crate) enum Call {
     YieldNow { reason: YieldReason },
     Release { id: Id },
     Spawn,
+    UnhandledPanic { reason: PanicReason },
 }
 
 #[derive(Debug, Clone)]
@@ -31,6 +33,7 @@ impl Tracker {
         map.insert(Method::YieldNow, Vec::new());
         map.insert(Method::Release, Vec::new());
         map.insert(Method::Spawn, Vec::new());
+        map.insert(Method::UnhandledPanic, Vec::new());
 
         Self {
             calls: Arc::new(map),
@@ -46,13 +49,13 @@ impl Tracker {
 
     pub(crate) fn get_calls(&self, method: &Method) -> Vec<Call> {
         self.calls
-            .get(&method)
+            .get(method)
             .expect("method not found")
             .value()
             .clone()
     }
 
     pub(crate) fn num_calls(&self, method: &Method) -> usize {
-        self.calls.get(&method).map_or(0, |calls| calls.len())
+        self.calls.get(method).map_or(0, |calls| calls.len())
     }
 }

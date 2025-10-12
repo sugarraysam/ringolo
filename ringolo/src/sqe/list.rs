@@ -1,4 +1,4 @@
-use crate::context::{with_core_mut, with_slab, with_slab_mut};
+use crate::context::{with_core_mut, with_slab_mut};
 use crate::sqe::errors::IoError;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
 use anyhow::anyhow;
@@ -83,10 +83,12 @@ impl SqeList {
 impl Submittable for SqeList {
     fn submit(&mut self, waker: &Waker) -> Result<i32, IoError> {
         if let SqeListState::Preparing { builder } = &self.state {
-            // Important: clone entries so we can retry if Slab is full. This is because
-            // `try_build()` is *atomic*, where either all SQEs are added to slab or none are.
-            // This allows yielding to the scheduler, having the scheduler take corrective actions
-            // (e.g.: submit + process cqes) and retry later.
+            // We run `pre_submit_validation` to make the submission *atomic*. This is
+            // because we must ensure that entries are added to both the ring and the slab
+            // to avoid corrupted state.
+            with_core_mut(|core| core.pre_push_validation(builder.list.len()))?;
+
+            // Clone entries so we can safely retry.
             let builder = builder.clone();
 
             _ = mem::replace(&mut self.state, builder.try_build()?);
@@ -271,12 +273,6 @@ impl SqeListBuilder {
         let n_sqes = self.list.len();
         if n_sqes < 2 {
             return Err(anyhow!("SqeListBuilder requires at least 2 sqes, got {}", n_sqes).into());
-        }
-
-        // Ensure we can add all SQEs in slab otherwise return an error. This is important to
-        // uphold the chain + batch contract which is that all SQEs are submitted at once.
-        if with_slab(|slab| slab.len() + n_sqes >= slab.capacity()) {
-            return Err(IoError::SlabFull);
         }
 
         let kind = self.kind;
@@ -572,25 +568,24 @@ mod tests {
     #[test]
     fn test_overflow_slab() -> Result<()> {
         let ring_size = 32;
-        let batch_size = (ring_size * 2) + 1;
+        let batch_size = 16;
 
         let builder = Builder::new_local().sq_ring_size(ring_size);
         init_local_runtime_and_context(Some(builder))?;
 
-        let mut builder = SqeBatchBuilder::new();
-        for _ in 0..batch_size {
-            builder = builder.add_entry(nop(), None);
-        }
-
         let (waker, _) = mock_waker();
 
-        let mut list = builder.build();
-        let res = list.submit(&waker);
+        for i in 0..=(ring_size / batch_size) {
+            let mut list = build_batch(batch_size);
+            let res = list.submit(&waker);
 
-        // In the current setup, we always overflow the Slab before we overflow
-        // the ring. So we can detect this error first.
-        assert!(res.is_err());
-        assert_eq!(res.unwrap_err(), IoError::SlabFull);
+            if i == (ring_size / batch_size) + 1 {
+                // This last submission should fail as we have exhausted the slab.
+                assert!(res.is_err());
+                assert_eq!(res.unwrap_err(), IoError::SlabFull);
+                break;
+            }
+        }
 
         Ok(())
     }

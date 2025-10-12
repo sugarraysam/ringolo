@@ -153,12 +153,20 @@ impl Worker {
         let waker = waker_ref(scheduler);
         let mut cx = std::task::Context::from_waker(&waker);
 
+        let mut root_result: Option<F::Output> = None;
+
+        // Here are a couple of tricky things about the event loop:
+        // - the root future might finish before OR after all tasks are done
+        // - if the root future panics, we propagate to user immediately
+        // - if a spawned task panics, it is handled asynchronously
+        // - weird interactions with SQ ring or Slab can result in corrupted state
+        //   and force scheduler to panic
         loop {
-            if scheduler.reset_root_woken() {
+            if scheduler.reset_root_woken() && root_result.is_none() {
                 let _g = ctx.set_polling_root();
 
                 if let Poll::Ready(v) = root.as_mut().poll(&mut cx) {
-                    return Ok(v);
+                    root_result = Some(v);
                 }
             }
 
@@ -169,13 +177,17 @@ impl Worker {
                 task.run();
             } else {
                 // No more work to do. This means it is time to poll the root future.
-                if with_slab(|slab| slab.pending_ios) == 0 {
+                if with_slab(|s| s.pending_ios == 0) {
                     // By definition if there are no pending IOs, then we should have no `ready_cqes`
                     // and no `unsubmitted_sqes` because we have a 1:1 mapping between RawSqe <-> SQE.
                     debug_assert!(!data.has_ready_cqes);
                     debug_assert!(data.unsubmitted_sqes == 0);
 
-                    scheduler.set_root_woken();
+                    // TODO: do we have to check scheduler.tasks.is_empty() be false?
+                    match root_result.is_some() {
+                        true => return Ok(root_result.unwrap()),
+                        false => scheduler.set_root_woken(),
+                    }
                 } else {
                     // "Park" the thread waiting for next completion.
                     with_core_mut(|core| -> Result<()> {
@@ -197,6 +209,7 @@ impl Worker {
         // to process pending kernel `task_work` and post CQEs. It would be silly to not submit
         // pending SQEs in same syscall.
         } else if events.contains(TickerEvents::PROCESS_CQES) {
+            dbg!("processing cqes");
             ctx.with_core_mut(|core| {
                 core.submit_and_wait(1, None)?;
                 core.process_cqes(None)
@@ -204,6 +217,7 @@ impl Worker {
 
         // Only submit, no need to wait for anything.
         } else if events.contains(TickerEvents::SUBMIT_SQES) {
+            dbg!("submitting sqes");
             ctx.with_core_mut(|core| core.submit_no_wait())?;
         }
 

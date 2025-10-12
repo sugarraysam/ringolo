@@ -58,6 +58,23 @@ impl Core {
         self.polling_root_future.get()
     }
 
+    // Must call before trying to call `push_sqes`. This is because we need to make sure our
+    // batch can fit in both the Slab and the SQ ring to avoid corrupted state.
+    pub(crate) fn pre_push_validation(&mut self, n_sqes: usize) -> Result<(), IoError> {
+        let slab = self.slab.borrow();
+        let sq = self.ring.get_mut().sq();
+
+        if n_sqes > sq.capacity() {
+            Err(IoError::SqBatchTooLarge)
+        } else if n_sqes + sq.len() > sq.capacity() {
+            Err(IoError::SqRingFull)
+        } else if n_sqes + slab.len() > slab.capacity() {
+            Err(IoError::SlabFull)
+        } else {
+            Ok(())
+        }
+    }
+
     // Queues SQEs in the SQ ring, fetching them from the slab using the provided
     // indices. To submit the SQEs to the kernel, we need to call `q.sync()` and
     // make an `io_uring_enter` syscall unless kernel side SQ polling is enabled.
@@ -66,16 +83,6 @@ impl Core {
         indices: impl ExactSizeIterator<Item = &'a usize>,
     ) -> Result<i32, IoError> {
         let mut sq = self.ring.get_mut().sq();
-        let sq_len = sq.len();
-
-        // SQE chain and batches have a contract where they need to all be submitted
-        // at the same time. If we can't fit them all, return an error.
-        if sq_len + indices.len() >= sq.capacity() {
-            return Err(IoError::SqRingFull);
-        } else if indices.len() >= sq.capacity() {
-            return Err(IoError::SqBatchTooLarge);
-        }
-
         let slab = self.slab.borrow();
 
         // If we fail to add an entry at this point, we might violate SQE primitive contracts.

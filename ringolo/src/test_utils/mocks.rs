@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{Schedule, YieldReason};
+use crate::runtime::{PanicReason, Schedule, YieldReason};
 use crate::task::layout::vtable;
 use crate::task::{Header, JoinHandle, Notified, State, Task};
 use std::future::Ready;
@@ -26,8 +26,8 @@ impl Schedule for DummyScheduler {
         unimplemented!("dummy scheduler");
     }
 
-    fn unhandled_panic(&self) {
-        // By default, do nothing.
+    fn unhandled_panic(&self, _reason: PanicReason) {
+        unimplemented!("dummy scheduler");
     }
 }
 

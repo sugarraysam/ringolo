@@ -17,6 +17,10 @@ impl RawSqeSlab {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             slab: Slab::with_capacity(capacity),
+
+            // Pending ios is used by local worker as a signal of "is there more work to do". If
+            // there are no pending ios, then we are NOT expecting any more CQE, and we can decide
+            // to park the thread or poll the root future.
             pending_ios: 0,
         }
     }

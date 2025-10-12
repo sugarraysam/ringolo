@@ -48,9 +48,7 @@ pub(crate) trait Schedule: Sync + Sized + 'static {
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>>;
 
     /// Polling the task resulted in a panic. Should the runtime shutdown?
-    fn unhandled_panic(&self) {
-        // By default, do nothing.
-    }
+    fn unhandled_panic(&self, reason: PanicReason);
 }
 
 #[derive(Debug)]
@@ -64,6 +62,15 @@ pub(crate) enum YieldReason {
     SlabFull,
     SqRingFull,
     NoTaskBudget,
+    Unknown,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum PanicReason {
+    SqBatchTooLarge,
+    SqRingInvalidState,
+    SlabInvalidState,
+    Unknown,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

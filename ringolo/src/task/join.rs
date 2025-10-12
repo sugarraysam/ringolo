@@ -1,10 +1,9 @@
-use crate::task::{Header, Id, RawTask, Result};
-
+use crate::task::{Header, Id, JoinError, RawTask, Result, id};
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::panic::{RefUnwindSafe, UnwindSafe};
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::task::{Context, Poll, Waker};
 
 /// An owned permission to join on a task (await its termination).
@@ -289,6 +288,19 @@ impl<T> JoinHandle<T> {
     pub fn id(&self) -> Id {
         // Safety: The header pointer is valid.
         unsafe { Header::get_id(self.raw.header_ptr()) }
+    }
+
+    pub fn get_result(mut self) -> Result<T> {
+        let id = self.id();
+        let mut this = pin!(self);
+
+        match this
+            .as_mut()
+            .poll(&mut Context::from_waker(futures::task::noop_waker_ref()))
+        {
+            Poll::Ready(res) => res,
+            Poll::Pending => Err(JoinError::cancelled(id)),
+        }
     }
 }
 

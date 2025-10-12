@@ -92,6 +92,9 @@ impl CompletionHandler {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionEffect {
+    // We use this fancy way to decrement pending IO on the slab mostly because
+    // of MULTISHOT, where 1 SQE can generate N CQEs. We are only allowed to decrement
+    // the pending IO counter after receiving the *last CQE* for this stream.
     DecrementPendingIo,
     WakeHead { head: usize },
 }

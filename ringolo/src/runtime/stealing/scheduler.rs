@@ -1,7 +1,8 @@
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
-use crate::runtime::{Schedule, YieldReason};
+use crate::runtime::{PanicReason, Schedule, YieldReason};
+use crate::sqe::IoError;
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
@@ -112,6 +113,11 @@ impl Schedule for Handle {
     }
 
     fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {
+        unimplemented!("todo");
+    }
+
+    /// Polling the task resulted in a panic. Should the runtime shutdown?
+    fn unhandled_panic(&self, _reason: PanicReason) {
         unimplemented!("todo");
     }
 }

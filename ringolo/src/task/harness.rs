@@ -1,4 +1,4 @@
-use crate::runtime::Schedule;
+use crate::runtime::{PanicReason, Schedule};
 use crate::sqe::IoError;
 use crate::task::layout::{Core, TaskLayout};
 use crate::task::raw::can_read_output;
@@ -377,7 +377,7 @@ fn poll_future<T: Future, S: Schedule>(core: &Core<T, S>, cx: Context<'_>) -> Po
     }));
 
     if res.is_err() {
-        core.scheduler.unhandled_panic();
+        core.scheduler.unhandled_panic(PanicReason::Unknown);
     }
 
     Poll::Ready(())
@@ -389,6 +389,6 @@ fn panic_to_error<S: Schedule>(
     task_id: Id,
     panic: Box<dyn Any + Send + 'static>,
 ) -> JoinError {
-    scheduler.unhandled_panic();
+    scheduler.unhandled_panic(PanicReason::Unknown);
     JoinError::panic(task_id, panic)
 }

@@ -2,7 +2,9 @@ use crate::context::{with_core, with_core_mut};
 use crate::runtime::local::worker::Worker;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
-use crate::runtime::{AddMode, EventLoop, OwnedTasks, Schedule, TaskOpts, YieldReason};
+use crate::runtime::{
+    AddMode, EventLoop, OwnedTasks, PanicReason, Schedule, TaskOpts, YieldReason,
+};
 use crate::task::{Id, JoinHandle, Notified, Task};
 #[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
@@ -33,7 +35,7 @@ impl Scheduler {
     pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
         Self {
             cfg: cfg.clone(),
-            worker: Worker::new(&cfg),
+            worker: Worker::new(cfg),
             tasks: OwnedTasks::new(cfg.sq_ring_size),
             root_woken: RefCell::new(true),
 
@@ -106,7 +108,7 @@ impl Schedule for Handle {
         self.track(Method::YieldNow, Call::YieldNow { reason });
         match reason {
             YieldReason::SqRingFull => {
-                if let Err(e) = with_core_mut(|core| core.submit_and_wait(1, None)) {
+                if let Err(e) = with_core_mut(|core| core.submit_no_wait()) {
                     panic!(
                         "FATAL: scheduler error. Unable to submit SQEs and retrying to submit failed again: {:?}",
                         e
@@ -124,7 +126,7 @@ impl Schedule for Handle {
                     );
                 }
             }
-            YieldReason::NoTaskBudget => { /* nothing to do */ }
+            YieldReason::NoTaskBudget | YieldReason::Unknown => { /* nothing to do */ }
         }
 
         // If the root_future is yielding, we need to handle it differently.
@@ -142,6 +144,19 @@ impl Schedule for Handle {
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
         self.track(Method::Release, Call::Release { id: task.id() });
         self.tasks.remove(&task.id())
+    }
+
+    fn unhandled_panic(&self, reason: PanicReason) {
+        self.track(Method::UnhandledPanic, Call::UnhandledPanic { reason });
+
+        // TODO: how to handle? What does tokio do? For now just crash.
+        panic!(
+            "FATAL: scheduler error. Unhandled panic in task {:?}.",
+            reason
+        );
+
+        // By default, we shutdown the runtime.
+        // self.tasks.shutdown_all();
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::runtime::{Schedule, YieldReason};
+use crate::runtime::Schedule;
 use crate::task::Header;
 use crate::with_scheduler;
 use std::future::Future;
@@ -86,35 +86,36 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
         loop {
             match this.state {
                 State::Initial => {
-                    if let Err(e) = this.inner.submit(cx.waker()) {
-                        match e {
-                            IoError::SqRingFull | IoError::SlabFull => {
-                                let reason = if matches!(e, IoError::SqRingFull) {
-                                    YieldReason::SqRingFull
-                                } else {
-                                    YieldReason::SlabFull
-                                };
+                    match this.inner.submit(cx.waker()) {
+                        Ok(_) => {
+                            // Continue the loop to immediately poll for completion. Although very unlikely
+                            // as we will batch submit SQEs in SQ ring. Nevertheless, we want to call
+                            // `poll_complete` to ensure we set the waker.
+                            this.state = State::Submitted;
+                            continue;
+                        }
+                        Err(e) if e.is_retryable() => {
+                            // We were unable to register the waker, and submit our IO to local uring.
+                            // Yield to scheduler so we can take corrective action and retry later.
+                            with_scheduler!(|s| {
+                                s.yield_now(cx.waker(), e.as_yield_reason());
+                            });
 
-                                // We were unable to register the waker, and submit our IO to local uring.
-                                // Yield to scheduler so we can take corrective action and retry later.
+                            return Poll::Pending;
+                        }
+                        Err(e) => {
+                            this.state = State::Completed;
+
+                            if e.is_fatal() {
                                 with_scheduler!(|s| {
-                                    s.yield_now(cx.waker(), reason);
+                                    s.unhandled_panic(e.as_panic_reason());
                                 });
+                                unreachable!("scheduler should panic");
+                            }
 
-                                return Poll::Pending;
-                            }
-                            _ => {
-                                this.state = State::Completed;
-                                return Poll::Ready(Err(e));
-                            }
+                            return Poll::Ready(Err(e));
                         }
                     }
-
-                    // Continue the loop to immediately poll for completion. Although very unlikely
-                    // as we will batch submit SQEs in SQ ring. Nevertheless, we want to call
-                    // `poll_complete` to ensure we set the waker.
-                    this.state = State::Submitted;
-                    continue;
                 }
                 State::Submitted => match this.inner.poll_complete(cx.waker()) {
                     Poll::Ready(res) => {
@@ -134,8 +135,7 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
 }
 
 pub struct SqeCollection<T: Submittable + Completable> {
-    state: State,
-    inner: Vec<(usize, T)>,
+    inner: Vec<(usize, Sqe<T>)>,
 
     // Store results in internal future state to persist across poll calls.
     // We store it behind Option<T> because this type impl default which allows
@@ -147,14 +147,13 @@ impl<T: Submittable + Completable> SqeCollection<T> {
     pub fn new(inner: Vec<T>) -> Self {
         let results = (0..inner.len()).map(|_| None).collect();
         Self {
-            state: State::Initial,
-            inner: inner.into_iter().enumerate().collect(),
+            inner: inner.into_iter().map(Sqe::new).enumerate().collect(),
             results,
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.is_empty() && self.results.iter().all(Option::is_some)
     }
 }
 
@@ -169,74 +168,25 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        loop {
-            match this.state {
-                State::Initial => {
-                    // Submit implementation only pushes sqes in SQ ring so this
-                    // is quite efficient and we maintain the guarantee that all
-                    // operations are submitted as part of the same `io_uring_enter`
-                    // syscall.
-                    for (_, sqe) in &mut this.inner {
-                        if let Err(e) = sqe.submit(cx.waker()) {
-                            match e {
-                                IoError::SqRingFull | IoError::SlabFull => {
-                                    let reason = if matches!(e, IoError::SqRingFull) {
-                                        YieldReason::SqRingFull
-                                    } else {
-                                        YieldReason::SlabFull
-                                    };
-
-                                    // We were unable to register the waker, and submit our IO to local uring.
-                                    // Yield to scheduler so we can take corrective action and retry later.
-                                    with_scheduler!(|s| {
-                                        s.yield_now(cx.waker(), reason);
-                                    });
-
-                                    return Poll::Pending;
-                                }
-                                _ => {
-                                    this.state = State::Completed;
-                                    return Poll::Ready(vec![Err(e)]);
-                                }
-                            }
-                        }
-                    }
-
-                    // Continue the loop to immediately poll for completion. Although very unlikely
-                    // as we will batch submit SQEs in SQ ring. Nevertheless, we want to call
-                    // `poll_complete` to ensure we set the waker.
-                    this.state = State::Submitted;
-                    continue;
+        // Delegate to all inner future implementations.
+        this.inner
+            .retain_mut(|(idx, fut)| match Pin::new(fut).poll(cx) {
+                Poll::Ready(result) => {
+                    this.results[*idx] = Some(result);
+                    false
                 }
-                State::Submitted => {
-                    this.inner.retain(|(idx, sqe)| {
-                        match sqe.poll_complete(cx.waker()) {
-                            Poll::Ready(res) => {
-                                this.results[*idx] = Some(res);
-                                false
-                            }
-                            Poll::Pending => true, // keep polling
-                        }
-                    });
+                Poll::Pending => true,
+            });
 
-                    if this.is_ready() {
-                        this.state = State::Completed;
-
-                        let results = std::mem::take(&mut this.results)
-                            .into_iter()
-                            .flatten()
-                            .collect();
-
-                        return Poll::Ready(results);
-                    } else {
-                        return Poll::Pending;
-                    }
-                }
-
-                State::Completed => {
-                    panic!("Future polled after completion");
-                }
-            }
+        if this.is_ready() {
+            let results = std::mem::take(&mut this.results)
+                .into_iter()
+                // Safety: panics if any result is None but we just checked.
+                .flatten()
+                .collect();
+            Poll::Ready(results)
+        } else {
+            Poll::Pending
         }
     }
 }

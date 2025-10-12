@@ -1,5 +1,7 @@
 use std::io;
 
+use crate::runtime::{PanicReason, YieldReason};
+
 /// A centralized error type for all scheduler and runtime operations.
 #[derive(thiserror::Error, Debug)]
 pub enum IoError {
@@ -30,6 +32,35 @@ pub enum IoError {
     /// A catch-all for any other type of unexpected error.
     #[error("An unexpected error occurred: {0}")]
     Other(#[from] anyhow::Error),
+}
+
+impl IoError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, IoError::SqRingFull | IoError::SlabFull)
+    }
+
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            IoError::SlabInvalidState | IoError::SqRingInvalidState
+        )
+    }
+
+    pub(crate) fn as_yield_reason(&self) -> YieldReason {
+        match self {
+            IoError::SqRingFull => YieldReason::SqRingFull,
+            IoError::SlabFull => YieldReason::SlabFull,
+            _ => YieldReason::Unknown,
+        }
+    }
+
+    pub(crate) fn as_panic_reason(&self) -> PanicReason {
+        match self {
+            IoError::SlabInvalidState => PanicReason::SlabInvalidState,
+            IoError::SqRingInvalidState => PanicReason::SqRingInvalidState,
+            _ => PanicReason::Unknown,
+        }
+    }
 }
 
 impl PartialEq for IoError {

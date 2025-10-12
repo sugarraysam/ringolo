@@ -55,6 +55,11 @@ impl<S: 'static> OwnedTasks<S> {
         self.tasks.len()
     }
 
+    /// Returns the number of tasks currently owned by the executor.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
     /// Initiates a graceful shutdown by signaling all tasks.
     pub(crate) fn shutdown_all(&self)
     where
@@ -65,11 +70,7 @@ impl<S: 'static> OwnedTasks<S> {
             // Can't get owned iterator so we first collect keys and then use
             // the remove API. We are shutting down anyways so performance is
             // not such a concern.
-            let keys = self
-                .tasks
-                .iter()
-                .map(|e| *e.key())
-                .collect::<Vec<_>>();
+            let keys = self.tasks.iter().map(|e| *e.key()).collect::<Vec<_>>();
 
             keys.iter().for_each(|k| {
                 if let Some((_, task)) = self.tasks.remove(k) {

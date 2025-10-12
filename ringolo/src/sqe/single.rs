@@ -39,9 +39,13 @@ impl Submittable for SqeSingle {
             // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
             // and only insert the entry in the slab once.
             SqeSingleState::Preparing { entry } => {
+                // We run `pre_push_validation` to make the submission *atomic*. This is
+                // because we must ensure that entries are added to both the ring and the slab
+                // to avoid corrupted state.
+                with_core_mut(|core| core.pre_push_validation(1))?;
+
                 // Important: clone entry so we can retry if Slab is full.
                 let entry = entry.clone();
-
                 let idx = with_slab_mut(|slab| {
                     slab.insert(RawSqe::new(entry, CompletionHandler::new_single()))
                         .map(|(idx, _)| idx)
