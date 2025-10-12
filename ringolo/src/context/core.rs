@@ -96,6 +96,7 @@ impl Core {
             unsafe { sq.push(entry) }.map_err(|_| IoError::SqRingInvalidState)?;
         }
 
+        dbg!("pushed {} sqes to ring", sq.len());
         Ok(0)
     }
 

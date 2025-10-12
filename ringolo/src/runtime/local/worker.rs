@@ -131,9 +131,9 @@ impl EventLoop for Worker {
         self.pollable.borrow_mut().pop_back()
     }
 
-    fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output> {
-        if let Some(root) = root_future {
-            expect_local_scheduler(|ctx, scheduler| self.event_loop_inner(ctx, scheduler, root))
+    fn event_loop<F: Future>(&self, root_fut: Option<F>) -> Result<F::Output> {
+        if let Some(root_fut) = root_fut {
+            expect_local_scheduler(|ctx, scheduler| self.event_loop_inner(ctx, scheduler, root_fut))
         } else {
             Err(anyhow!("Unexpected empty root_future"))
         }
@@ -145,10 +145,10 @@ impl Worker {
         &self,
         ctx: &local::Context,
         scheduler: &local::Handle,
-        root_future: F,
+        root_fut: F,
     ) -> Result<F::Output> {
         let mut data = self.cfg.borrow_mut();
-        let mut root = pin!(root_future);
+        let mut root_fut = pin!(root_fut);
 
         let waker = waker_ref(scheduler);
         let mut cx = std::task::Context::from_waker(&waker);
@@ -163,9 +163,10 @@ impl Worker {
         //   and force scheduler to panic
         loop {
             if scheduler.reset_root_woken() && root_result.is_none() {
+                dbg!("polling root future");
                 let _g = ctx.set_polling_root();
 
-                if let Poll::Ready(v) = root.as_mut().poll(&mut cx) {
+                if let Poll::Ready(v) = root_fut.as_mut().poll(&mut cx) {
                     root_result = Some(v);
                 }
             }
@@ -189,6 +190,7 @@ impl Worker {
                         false => scheduler.set_root_woken(),
                     }
                 } else {
+                    dbg!("parking thread waiting for completions");
                     // "Park" the thread waiting for next completion.
                     with_core_mut(|core| -> Result<()> {
                         core.submit_and_wait(1, None)?;

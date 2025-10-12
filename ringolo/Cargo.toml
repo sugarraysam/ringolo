@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# TODO: figure out why rust-analyzer doesnt pickup experimental override
 # Include nothing by default
 default = []
 experimental = []
@@ -22,7 +23,7 @@ futures = "~0.3.31"
 io-uring = { git = "https://github.com/sugarraysam/io-uring.git", branch = "origin/expose-enter-flags" }
 libc = { version = "~0.2.98", default-features = false }
 paste = "~1.0.15"
-pin-project-lite = "~0.2.16"
+pin-project = "~1.1.10"
 ringolo-macros = { version = "0.1.0", path = "../ringolo-macros" }
 slab = "~0.4.11"
 smallvec = "~1.15.1"

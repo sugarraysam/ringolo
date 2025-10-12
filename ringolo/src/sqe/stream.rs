@@ -18,6 +18,7 @@ pub(crate) enum SqeStreamState {
     Indexed { idx: usize },
     Submitted { idx: usize },
     Completed,
+    Cancelled,
 }
 
 #[derive(Debug)]
@@ -47,6 +48,14 @@ impl SqeStream {
             _ => Err(anyhow!("unexpected sqe stream state: {:?}", self.state).into()),
         }
     }
+
+    pub(crate) fn cancel(mut self: Pin<&mut Self>) -> Option<usize> {
+        let old = mem::replace(&mut self.state, SqeStreamState::Cancelled);
+        match old {
+            SqeStreamState::Submitted { idx } => Some(idx),
+            _ => None,
+        }
+    }
 }
 
 impl Submittable for SqeStream {
@@ -54,7 +63,7 @@ impl Submittable for SqeStream {
         // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
         // and only insert the entry in the slab once.
         if let SqeStreamState::Preparing { entry, count } = &mut self.state {
-            // We run `pre_submit_validation` to make the submission *atomic*. This is
+            // We run `pre_push_validation` to make the submission *atomic*. This is
             // because we must ensure that entries are added to both the ring and the slab
             // to avoid corrupted state.
             with_core_mut(|core| core.pre_push_validation(1))?;
@@ -67,7 +76,7 @@ impl Submittable for SqeStream {
                     .map(|(idx, _)| idx)
             })?;
 
-            _ = mem::replace(&mut self.state, SqeStreamState::Indexed { idx });
+            let _ = mem::replace(&mut self.state, SqeStreamState::Indexed { idx });
             increment_pending_io(waker);
         }
 
@@ -80,8 +89,8 @@ impl Submittable for SqeStream {
 
 impl Unpin for SqeStream {}
 
-// SqeStream does not implement Completable trait, as it represents a one-off result.
-// Instead, we implement futures::Stream interface, to keep returning results to the
+// SqeStream does not implement `Completable` trait, as it does not represent a one-off result.
+// Instead, we implement `futures::Stream` interface, and will keep producing results to the
 // user as they become available.
 impl Stream for SqeStream {
     type Item = Result<i32, IoError>;
@@ -96,6 +105,7 @@ impl Stream for SqeStream {
                         Ok(_) => {
                             // Submission successful, advance state and immediately
                             // try to poll for a result.
+                            dbg!("submitted");
                             this.state = SqeStreamState::Submitted {
                                 idx: this.get_idx()?,
                             };
@@ -138,16 +148,23 @@ impl Stream for SqeStream {
                             }
                         };
 
+                        dbg!("found raw sqe looking for next result : {:?}", &raw_sqe);
+
                         // It is the responsibility of the caller to cancel the
                         // stream if there is a bad result. We don't take responsibility
                         // for analyzing stream errors.
                         match raw_sqe.pop_next_result() {
-                            Ok(Some(result)) => Poll::Ready(Some(Ok(result))),
+                            Ok(Some(result)) => {
+                                dbg!("got result from stream: {}", result);
+                                Poll::Ready(Some(Ok(result)))
+                            }
                             Ok(None) => {
                                 if matches!(raw_sqe.get_state(), RawSqeState::Completed) {
+                                    dbg!("stream completed");
                                     this.state = SqeStreamState::Completed;
                                     Poll::Ready(None)
                                 } else {
+                                    dbg!("no result yet, pending");
                                     raw_sqe.set_waker(cx.waker());
                                     Poll::Pending
                                 }
@@ -156,7 +173,7 @@ impl Stream for SqeStream {
                         }
                     });
                 }
-                SqeStreamState::Completed => {
+                SqeStreamState::Completed | SqeStreamState::Cancelled => {
                     return Poll::Ready(None);
                 }
             }
@@ -167,6 +184,11 @@ impl Stream for SqeStream {
 // RAII: free RawSqe from slab.
 impl Drop for SqeStream {
     fn drop(&mut self) {
+        if let SqeStreamState::Cancelled = self.state {
+            // The cancellation task owns the RawSqe now.
+            return;
+        }
+
         if let Err(e) = self.get_idx().map(|idx| {
             with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {

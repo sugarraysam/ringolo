@@ -1,16 +1,13 @@
 #![allow(clippy::all)]
 
 // Required imports for the macro and the generated code.
-use crate::sqe::{IoError, Sqe, SqeSingle};
-use io_uring::squeue::Entry;
+use crate::sqe::SqeSingle;
 use io_uring::types::{
-    DestinationSlot, Fd, Fixed, FsyncFlags, OpenHow, TimeoutFlags, Timespec, epoll_event, statx,
+    CancelBuilder, DestinationSlot, Fd, Fixed, FsyncFlags, OpenHow, TimeoutFlags, Timespec,
+    epoll_event, statx,
 };
 use std::future::Future;
-use std::io;
 use std::os::fd::RawFd;
-use std::pin::{Pin, pin};
-use std::task::{Context, Poll};
 
 /// This macro generates a `Future` implementation for an `io_uring` opcode.
 ///
@@ -41,7 +38,7 @@ macro_rules! generate_io_uring_future {
     ) => { paste::paste! {
 
         pub struct $name {
-            sqe: Sqe<SqeSingle>,
+            sqe: $crate::sqe::Sqe<$crate::sqe::SqeSingle>,
         }
 
         pub struct [<$name Builder>] {
@@ -68,17 +65,17 @@ macro_rules! generate_io_uring_future {
             // The `build` method consumes the builder and returns the final struct.
             pub fn build(self) -> $name {
                 $name {
-                    sqe: Sqe::new(SqeSingle::new(self.op.build())),
+                    sqe: $crate::sqe::Sqe::new(SqeSingle::new(self.op.build())),
                 }
             }
         }
 
         // The `Future` implementation is consistent across all generated structs.
         impl Future for $name {
-            type Output = Result<(Entry, io::Result<i32>), IoError>;
+            type Output = Result<(io_uring::squeue::Entry, std::io::Result<i32>), $crate::sqe::IoError>;
 
-            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let mut pinned = pin!(&mut self.sqe);
+            fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+                let mut pinned = std::pin::pin!(&mut self.sqe);
                 pinned.as_mut().poll(cx)
             }
         }
@@ -98,6 +95,20 @@ generate_io_uring_future!(
     io_uring::opcode::AcceptMulti,
     ( fd: Fd ),
     ( allocate_file_index: bool, flags: i32 )
+);
+
+generate_io_uring_future!(
+    AsyncCancel,
+    io_uring::opcode::AsyncCancel,
+    ( user_data: u64 ),
+    ( )
+);
+
+generate_io_uring_future!(
+    AsyncCancel2,
+    io_uring::opcode::AsyncCancel2,
+    ( builder: CancelBuilder ),
+    ( )
 );
 
 generate_io_uring_future!(

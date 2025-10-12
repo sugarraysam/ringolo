@@ -1,64 +1,37 @@
-use crate::sqe::{SqeStream, SqeStreamError};
-use anyhow::{anyhow, Result};
+use crate as ringolo;
+use crate::sqe::{IoError, SqeStream};
+use anyhow::Result;
 use futures::Stream;
 use io_uring::opcode::Timeout;
-use io_uring::types::{TimeoutFlags, Timespec};
-use pin_project_lite::pin_project;
+use io_uring::types::{CancelBuilder, TimeoutFlags, Timespec};
+use pin_project::{pin_project, pinned_drop};
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-// TODO: pin_project impl drop already?
-pin_project! {
-    pub struct Tick {
-        #[pin]
-        inner: SqeStream,
+#[pin_project(PinnedDrop)]
+pub struct Tick {
+    #[pin]
+    inner: SqeStream,
 
-        // Will be used in drop impl to determinie if we need to cancel the
-        // MULTISHOT inner Timeout.
-        finished: bool,
-    }
+    // TODO: we need to keep the Timespec alive as we pass an addr to the kernel.
+    // If we drop
+    timespec: Box<Timespec>,
 }
 
 impl Tick {
-    pub fn try_new(freq: Duration, count: Option<u32>) -> Result<Self> {
-        if count.map_or(false, |c| c <= 1) {
-            return Err(anyhow!("Specify a count that is > 1 you silly goose"));
-        }
+    pub fn try_new(interval: Duration, count: Option<u32>) -> Result<Self> {
+        let timespec = Box::new(Timespec::from(interval));
 
-        let timespec = Timespec::new()
-            .sec(freq.as_secs())
-            .nsec(freq.subsec_nanos());
-
-        let timeout = {
-            let mut t = Timeout::new(&timespec);
-
-            if let Some(c) = count {
-                t = t.count(c);
-            }
-
-            t.flags(TimeoutFlags::MULTISHOT).build()
-        };
+        let timeout = Timeout::new(&*timespec as *const Timespec)
+            .count(count.unwrap_or(0))
+            .flags(TimeoutFlags::MULTISHOT)
+            .build();
 
         Ok(Self {
             inner: SqeStream::try_new(timeout, count)?,
-            finished: false,
+            timespec,
         })
-    }
-}
-
-impl Drop for Tick {
-    fn drop(&mut self) {
-        if !self.finished {
-            // TODO:
-            // - use ctx.scheduler, enqueue new task with `is_new==false`, so it lands
-            //   on this worker (this thread) OR access worker directly? `add_local_task`?
-            //     -> TASK CANNOT BE STEALABLE
-            // - more involved than it looks like
-            // - log errors async (eprintln) or even panic
-            let _user_data = self.inner.get_idx();
-            unimplemented!("TODO");
-        }
     }
 }
 
@@ -73,7 +46,6 @@ impl Stream for Tick {
 
         // Stream successfully completed.
         if res.is_none() {
-            *this.finished = true;
             return Poll::Ready(None);
         }
 
@@ -83,11 +55,51 @@ impl Stream for Tick {
 
             // -62 ETIME is a success case as the kernel is telling us the
             // timeout occurred and triggered the completion event.
-            Err(SqeStreamError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => {
-                Poll::Ready(Some(()))
-            }
+            Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Poll::Ready(Some(())),
 
             Err(e) => panic!("Unexpected tick error: {:?}", e),
         }
+    }
+}
+
+// TODO:
+// - if cancel fails, should provide a signal, cancellation is async in nature, but we want to know
+//   if we are leaking resources. If many multishot fail to get cancelled its really bad.
+#[pinned_drop]
+impl PinnedDrop for Tick {
+    fn drop(self: Pin<&mut Self>) {
+        let this = self.project();
+
+        let user_data = match this.inner.cancel() {
+            Some(idx) => idx,
+            None => {
+                // Nothing to cancel.
+                return;
+            }
+        };
+
+        // TODO: OnCancelError::{Ignore, Panic} struct to choose from
+        // - if fixed count we dont care just ignore
+        // - if infinite then panic as we leak resources
+        let builder = CancelBuilder::user_data(user_data as u64).all();
+        ringolo::spawn_cancel(builder, user_data);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate as ringolo;
+    use anyhow::Result;
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    // TODO:
+    // - test Cancelling scenarios
+    #[ringolo::test]
+    async fn test_tick_with_count() -> Result<()> {
+        let tick = Tick::try_new(Duration::from_nanos(1), Some(3))?;
+        assert_eq!(tick.collect::<Vec<_>>().await.len(), 3);
+        Ok(())
     }
 }

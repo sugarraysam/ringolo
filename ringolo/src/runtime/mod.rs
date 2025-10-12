@@ -7,6 +7,9 @@ use bitflags::bitflags;
 use std::task::Waker;
 
 // Public API
+pub mod cancel;
+pub use cancel::{CancelBuilder, CancellationTask};
+
 pub mod runtime;
 pub use runtime::{Builder, Runtime};
 
@@ -97,7 +100,7 @@ pub(crate) trait EventLoop {
 }
 
 bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub(crate) struct TaskOpts: u32 {
         /// Task will stick to the thread onto which it is created.
         const STICKY = 1;
@@ -106,36 +109,44 @@ bitflags! {
 
 /// Boundary value to prevent stack overflow caused by a large-sized
 /// Future being placed in the stack.
-pub(crate) const BOX_FUTURE_THRESHOLD: usize = if cfg!(debug_assertions) { 2048 } else { 16384 };
+pub(crate) const BOX_ROOT_FUTURE_THRESHOLD: usize =
+    if cfg!(debug_assertions) { 2048 } else { 16384 };
 
-pub fn block_on<F>(future: F) -> F::Output
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
+/// We `block_on` on a special future that we refer to as the `root_future`. It
+/// is guaranteed to be polled on the current thread, and is central in deciding
+/// how and when the runtime returns. This is why it has looser bounds (!Send and !Sync).
+///
+/// It can stay on the stack if it is small enough, otherwise it gets heap
+/// allocated.
+pub fn block_on<F: Future>(root_fut: F) -> F::Output {
     with_scheduler!(|s| {
         let fut_size = std::mem::size_of::<F>();
 
-        if fut_size > BOX_FUTURE_THRESHOLD {
-            s.block_on(Box::pin(future))
+        if fut_size > BOX_ROOT_FUTURE_THRESHOLD {
+            s.block_on(Box::pin(root_fut))
         } else {
-            s.block_on(future)
+            s.block_on(root_fut)
         }
     })
 }
 
+// Future gets boxed in `task::layout::TaskLayout::new`, so don't box it
+// twice like the `root_future`.
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    with_scheduler!(|s| {
-        let fut_size = std::mem::size_of::<F>();
+    with_scheduler!(|s| { s.spawn(future, None) })
+}
 
-        if fut_size > BOX_FUTURE_THRESHOLD {
-            s.spawn(Box::pin(future))
-        } else {
-            s.spawn(future)
-        }
-    })
+pub fn spawn_cancel(builder: CancelBuilder, user_data: usize) {
+    let cancel_task = CancellationTask::new(builder, user_data);
+
+    // Cancel tasks need to be sticky to the local thread. It does not make sense
+    // to cancel an io_uring operation from another thread.
+    let _join_handle = with_scheduler!(|s| { s.spawn(cancel_task.run(), Some(TaskOpts::STICKY)) });
+
+    // TODO: add join_handle to CancellationHandler?? retry/logging?
+    // the task itself is doing all of this so might be OK to just drop this one.
 }

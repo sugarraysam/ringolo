@@ -115,6 +115,11 @@ impl Header {
     /// Stealing a task with pending I/O would cause its waker to be invoked on
     /// the wrong worker, leading to undefined behavior.
     pub(crate) unsafe fn is_stealable(me: NonNull<Header>) -> bool {
-        me.as_ref().pending_io.get() == 0
+        let ptr = me.as_ref();
+
+        let is_sticky = ptr.opts.get().contains(TaskOpts::STICKY);
+        let has_pending_io = ptr.pending_io.get() > 0;
+
+        !is_sticky && !has_pending_io
     }
 }

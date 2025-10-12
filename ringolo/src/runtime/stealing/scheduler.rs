@@ -1,7 +1,7 @@
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
-use crate::runtime::{PanicReason, Schedule, YieldReason};
+use crate::runtime::{PanicReason, Schedule, TaskOpts, YieldReason};
 use crate::sqe::IoError;
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
@@ -123,22 +123,19 @@ impl Schedule for Handle {
 }
 
 impl Handle {
-    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
+    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
         unimplemented!("TODO");
     }
 
-    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub(crate) fn spawn<F>(&self, future: F, task_opts: Option<TaskOpts>) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         let id = crate::task::Id::next();
 
-        let (task, notified, join_handle) = crate::task::new_task(future, None, self.clone(), id);
+        let (task, notified, join_handle) =
+            crate::task::new_task(future, task_opts, self.clone(), id);
 
         // TODO: insert task take ownership
         // debug_assert!(self.tasks.insert(task).is_none());

@@ -1,6 +1,5 @@
 use super::*;
 use crate as ringolo;
-use crate::context::{expect_local_scheduler, with_ring_mut, with_slab_and_ring_mut};
 use crate::future::opcodes::NopBuilder;
 use crate::runtime::waker::Wake;
 use crate::runtime::{Builder, Schedule, YieldReason};
@@ -129,9 +128,6 @@ fn test_local_scheduler_sq_ring_full_recovers() -> Result<()> {
     Ok(())
 }
 
-// TODO:
-// - spawn before `block_on` succeeds
-// - clean this mess
 #[test]
 fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
     let sq_ring_size = 8;
@@ -150,7 +146,7 @@ fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
     })?;
 
     assert!(matches!(res, Ok(0)));
-    // assert!(handle.is_finished());
+    assert!(handle.is_finished());
 
     for res in handle.get_result()? {
         assert!(res.is_ok());
@@ -162,186 +158,34 @@ fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
 
     Ok(())
 }
-//     let (waker, waker_data) = mock_waker();
 
-//     // Fill the ring
-//     {
-//         let mut sqes = build_batch(sq_ring_size);
-//         assert!(sqes.submit(&waker).is_ok());
-//         sqes.set_waker(&waker)?;
+#[test]
+fn test_local_scheduler_spawn_within_block_on() -> Result<()> {
+    let runtime = Builder::new_local().try_build()?;
 
-//         with_ring_mut(|ring| assert_eq!(ring.sq().len(), sq_ring_size));
+    let res = runtime.block_on(async {
+        let res = ringolo::spawn(async {
+            let batch = Sqe::new(build_batch(10));
+            let res = batch.await;
 
-//         // Adding one more SQE triggers PushError
-//         let mut sqe = SqeSingle::new(nop());
-//         assert!(matches!(sqe.submit(&waker), Err(IoError::SqRingFull)));
-//     }
+            assert!(res.is_ok());
+            for (_, res) in res.unwrap() {
+                assert!(res.is_ok());
+                assert_eq!(res.unwrap(), 0);
+            }
+        })
+        .await;
 
-//     with_scheduler!(|s| {
-//         s.block_on(async {
-//             let fut = Sqe::new(SqeSingle::new(nop()));
-//             let res = fut.await;
+        assert!(res.is_ok());
 
-//             assert!(res.is_ok());
-//             let (_, res) = res.unwrap();
+        with_scheduler!(|s| {
+            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
+            assert_eq!(spawn_calls.len(), 1);
+        });
 
-//             assert!(res.is_ok());
-//             assert_eq!(res.unwrap(), 0);
-//         })
-//     });
+        42
+    });
 
-//     with_slab_and_ring_mut(|slab, ring| {
-//         assert_eq!(ring.sq().len(), 0);
-//         // assert_eq!(slab.pending_ios, 0);
-//         assert_eq!(slab.len(), 0);
-//     });
-
-//     assert_eq!(waker_data.get_count(), 1);
-
-//     expect_local_scheduler(|_ctx, scheduler| {
-//         let yield_calls = scheduler.tracker.get_calls(&Method::YieldNow);
-//         assert_eq!(yield_calls.len(), 1);
-//         assert!(matches!(
-//             yield_calls[0],
-//             Call::YieldNow {
-//                 reason: YieldReason::SqRingFull
-//             }
-//         ));
-//     });
-
-//     Ok(())
-// }
-
-// #[test]
-// fn test_local_scheduler_spawn() -> Result<()> {
-//     let runtime = Builder::new_local().try_build()?;
-
-//     // Spawning before `block_on` is allowed, just enqueues the task.
-//     let handle = runtime.spawn(async {
-//         // Sync future is allowed.
-//         assert!(true);
-//         42
-//     });
-
-//     let res = runtime.block_on(async {
-//         let res = ringolo::spawn(async {
-//             let batch = Sqe::new(build_batch(10));
-//             let res = batch.await;
-
-//             assert!(res.is_ok());
-//             for (_, res) in res.unwrap() {
-//                 assert!(res.is_ok());
-//                 assert_eq!(res.unwrap(), 0);
-//             }
-//         })
-//         .await;
-
-//         assert!(res.is_ok());
-
-//         with_scheduler!(|s| {
-//             let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-//             assert_eq!(spawn_calls.len(), 2);
-//         });
-
-//         42
-//     });
-
-//     assert_eq!(res, 42);
-//     assert!(handle.is_finished());
-//     Ok(())
-// }
-
-// #[test]
-// fn test_local_scheduler_sq_ring_full_triggers_yield_now() -> Result<()> {
-//     let sq_ring_size = 8;
-//     let runtime = Builder::new_local().sq_ring_size(sq_ring_size);
-//     init_local_runtime_and_context(Some(runtime))?;
-
-//     let (waker, waker_data) = mock_waker();
-
-//     // Fill the ring
-//     {
-//         let mut sqes = build_batch(sq_ring_size);
-//         assert!(sqes.submit(&waker).is_ok());
-//         sqes.set_waker(&waker)?;
-
-//         with_ring_mut(|ring| assert_eq!(ring.sq().len(), sq_ring_size));
-
-//         // Adding one more SQE triggers PushError
-//         let mut sqe = SqeSingle::new(nop());
-//         assert!(matches!(sqe.submit(&waker), Err(IoError::SqRingFull)));
-//     }
-
-//     with_scheduler!(|s| {
-//         s.block_on(async {
-//             let fut = Sqe::new(SqeSingle::new(nop()));
-//             let res = fut.await;
-
-//             assert!(res.is_ok());
-//             let (_, res) = res.unwrap();
-
-//             assert!(res.is_ok());
-//             assert_eq!(res.unwrap(), 0);
-//         })
-//     });
-
-//     with_slab_and_ring_mut(|slab, ring| {
-//         assert_eq!(ring.sq().len(), 0);
-//         // assert_eq!(slab.pending_ios, 0);
-//         assert_eq!(slab.len(), 0);
-//     });
-
-//     assert_eq!(waker_data.get_count(), 1);
-
-//     expect_local_scheduler(|_ctx, scheduler| {
-//         let yield_calls = scheduler.tracker.get_calls(&Method::YieldNow);
-//         assert_eq!(yield_calls.len(), 1);
-//         assert!(matches!(
-//             yield_calls[0],
-//             Call::YieldNow {
-//                 reason: YieldReason::SqRingFull
-//             }
-//         ));
-//     });
-
-//     Ok(())
-// }
-
-// #[test]
-// fn test_local_scheduler_spawn() -> Result<()> {
-//     let runtime = Builder::new_local().try_build()?;
-
-//     // Spawning before `block_on` is allowed, just enqueues the task.
-//     let handle = runtime.spawn(async {
-//         // Sync future is allowed.
-//         assert!(true);
-//         42
-//     });
-
-//     let res = runtime.block_on(async {
-//         let res = ringolo::spawn(async {
-//             let batch = Sqe::new(build_batch(10));
-//             let res = batch.await;
-
-//             assert!(res.is_ok());
-//             for (_, res) in res.unwrap() {
-//                 assert!(res.is_ok());
-//                 assert_eq!(res.unwrap(), 0);
-//             }
-//         })
-//         .await;
-
-//         assert!(res.is_ok());
-
-//         with_scheduler!(|s| {
-//             let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-//             assert_eq!(spawn_calls.len(), 2);
-//         });
-
-//         42
-//     });
-
-//     assert_eq!(res, 42);
-//     assert!(handle.is_finished());
-//     Ok(())
-// }
+    assert_eq!(res, 42);
+    Ok(())
+}

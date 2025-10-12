@@ -307,12 +307,8 @@ impl Runtime {
         Runtime { scheduler }
     }
 
-    pub fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        ringolo::block_on(future)
+    pub fn block_on<F: Future>(&self, root_fut: F) -> F::Output {
+        ringolo::block_on(root_fut)
     }
 
     /// Spawn a future onto the runtime.

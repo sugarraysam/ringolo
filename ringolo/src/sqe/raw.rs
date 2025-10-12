@@ -203,6 +203,12 @@ impl RawSqe {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
+        dbg!(
+            "on_completion called with res: {}, flags: {:?}",
+            cqe_res,
+            cqe_flags
+        );
+
         let cqe_res: Result<i32> = if cqe_res >= 0 {
             Ok(cqe_res)
         } else {
@@ -243,8 +249,8 @@ impl RawSqe {
 
                 let done = match completion {
                     StreamCompletion::ByCount { remaining } => {
-                        let prev = remaining.fetch_sub(1, Ordering::Relaxed) - 1;
-                        prev == 0
+                        let prev = remaining.fetch_sub(1, Ordering::Relaxed);
+                        prev - 1 == 0
                     }
                     StreamCompletion::ByFlag { done } => {
                         // If we have the `IORING_CQE_F_MORE` flags set, it means we are

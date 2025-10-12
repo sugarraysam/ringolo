@@ -107,22 +107,14 @@ impl Schedule for Handle {
     fn yield_now(&self, waker: &Waker, reason: YieldReason) {
         self.track(Method::YieldNow, Call::YieldNow { reason });
         match reason {
-            YieldReason::SqRingFull => {
-                if let Err(e) = with_core_mut(|core| core.submit_no_wait()) {
-                    panic!(
-                        "FATAL: scheduler error. Unable to submit SQEs and retrying to submit failed again: {:?}",
-                        e
-                    );
-                }
-            }
-            YieldReason::SlabFull => {
+            YieldReason::SqRingFull | YieldReason::SlabFull => {
                 if let Err(e) = with_core_mut(|core| -> Result<usize> {
                     core.submit_and_wait(1, None)?;
                     core.process_cqes(None)
                 }) {
                     panic!(
-                        "FATAL: scheduler error. SlabFull and could not submit or process cqes: {:?}",
-                        e
+                        "FATAL: scheduler error: {:?}. Unable to submit or process cqes: {:?}",
+                        reason, e
                     );
                 }
             }
@@ -137,7 +129,9 @@ impl Schedule for Handle {
             // tasks and one for the root_future. We just checked that we are not
             // currently polling the root future.
             let task = unsafe { Notified::from_waker(waker) };
-            self.worker.add_task(task, AddMode::Fifo);
+
+            // Lifo to minimize scheduler latency.
+            self.worker.add_task(task, AddMode::Lifo);
         }
     }
 
@@ -162,31 +156,30 @@ impl Schedule for Handle {
 
 impl Handle {
     #[track_caller]
-    pub(crate) fn block_on<F>(&self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        match self.worker.event_loop(Some(future)) {
+    pub(crate) fn block_on<F: Future>(&self, root_fut: F) -> F::Output {
+        match self.worker.event_loop(Some(root_fut)) {
             Ok(res) => res,
             Err(e) => panic!("Failed to drive future to completion: {:?}", e),
         }
     }
 
-    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    pub(crate) fn spawn<F>(&self, future: F, task_opts: Option<TaskOpts>) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         self.track(Method::Spawn, Call::Spawn);
 
-        let (task, notified, join_handle) =
-            crate::task::new_task(future, Some(TaskOpts::STICKY), self.clone(), Id::next());
+        // All tasks are sticky on local scheduler.
+        let task_opts = task_opts.map(|opt| opt | TaskOpts::STICKY);
 
-        debug_assert!(self.tasks.insert(task).is_none());
+        let (task, notified, join_handle) =
+            crate::task::new_task(future, task_opts, self.clone(), Id::next());
+
+        let existed = self.tasks.insert(task);
+        debug_assert!(existed.is_none());
 
         self.schedule(true, notified);
-
         join_handle
     }
 }
