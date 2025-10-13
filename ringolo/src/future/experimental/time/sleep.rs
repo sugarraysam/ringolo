@@ -1,49 +1,40 @@
-use crate::future::opcodes::{Timeout, TimeoutBuilder};
-use anyhow::Result;
-use io_uring::types::Timespec;
-use pin_project_lite::pin_project;
+use crate::future::opcode::{Op, TimeoutOp};
+use pin_project::pin_project;
+use std::io;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-pin_project! {
-    pub struct Sleep {
-        #[pin]
-        inner: Timeout,
-    }
+#[pin_project]
+pub struct Sleep {
+    #[pin]
+    inner: Op<TimeoutOp>,
 }
 
 impl Sleep {
-    pub fn try_new(when: Duration) -> Result<Self> {
-        let timespec = Timespec::new()
-            .sec(when.as_secs())
-            .nsec(when.subsec_nanos());
-
-        Ok(Self {
-            inner: TimeoutBuilder::new(&timespec).build(),
-        })
+    pub fn new(when: Duration) -> Self {
+        Self {
+            inner: Op::new(TimeoutOp::new(when)),
+        }
     }
 }
 
 impl Future for Sleep {
-    type Output = ();
+    type Output = io::Result<()>;
 
     #[track_caller]
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
 
-        let res = ready!(this.inner.poll(cx));
-
-        if let Ok((_, res)) = &res {
-            match res {
-                Ok(_) => Poll::Ready(()),
-                // -62 ETIME is a success case as the kernel is telling us the
-                // timeout occurred and triggered the completion event.
-                Err(res) if res.raw_os_error() == Some(libc::ETIME) => Poll::Ready(()),
-                Err(e) => panic!("Unexpected sleep error: {:?}", e),
-            }
-        } else {
-            panic!("Unexpected sleep error: {:?}", res.unwrap_err());
+        match ready!(this.inner.poll(cx)) {
+            Ok(_) => Poll::Ready(Ok(())),
+            Err(e) if e.raw_os_error() == Some(libc::ETIME) => Poll::Ready(Ok(())),
+            Err(e) => Poll::Ready(Err(e)),
         }
     }
+}
+
+#[cfg(test)]
+mod tests {
+    // TODO: add tests
 }

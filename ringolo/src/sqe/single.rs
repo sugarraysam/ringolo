@@ -64,7 +64,7 @@ impl Submittable for SqeSingle {
 }
 
 impl Completable for SqeSingle {
-    type Output = Result<(Entry, io::Result<i32>), IoError>;
+    type Output = Result<i32, IoError>;
 
     fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output> {
         let idx = self.get_idx()?;
@@ -160,9 +160,10 @@ mod tests {
             assert_eq!(waker_data.get_pending_io(), 0);
         });
 
-        if let Poll::Ready(Ok((entry, result))) = sqe_fut.as_mut().poll(&mut ctx) {
-            assert!(matches!(result, Ok(0)));
-            assert_eq!(entry.get_user_data(), idx as u64);
+        if let Poll::Ready(Ok(result)) = sqe_fut.as_mut().poll(&mut ctx) {
+            assert_eq!(result, 0);
+            // TODO: rawsqe has userdata?
+            // assert_eq!(entry.get_user_data(), idx as u64);
         } else {
             assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
         }

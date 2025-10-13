@@ -14,7 +14,7 @@ use std::task::{Context, Poll, Waker};
 
 #[derive(Debug)]
 pub(crate) enum SqeStreamState {
-    Preparing { entry: Entry, count: Option<u32> },
+    Preparing { entry: Entry, count: u32 },
     Indexed { idx: usize },
     Submitted { idx: usize },
     Completed,
@@ -30,7 +30,7 @@ impl SqeStream {
     // If count is set, we will complete the stream after receiving `count` elements.
     // Otherwise, we will keep producing results as long as completions are posted
     // with the `IORING_CQE_F_MORE` flag.
-    pub fn try_new(entry: Entry, count: Option<u32>) -> io::Result<Self> {
+    pub fn try_new(entry: Entry, count: u32) -> io::Result<Self> {
         // TODO: add validation for opcode that can support `IORING_CQE_F_MORE`
         // waiting on PR :: opcode::ACCEPT | opcode::RECV | opcode::RECVMSG
         // entry.opcode()
@@ -105,7 +105,6 @@ impl Stream for SqeStream {
                         Ok(_) => {
                             // Submission successful, advance state and immediately
                             // try to poll for a result.
-                            dbg!("submitted");
                             this.state = SqeStreamState::Submitted {
                                 idx: this.get_idx()?,
                             };
@@ -148,23 +147,16 @@ impl Stream for SqeStream {
                             }
                         };
 
-                        dbg!("found raw sqe looking for next result : {:?}", &raw_sqe);
-
                         // It is the responsibility of the caller to cancel the
                         // stream if there is a bad result. We don't take responsibility
                         // for analyzing stream errors.
                         match raw_sqe.pop_next_result() {
-                            Ok(Some(result)) => {
-                                dbg!("got result from stream: {}", result);
-                                Poll::Ready(Some(Ok(result)))
-                            }
+                            Ok(Some(result)) => Poll::Ready(Some(Ok(result))),
                             Ok(None) => {
                                 if matches!(raw_sqe.get_state(), RawSqeState::Completed) {
-                                    dbg!("stream completed");
                                     this.state = SqeStreamState::Completed;
                                     Poll::Ready(None)
                                 } else {
-                                    dbg!("no result yet, pending");
                                     raw_sqe.set_waker(cx.waker());
                                     Poll::Pending
                                 }
@@ -227,7 +219,7 @@ mod tests {
             .count(count)
             .flags(TimeoutFlags::MULTISHOT);
 
-        let mut stream = pin!(SqeStream::try_new(timeout.build(), Some(count))?);
+        let mut stream = pin!(SqeStream::try_new(timeout.build(), count)?);
 
         let (waker, waker_data) = mock_waker();
         let mut ctx = Context::from_waker(&waker);

@@ -1,6 +1,6 @@
 use super::*;
 use crate as ringolo;
-use crate::future::opcodes::NopBuilder;
+use crate::future::opcode::builder::NopBuilder;
 use crate::runtime::waker::Wake;
 use crate::runtime::{Builder, Schedule, YieldReason};
 use crate::sqe::{IoError, Sqe, SqeCollection};
@@ -21,9 +21,6 @@ fn test_local_scheduler_single_nop() -> Result<()> {
         let res = fut.await;
 
         assert!(res.is_ok());
-        let (_, res) = res.unwrap();
-
-        assert!(res.is_ok());
         assert_eq!(res.unwrap(), 0);
         Ok(())
     })
@@ -37,7 +34,7 @@ fn test_local_scheduler_batch_of_nops() -> Result<()> {
         let res = batch.await;
 
         assert!(res.is_ok());
-        for (_, res) in res.unwrap() {
+        for res in res.unwrap() {
             assert!(res.is_ok());
             assert_eq!(res.unwrap(), 0);
         }
@@ -60,7 +57,7 @@ fn test_local_scheduler_chain_write_fsync_read_tempfile() -> Result<()> {
         expected
             .into_iter()
             .zip(res.unwrap())
-            .for_each(|(expected, (_entry, got))| {
+            .for_each(|(expected, got)| {
                 assert!(got.is_ok());
                 assert_eq!(expected, got.unwrap())
             });
@@ -106,7 +103,7 @@ fn test_local_scheduler_sq_ring_full_recovers() -> Result<()> {
 
     for res in results {
         assert!(res.is_ok());
-        for (_, res) in res.unwrap() {
+        for res in res.unwrap() {
             assert!(res.is_ok());
             assert_eq!(res.unwrap(), 0);
         }
@@ -140,17 +137,17 @@ fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
         batch.await
     });
 
-    let (_, res) = runtime.block_on(async move {
+    let res = runtime.block_on(async move {
         let sqe = NopBuilder::new().build();
         sqe.await
-    })?;
+    });
 
     assert!(matches!(res, Ok(0)));
     assert!(handle.is_finished());
 
     for res in handle.get_result()? {
         assert!(res.is_ok());
-        for (_, res) in res.unwrap() {
+        for res in res.unwrap() {
             assert!(res.is_ok());
             assert_eq!(res.unwrap(), 0);
         }
@@ -169,7 +166,7 @@ fn test_local_scheduler_spawn_within_block_on() -> Result<()> {
             let res = batch.await;
 
             assert!(res.is_ok());
-            for (_, res) in res.unwrap() {
+            for res in res.unwrap() {
                 assert!(res.is_ok());
                 assert_eq!(res.unwrap(), 0);
             }

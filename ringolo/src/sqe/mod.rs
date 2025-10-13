@@ -359,7 +359,7 @@ mod tests {
             for (got, expected) in results.iter().zip(expected_results) {
                 assert_eq!(got.len(), expected.len());
 
-                for ((_, io_result), expected) in got.iter().zip(expected) {
+                for (io_result, expected) in got.iter().zip(expected) {
                     match (io_result, expected) {
                         (Err(e1), Either::Right(e2)) => assert_eq!(e1.raw_os_error().unwrap(), e2),
                         (Ok(r1), Either::Left(r2)) => assert_eq!(*r1, r2),

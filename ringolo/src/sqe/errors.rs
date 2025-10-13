@@ -1,4 +1,4 @@
-use std::io;
+use std::io::{self, Error};
 
 use crate::runtime::{PanicReason, YieldReason};
 
@@ -70,6 +70,15 @@ impl PartialEq for IoError {
             (Self::SlabFull, Self::SlabFull) => true,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
             _ => false,
+        }
+    }
+}
+
+impl From<IoError> for io::Error {
+    fn from(e: IoError) -> Self {
+        match e {
+            IoError::Io(io_err) => io_err,
+            _ => Error::other(e.to_string()),
         }
     }
 }

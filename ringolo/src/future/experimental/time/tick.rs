@@ -1,10 +1,9 @@
 use crate as ringolo;
-use crate::sqe::{IoError, SqeStream};
-use anyhow::Result;
+use crate::future::opcode::{Multishot, TimeoutMultishot};
 use futures::Stream;
-use io_uring::opcode::Timeout;
-use io_uring::types::{CancelBuilder, TimeoutFlags, Timespec};
+use io_uring::types::CancelBuilder;
 use pin_project::{pin_project, pinned_drop};
+use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -12,31 +11,19 @@ use std::time::Duration;
 #[pin_project(PinnedDrop)]
 pub struct Tick {
     #[pin]
-    inner: SqeStream,
-
-    // TODO: we need to keep the Timespec alive as we pass an addr to the kernel.
-    // If we drop
-    timespec: Box<Timespec>,
+    inner: Multishot<TimeoutMultishot>,
 }
 
 impl Tick {
-    pub fn try_new(interval: Duration, count: Option<u32>) -> Result<Self> {
-        let timespec = Box::new(Timespec::from(interval));
-
-        let timeout = Timeout::new(&*timespec as *const Timespec)
-            .count(count.unwrap_or(0))
-            .flags(TimeoutFlags::MULTISHOT)
-            .build();
-
-        Ok(Self {
-            inner: SqeStream::try_new(timeout, count)?,
-            timespec,
-        })
+    pub fn new(interval: Duration, count: u32) -> Self {
+        Self {
+            inner: Multishot::new(TimeoutMultishot::new(interval, count)),
+        }
     }
 }
 
 impl Stream for Tick {
-    type Item = ();
+    type Item = io::Result<()>;
 
     #[track_caller]
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
@@ -44,20 +31,9 @@ impl Stream for Tick {
 
         let res = ready!(this.inner.poll_next(cx));
 
-        // Stream successfully completed.
-        if res.is_none() {
-            return Poll::Ready(None);
-        }
-
-        // Safety: we just checked for none
-        match res.unwrap() {
-            Ok(_) => Poll::Ready(Some(())),
-
-            // -62 ETIME is a success case as the kernel is telling us the
-            // timeout occurred and triggered the completion event.
-            Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Poll::Ready(Some(())),
-
-            Err(e) => panic!("Unexpected tick error: {:?}", e),
+        match res {
+            None => Poll::Ready(None),
+            Some(r) => Poll::Ready(Some(r)),
         }
     }
 }
@@ -92,14 +68,23 @@ mod tests {
     use crate as ringolo;
     use anyhow::Result;
     use futures::StreamExt;
+    use rstest::rstest;
     use std::time::Duration;
+
+    #[rstest]
+    #[case::single(Duration::from_millis(2), 1)]
+    #[case::three(Duration::from_millis(2), 3)]
+    #[case::five(Duration::from_millis(2), 5)]
+    #[ringolo::test]
+    async fn test_tick_with_count(#[case] interval: Duration, #[case] count: u32) -> Result<()> {
+        let tick = Tick::new(interval, count);
+        let ticks = tick.collect::<Vec<_>>().await;
+
+        assert!(ticks.iter().all(Result::is_ok));
+        assert_eq!(ticks.len() as u32, count);
+        Ok(())
+    }
 
     // TODO:
     // - test Cancelling scenarios
-    #[ringolo::test]
-    async fn test_tick_with_count() -> Result<()> {
-        let tick = Tick::try_new(Duration::from_nanos(1), Some(3))?;
-        assert_eq!(tick.collect::<Vec<_>>().await.len(), 3);
-        Ok(())
-    }
 }

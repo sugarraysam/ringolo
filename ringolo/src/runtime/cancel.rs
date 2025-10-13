@@ -1,6 +1,5 @@
-use crate::runtime::TaskOpts;
-use crate::with_scheduler;
-use crate::{context::with_slab_mut, future::opcodes::AsyncCancel2Builder, sqe::IoError};
+use crate::future::opcode::builder::AsyncCancel2Builder;
+use crate::{context::with_slab_mut, sqe::IoError};
 
 pub type CancelBuilder = io_uring::types::CancelBuilder;
 

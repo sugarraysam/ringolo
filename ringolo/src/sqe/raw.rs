@@ -18,8 +18,8 @@ pub(crate) enum StreamCompletion {
 }
 
 impl StreamCompletion {
-    pub(crate) fn new(count: Option<u32>) -> Self {
-        if let Some(count) = count {
+    pub(crate) fn new(count: u32) -> Self {
+        if count > 0 {
             StreamCompletion::ByCount {
                 remaining: Arc::new(AtomicU32::new(count)),
             }
@@ -78,7 +78,7 @@ impl CompletionHandler {
         }
     }
 
-    pub(crate) fn new_stream(count: Option<u32>) -> CompletionHandler {
+    pub(crate) fn new_stream(count: u32) -> CompletionHandler {
         CompletionHandler::Stream {
             results: VecDeque::new(),
             completion: StreamCompletion::new(count),
@@ -203,12 +203,6 @@ impl RawSqe {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        dbg!(
-            "on_completion called with res: {}, flags: {:?}",
-            cqe_res,
-            cqe_flags
-        );
-
         let cqe_res: Result<i32> = if cqe_res >= 0 {
             Ok(cqe_res)
         } else {
@@ -311,12 +305,12 @@ impl RawSqe {
         .into())
     }
 
-    pub(crate) fn take_final_result(&mut self) -> Result<(Entry, Result<i32>)> {
+    pub(crate) fn take_final_result(&mut self) -> Result<i32> {
         if !matches!(self.state, RawSqeState::Ready) {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        let entry = self.take_entry()?;
+        let _entry = self.take_entry()?;
         let result = match &mut self.handler {
             CompletionHandler::Single { result } => result.take(),
             CompletionHandler::BatchOrChain { result, .. } => result.take(),
@@ -333,8 +327,7 @@ impl RawSqe {
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "no result"))?;
 
         self.state = RawSqeState::Completed;
-
-        Ok((entry, result))
+        result
     }
 
     pub(crate) fn is_ready(&self) -> bool {
@@ -410,10 +403,11 @@ mod tests {
         );
 
         assert!(sqe.is_ready());
-        let (entry, got) = sqe.take_final_result()?;
+        let got = sqe.take_final_result();
+        // TODO: rawsqe has userdata?
+        // assert_eq!(entry.get_user_data(), user_data);
 
         // Result and entry consumed
-        assert_eq!(entry.get_user_data(), user_data);
         assert!(sqe.entry.is_none());
         assert!(matches!(sqe.state, RawSqeState::Completed));
 
