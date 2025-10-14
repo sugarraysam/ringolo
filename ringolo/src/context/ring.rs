@@ -1,17 +1,20 @@
 use anyhow::Result;
+use io_uring::squeue::Entry;
 use io_uring::types::{SubmitArgs, Timespec};
 use io_uring::{CompletionQueue, EnterFlags, IoUring, SubmissionQueue};
-use libc;
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
+
+use crate::context::RawSqeSlab;
+use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 
 pub(crate) struct SingleIssuerRing {
     ring: IoUring,
 }
 
 impl SingleIssuerRing {
-    pub(super) fn try_new(sq_ring_size: u32) -> Result<Self> {
+    pub(crate) fn try_new(sq_ring_size: u32) -> Result<Self> {
         let ring = IoUring::builder()
             // Keep submitting requests even if we encounter error. This is
             // important to reduce the number of syscall. We also want to produce
@@ -43,11 +46,35 @@ impl SingleIssuerRing {
         Ok(SingleIssuerRing { ring })
     }
 
-    pub(super) fn as_raw_fd(&self) -> RawFd {
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
         self.ring.as_raw_fd()
     }
 
-    pub(super) fn submit_and_wait(
+    pub(crate) fn sq(&mut self) -> SubmissionQueue<'_> {
+        self.ring.submission()
+    }
+
+    pub(crate) fn cq(&mut self) -> CompletionQueue<'_> {
+        self.ring.completion()
+    }
+
+    pub(crate) fn num_unsubmitted_sqes(&mut self) -> usize {
+        self.sq().len()
+    }
+
+    pub(crate) fn push(&mut self, entry: &Entry) -> Result<(), IoError> {
+        unsafe { self.sq().push(entry).map_err(IoError::from) }
+    }
+
+    pub(crate) fn push_batch(&mut self, entries: &[Entry]) -> Result<(), IoError> {
+        if entries.len() > self.sq().capacity() {
+            return Err(IoError::SqBatchTooLarge);
+        }
+
+        unsafe { self.sq().push_multiple(entries).map_err(IoError::from) }
+    }
+
+    pub(crate) fn submit_and_wait(
         &mut self,
         num_to_wait: usize,
         timeout: Option<Duration>,
@@ -68,7 +95,7 @@ impl SingleIssuerRing {
     /// Submit all pending SQ without the GETEVENTS flag. This is to prevent
     /// user/kernel transition where the application thread would have to process
     /// all of the queued `task_work` callbacks.
-    pub(super) fn submit_no_wait(&mut self) -> io::Result<usize> {
+    pub(crate) fn submit_no_wait(&mut self) -> io::Result<usize> {
         let to_submit = {
             let mut sq = self.sq();
             let to_submit = sq.len();
@@ -97,67 +124,115 @@ impl SingleIssuerRing {
 
     // Because we set IORING_SQ_TASKRUN flag, we have a shortcut to check if
     // we have pending completions.
-    pub(super) fn has_ready_cqes(&mut self) -> bool {
+    pub(crate) fn has_ready_cqes(&mut self) -> bool {
         self.sq().taskrun()
     }
 
-    pub(crate) fn sq(&mut self) -> SubmissionQueue<'_> {
-        self.ring.submission()
-    }
+    // Will busy loop until `num_to_complete` has been achieved. It is the caller's
+    // responsibility to make sure the CQ will see that many completions, otherwise
+    // this will result in an infinite loop.
+    pub(crate) fn process_cqes(
+        &mut self,
+        slab: &mut RawSqeSlab,
+        num_to_complete: Option<usize>,
+    ) -> Result<usize> {
+        let mut num_completed = 0;
+        let mut should_sync = false;
 
-    pub(crate) fn cq(&mut self) -> CompletionQueue<'_> {
-        self.ring.completion()
+        let to_complete = num_to_complete.unwrap_or(self.cq().len());
+
+        while num_completed < to_complete {
+            let mut cq = self.cq();
+
+            // Avoid syncing on first pass
+            if should_sync {
+                cq.sync();
+            }
+
+            for cqe in cq {
+                let raw_sqe = match slab.get_mut(cqe.user_data() as usize) {
+                    Err(e) => {
+                        eprintln!("CQE user data not found in RawSqeSlab: {:?}", e);
+                        continue;
+                    }
+                    Ok(sqe) => {
+                        // Ignore unknown CQEs which might have valid index in
+                        // the Slab. Can this even happen?
+                        if !matches!(sqe.get_state(), RawSqeState::Pending | RawSqeState::Ready) {
+                            continue;
+                        }
+                        sqe
+                    }
+                };
+
+                let cqe_flags = match cqe.flags() {
+                    0 => None,
+                    flags => Some(flags),
+                };
+
+                num_completed += 1;
+
+                for effect in raw_sqe.on_completion(cqe.result(), cqe_flags)? {
+                    match effect {
+                        CompletionEffect::DecrementPendingIo => slab.pending_ios -= 1,
+                        CompletionEffect::WakeHead { head } => slab.get_mut(head)?.wake()?,
+                    }
+                }
+            }
+
+            should_sync = true;
+        }
+
+        Ok(num_completed)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::with_core_mut;
-    // use crate::future::opcode::builder::TimeoutBuilder;
+    use crate::context::with_slab_and_ring_mut;
+    use crate::future::opcode::{Op, TimeoutOp};
     use crate::runtime::Builder;
+    use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
     use crate::sqe::{CompletionHandler, IoError, RawSqe};
     use crate::test_utils::*;
     use rstest::rstest;
+    use smallvec::SmallVec;
     use std::pin::pin;
     use std::task::{Context, Poll};
+    use tracing::Span;
 
     #[test]
-    #[ignore = "TODO: fix TimeoutBuilder opcode self-referential"]
     fn test_taskrun_flag() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        // let timespec = Timespec::from(Duration::from_millis(30));
+        let mut sqe_fut = pin!(Op::new(TimeoutOp::new(Duration::from_millis(2))));
+        let (waker, _) = mock_waker();
 
-        // let mut sqe_fut = pin!(TimeoutBuilder::new(&timespec).build());
-        // let (waker, _) = mock_waker();
+        let mut ctx = Context::from_waker(&waker);
+        assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
 
-        // let mut ctx = Context::from_waker(&waker);
-        // assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
+        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+            assert!(!ring.has_ready_cqes());
 
-        // with_core_mut(|core| -> Result<()> {
-        //     assert!(!core.has_ready_cqes());
+            // Submit without GETEVENTS flag.
+            ring.submit_no_wait()?;
 
-        //     // Submit without GETEVENTS flag.
-        //     core.submit_no_wait()?;
+            // Wait for first IO to be ready, and first `task_work` callback to
+            // be queued.
+            while !ring.has_ready_cqes() {}
+            assert!(ring.has_ready_cqes());
 
-        //     // Wait for first IO to be ready, and first `task_work` callback to
-        //     // be queued.
-        //     while !core.has_ready_cqes() {}
-        //     assert!(core.has_ready_cqes());
+            ring.submit_and_wait(1, None)?;
+            assert_eq!(ring.process_cqes(slab, Some(1))?, 1);
 
-        //     core.submit_and_wait(1, None)?;
-        //     assert_eq!(core.process_cqes(Some(1))?, 1);
+            Ok(())
+        })?;
 
-        //     Ok(())
-        // })?;
-
-        // match sqe_fut.as_mut().poll(&mut ctx) {
-        //     Poll::Ready(Ok((_, Err(e)))) => {
-        //         assert_eq!(e.raw_os_error().unwrap(), libc::ETIME);
-        //     }
-        //     _ => assert!(false, "unexpected poll result"),
-        // }
+        assert!(matches!(
+            sqe_fut.as_mut().poll(&mut ctx),
+            Poll::Ready(Ok(_))
+        ));
 
         Ok(())
     }
@@ -170,38 +245,40 @@ mod tests {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
         init_local_runtime_and_context(Some(builder))?;
 
-        with_core_mut(|core| -> Result<()> {
+        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {
-                let sq = core.ring.get_mut().sq();
+                let sq = ring.sq();
                 assert_eq!(sq.len(), 0);
                 assert_eq!(sq.capacity(), sq_ring_size);
             }
 
-            let nops = {
-                let mut slab = core.slab.borrow_mut();
-
-                (0..n)
-                    .map(|_| {
-                        let raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
-                        slab.insert(raw_sqe)
-                            .map(|(idx, _)| idx)
-                            .map_err(IoError::into)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            }?;
-
-            core.push_sqes(nops.iter())?;
+            let mut nops: SmallVec<[Entry; SPILL_TO_HEAP_THRESHOLD]> = SmallVec::with_capacity(n);
+            let mut raws: SmallVec<[RawSqe; SPILL_TO_HEAP_THRESHOLD]> = SmallVec::with_capacity(n);
 
             {
-                let sq = core.ring.get_mut().sq();
+                let batch = slab.reserve_batch(n)?;
+                let indices = batch.keys();
+
+                (0..n).for_each(|i| {
+                    nops.push(nop().user_data(indices[i] as u64));
+                    raws.push(RawSqe::new(CompletionHandler::new_single()));
+                });
+
+                batch.commit(raws);
+            };
+
+            ring.push_batch(&nops)?;
+
+            {
+                let sq = ring.sq();
                 assert_eq!(sq.len(), n);
                 assert_eq!(sq.capacity(), sq_ring_size);
             }
 
-            core.submit_and_wait(n, None)?;
+            ring.submit_and_wait(n, None)?;
 
             {
-                let sq = core.ring.get_mut().sq();
+                let sq = ring.sq();
                 assert_eq!(sq.len(), 0);
                 assert_eq!(sq.capacity(), sq_ring_size);
             }
@@ -218,49 +295,51 @@ mod tests {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
         init_local_runtime_and_context(Some(builder))?;
 
-        with_core_mut(|core| -> Result<()> {
+        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {
-                let cq = core.ring.get_mut().cq();
+                let cq = ring.cq();
                 assert_eq!(cq.len(), 0);
                 assert_eq!(cq.capacity(), sq_ring_size * 2);
             }
 
             let (waker, waker_data) = mock_waker();
 
-            let nops = {
-                let mut slab = core.slab.borrow_mut();
+            let mut nops: SmallVec<[Entry; SPILL_TO_HEAP_THRESHOLD]> = SmallVec::with_capacity(n);
+            let mut raws: SmallVec<[RawSqe; SPILL_TO_HEAP_THRESHOLD]> = SmallVec::with_capacity(n);
 
-                (0..n)
-                    .map(|_| {
-                        let mut raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
-                        raw_sqe.set_waker(&waker);
-                        slab.insert(raw_sqe)
-                            .map(|(idx, _)| idx)
-                            .map_err(IoError::into)
-                    })
-                    .collect::<Result<Vec<_>>>()
-            }?;
+            {
+                let batch = slab.reserve_batch(n)?;
+                let indices = batch.keys();
 
-            core.push_sqes(nops.iter())?;
-            core.submit_no_wait()?;
+                (0..n).for_each(|i| {
+                    let nop = nop().user_data(indices[i] as u64);
+
+                    let mut raw = RawSqe::new(CompletionHandler::new_single());
+                    raw.set_waker(&waker);
+
+                    nops.push(nop);
+                    raws.push(raw);
+                });
+
+                batch.commit(raws);
+            };
+
+            ring.push_batch(&nops)?;
+            ring.submit_no_wait()?;
 
             // Busy loop and ensure len of cq ring monotonically increases until n.
             // We want to guaranted there is no need to call "cq.sync()" to see
             // # of ready_cqes increase.
             {
-                let cq = core.ring.get_mut().cq();
+                let cq = ring.cq();
                 while cq.len() != n {}
                 assert_eq!(cq.len(), n);
             }
 
             // Should process all ready cqes from iterator.
-            core.process_cqes(None)?;
+            ring.process_cqes(slab, None)?;
             assert_eq!(waker_data.get_count(), n);
-
-            {
-                let cq = core.ring.get_mut().cq();
-                assert_eq!(cq.len(), 0);
-            }
+            assert_eq!(ring.cq().len(), 0);
 
             Ok(())
         })

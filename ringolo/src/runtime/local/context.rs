@@ -73,8 +73,8 @@ impl Context {
         F: FnOnce(&SingleIssuerRing) -> R,
     {
         let core = self.core.borrow();
-        let slab = core.ring.borrow();
-        f(&slab)
+        let ring = core.ring.borrow();
+        f(&ring)
     }
 
     #[inline(always)]
@@ -83,7 +83,18 @@ impl Context {
         F: FnOnce(&mut SingleIssuerRing) -> R,
     {
         let core = self.core.borrow();
-        let mut slab = core.ring.borrow_mut();
-        f(&mut slab)
+        let mut ring = core.ring.borrow_mut();
+        f(&mut ring)
+    }
+
+    #[inline(always)]
+    pub(crate) fn with_slab_and_ring_mut<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&mut RawSqeSlab, &mut SingleIssuerRing) -> R,
+    {
+        let core = self.core.borrow();
+        let mut slab = core.slab.borrow_mut();
+        let mut ring = core.ring.borrow_mut();
+        f(&mut slab, &mut ring)
     }
 }

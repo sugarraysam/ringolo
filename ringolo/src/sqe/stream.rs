@@ -1,4 +1,4 @@
-use crate::context::{with_core_mut, with_slab_mut};
+use crate::context::{with_slab_and_ring_mut, with_slab_mut};
 use crate::runtime::Schedule;
 use crate::sqe::{
     CompletionHandler, IoError, RawSqe, RawSqeState, Submittable, increment_pending_io,
@@ -7,49 +7,43 @@ use crate::with_scheduler;
 use anyhow::anyhow;
 use futures::Stream;
 use io_uring::squeue::Entry;
-use std::io;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll, Waker};
 
 #[derive(Debug)]
 pub(crate) enum SqeStreamState {
-    Preparing { entry: Entry, count: u32 },
-    Indexed { idx: usize },
+    Unsubmitted { entry: Entry, count: u32 },
     Submitted { idx: usize },
     Completed,
     Cancelled,
 }
 
 #[derive(Debug)]
-pub struct SqeStream {
+pub(crate) struct SqeStream {
     state: SqeStreamState,
 }
 
 impl SqeStream {
-    // If count is set, we will complete the stream after receiving `count` elements.
-    // Otherwise, we will keep producing results as long as completions are posted
-    // with the `IORING_CQE_F_MORE` flag.
-    pub fn try_new(entry: Entry, count: u32) -> io::Result<Self> {
-        // TODO: add validation for opcode that can support `IORING_CQE_F_MORE`
-        // waiting on PR :: opcode::ACCEPT | opcode::RECV | opcode::RECVMSG
-        // entry.opcode()
-        //
-        // Which SQE flags to set?
-
-        Ok(Self {
-            state: SqeStreamState::Preparing { entry, count },
-        })
+    /// Create a new multi-shot stream SQE. It is the user responsibility to pass
+    /// a properly constructed entry that does support multi-shot completions.
+    /// If count is set, we will complete the stream after receiving `count` elements.
+    /// Otherwise, we will keep producing results as long as completions are posted
+    /// with the `IORING_CQE_F_MORE` flag.
+    pub(crate) fn new(entry: Entry, count: u32) -> Self {
+        Self {
+            state: SqeStreamState::Unsubmitted { entry, count },
+        }
     }
 
     pub(crate) fn get_idx(&self) -> Result<usize, IoError> {
         match self.state {
-            SqeStreamState::Indexed { idx } | SqeStreamState::Submitted { idx } => Ok(idx),
+            SqeStreamState::Submitted { idx } => Ok(idx),
             _ => Err(anyhow!("unexpected sqe stream state: {:?}", self.state).into()),
         }
     }
 
-    pub(crate) fn cancel(mut self: Pin<&mut Self>) -> Option<usize> {
+    pub(crate) fn cancel(&mut self) -> Option<usize> {
         let old = mem::replace(&mut self.state, SqeStreamState::Cancelled);
         match old {
             SqeStreamState::Submitted { idx } => Some(idx),
@@ -59,35 +53,35 @@ impl SqeStream {
 }
 
 impl Submittable for SqeStream {
-    fn submit(&mut self, waker: &Waker) -> Result<i32, IoError> {
-        // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
-        // and only insert the entry in the slab once.
-        if let SqeStreamState::Preparing { entry, count } = &mut self.state {
-            // We run `pre_push_validation` to make the submission *atomic*. This is
-            // because we must ensure that entries are added to both the ring and the slab
-            // to avoid corrupted state.
-            with_core_mut(|core| core.pre_push_validation(1))?;
+    /// Submit is a two-step process to avoid corrupted state. Slab and Ring are
+    /// interconnected so we use a reservation API on the slab and only commit
+    /// once we have successfully pushed to the ring. This enables safe retries
+    /// and avoids corrupted state.
+    fn submit(&mut self, waker: &Waker) -> Result<(), IoError> {
+        match &mut self.state {
+            SqeStreamState::Unsubmitted { entry, count } => with_slab_and_ring_mut(|slab, ring| {
+                let reserved = slab.reserve_entry()?;
+                let idx = reserved.key();
 
-            // Important: clone entry + count so we can retry if Slab is full.
-            let count = *count;
-            let entry = entry.clone();
-            let idx = with_slab_mut(|slab| {
-                slab.insert(RawSqe::new(entry, CompletionHandler::new_stream(count)))
-                    .map(|(idx, _)| idx)
-            })?;
+                entry.set_user_data(idx as u64);
+                ring.push(entry)?;
 
-            let _ = mem::replace(&mut self.state, SqeStreamState::Indexed { idx });
+                reserved.commit(RawSqe::new(CompletionHandler::new_stream(*count)));
+
+                Ok(idx)
+            }),
+            _ => {
+                return Err(anyhow!("SqeStream already submitted").into());
+            }
+        }
+        // On successful push, we can transition the state and increment the
+        // number of local pending IOs for this task.
+        .map(|idx| {
+            self.state = SqeStreamState::Submitted { idx };
             increment_pending_io(waker);
-        }
-
-        match &self.state {
-            SqeStreamState::Indexed { idx } => with_core_mut(|core| core.push_sqes([*idx].iter())),
-            _ => Err(anyhow!("SqeStream invalid state: expected state indexed").into()),
-        }
+        })
     }
 }
-
-impl Unpin for SqeStream {}
 
 // SqeStream does not implement `Completable` trait, as it does not represent a one-off result.
 // Instead, we implement `futures::Stream` interface, and will keep producing results to the
@@ -95,18 +89,17 @@ impl Unpin for SqeStream {}
 impl Stream for SqeStream {
     type Item = Result<i32, IoError>;
 
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match this.state {
-                SqeStreamState::Preparing { .. } | SqeStreamState::Indexed { .. } => {
-                    match this.submit(cx.waker()) {
+            match self.state {
+                SqeStreamState::Unsubmitted { .. } => {
+                    // TODO: return idx, much cleaner state transition
+                    match self.submit(cx.waker()) {
                         Ok(_) => {
                             // Submission successful, advance state and immediately
                             // try to poll for a result.
-                            this.state = SqeStreamState::Submitted {
-                                idx: this.get_idx()?,
+                            self.state = SqeStreamState::Submitted {
+                                idx: self.get_idx()?,
                             };
                             continue;
                         }
@@ -120,7 +113,7 @@ impl Stream for SqeStream {
                             return Poll::Pending;
                         }
                         Err(e) => {
-                            this.state = SqeStreamState::Completed;
+                            self.state = SqeStreamState::Completed;
 
                             if e.is_fatal() {
                                 with_scheduler!(|s| {
@@ -135,17 +128,7 @@ impl Stream for SqeStream {
                 }
                 SqeStreamState::Submitted { idx } => {
                     return with_slab_mut(|slab| -> Poll<Option<Self::Item>> {
-                        let raw_sqe = match slab.get_mut(idx) {
-                            Ok(sqe) => sqe,
-                            Err(e) => {
-                                this.state = SqeStreamState::Completed;
-                                return Poll::Ready(Some(Err(anyhow::anyhow!(
-                                    "can't find sqe in slab: {:?}",
-                                    e
-                                )
-                                .into())));
-                            }
-                        };
+                        let raw_sqe = slab.get_mut(idx)?;
 
                         // It is the responsibility of the caller to cancel the
                         // stream if there is a bad result. We don't take responsibility
@@ -154,7 +137,7 @@ impl Stream for SqeStream {
                             Ok(Some(result)) => Poll::Ready(Some(Ok(result))),
                             Ok(None) => {
                                 if matches!(raw_sqe.get_state(), RawSqeState::Completed) {
-                                    this.state = SqeStreamState::Completed;
+                                    self.state = SqeStreamState::Completed;
                                     Poll::Ready(None)
                                 } else {
                                     raw_sqe.set_waker(cx.waker());
@@ -219,7 +202,7 @@ mod tests {
             .count(count)
             .flags(TimeoutFlags::MULTISHOT);
 
-        let mut stream = pin!(SqeStream::try_new(timeout.build(), count)?);
+        let mut stream = pin!(SqeStream::new(timeout.build(), count));
 
         let (waker, waker_data) = mock_waker();
         let mut ctx = Context::from_waker(&waker);
@@ -236,7 +219,8 @@ mod tests {
         }
 
         let idx = stream.get_idx()?;
-        with_slab_and_ring_mut(|slab, ring| {
+
+        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             assert_eq!(ring.sq().len(), 1);
 
             let res = slab.get(idx).and_then(|sqe| {
@@ -251,9 +235,7 @@ mod tests {
             });
 
             assert!(res.is_ok());
-        });
 
-        with_core_mut(|core| -> Result<()> {
             // Because we use DEFER_TASKRUN, CQE are not automatically posted. Instead,
             // the kernel queues "task_work" everytime a timer fires. We have to
             // repeatedly enter the kernel with `io_uring_enter + GETEVENTS` to convert
@@ -261,10 +243,10 @@ mod tests {
             let mut num_awaiting = n;
             while num_awaiting > 0 {
                 // Submit our single SQE and wait for CQEs :: `io_uring_enter`
-                core.submit_and_wait(num_awaiting, None)?;
+                ring.submit_and_wait(num_awaiting, None)?;
 
                 // Wait for our timeouts to have completed N times
-                num_awaiting -= core.process_cqes(None)?;
+                num_awaiting -= ring.process_cqes(slab, None)?;
             }
 
             assert_eq!(num_awaiting, 0);
@@ -277,7 +259,7 @@ mod tests {
             if let CompletionHandler::Stream {
                 results,
                 completion,
-            } = &core.slab.borrow().get(idx)?.handler
+            } = &slab.get(idx)?.handler
             {
                 assert_eq!(results.len(), n);
                 assert!(!completion.has_more());

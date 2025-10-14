@@ -11,7 +11,7 @@ pub mod cancel;
 pub use cancel::{CancelBuilder, CancellationTask};
 
 pub mod runtime;
-pub use runtime::{Builder, Runtime};
+pub use runtime::Builder;
 
 // Exports
 pub(crate) mod local;
@@ -19,7 +19,7 @@ pub(crate) mod local;
 pub(crate) mod registry;
 pub(crate) use registry::OwnedTasks;
 
-pub(crate) use runtime::RuntimeConfig;
+pub(crate) use runtime::{RuntimeConfig, SPILL_TO_HEAP_THRESHOLD};
 
 pub(crate) mod stealing;
 

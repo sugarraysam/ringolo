@@ -1,5 +1,7 @@
 use std::io::{self, Error};
 
+use io_uring::squeue::PushError;
+
 use crate::runtime::{PanicReason, YieldReason};
 
 /// A centralized error type for all scheduler and runtime operations.
@@ -9,10 +11,7 @@ pub enum IoError {
     /// This is a specific, recoverable state where the application
     /// should reap completions before submitting more I/O.
     #[error("Submission queue ring is full, cannot submit IO")]
-    SqRingFull,
-
-    #[error("FATAL: SQ ring is in an invalid state")]
-    SqRingInvalidState,
+    SqRingFull(#[from] PushError),
 
     #[error("FATAL: SQ entry batch too large to fit in the SQ ring")]
     SqBatchTooLarge,
@@ -36,19 +35,16 @@ pub enum IoError {
 
 impl IoError {
     pub fn is_retryable(&self) -> bool {
-        matches!(self, IoError::SqRingFull | IoError::SlabFull)
+        matches!(self, IoError::SqRingFull { .. } | IoError::SlabFull)
     }
 
     pub fn is_fatal(&self) -> bool {
-        matches!(
-            self,
-            IoError::SlabInvalidState | IoError::SqRingInvalidState
-        )
+        matches!(self, IoError::SlabInvalidState)
     }
 
     pub(crate) fn as_yield_reason(&self) -> YieldReason {
         match self {
-            IoError::SqRingFull => YieldReason::SqRingFull,
+            IoError::SqRingFull { .. } => YieldReason::SqRingFull,
             IoError::SlabFull => YieldReason::SlabFull,
             _ => YieldReason::Unknown,
         }
@@ -57,7 +53,6 @@ impl IoError {
     pub(crate) fn as_panic_reason(&self) -> PanicReason {
         match self {
             IoError::SlabInvalidState => PanicReason::SlabInvalidState,
-            IoError::SqRingInvalidState => PanicReason::SqRingInvalidState,
             _ => PanicReason::Unknown,
         }
     }
@@ -66,7 +61,7 @@ impl IoError {
 impl PartialEq for IoError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::SqRingFull, Self::SqRingFull) => true,
+            (Self::SqRingFull { .. }, Self::SqRingFull { .. }) => true,
             (Self::SlabFull, Self::SlabFull) => true,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
             _ => false,

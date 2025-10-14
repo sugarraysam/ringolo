@@ -20,7 +20,7 @@ dashmap = "~6.1.0"
 either = "~1.15.0"
 futures = "~0.3.31"
 # io-uring = "^0.7.10"
-io-uring = { git = "https://github.com/sugarraysam/io-uring.git", branch = "origin/expose-enter-flags" }
+io-uring = { version = "0.7.10", path = "../../io-uring" }
 libc = { version = "~0.2.98", default-features = false }
 paste = "~1.0.15"
 pin-project = "~1.1.10"

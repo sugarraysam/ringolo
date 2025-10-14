@@ -39,7 +39,7 @@ mod parse;
 ///
 /// To use the task stealing runtime, the macro can be configured using
 ///
-/// ```
+/// ```no_run
 /// #[ringolo::main(flavor = "stealing", worker_threads = 10)]
 /// # async fn main() {}
 /// ```
@@ -64,7 +64,7 @@ mod parse;
 ///
 /// ## Using the stealing runtime (default runtime)
 ///
-/// ```rust
+/// ```no_run
 /// #[ringolo::main]
 /// async fn main() {
 ///     println!("Hello world");
@@ -73,7 +73,7 @@ mod parse;
 ///
 /// Equivalent code not using `#[ringolo::main]`
 ///
-/// ```rust
+/// ```no_run
 /// fn main() {
 ///     ringolo::runtime::Builder::new_stealing()
 ///         .try_build()
@@ -108,7 +108,7 @@ mod parse;
 ///
 /// ## Set number of worker threads
 ///
-/// ```rust
+/// ```no_run
 /// #[ringolo::main(worker_threads = 2)]
 /// async fn main() {
 ///     println!("Hello world");
@@ -117,7 +117,7 @@ mod parse;
 ///
 /// Equivalent code not using `#[ringolo::main]`
 ///
-/// ```rust
+/// ```no_run
 /// fn main() {
 ///     ringolo::runtime::Builder::new_stealing()
 ///         .worker_threads(2)

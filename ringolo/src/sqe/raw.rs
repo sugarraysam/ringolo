@@ -1,4 +1,3 @@
-use io_uring::squeue::Entry;
 use smallvec::{SmallVec, smallvec};
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
@@ -9,115 +8,7 @@ use std::task::Waker;
 use crate::sqe::IoError;
 
 #[derive(Debug)]
-pub(crate) enum StreamCompletion {
-    // The operation completes after a known number of events (e.g., `Timeout`).
-    ByCount { remaining: Arc<AtomicU32> },
-
-    // The operation completes when a CQE arrives without the `IORING_CQE_F_MORE` flag.
-    ByFlag { done: bool },
-}
-
-impl StreamCompletion {
-    pub(crate) fn new(count: u32) -> Self {
-        if count > 0 {
-            StreamCompletion::ByCount {
-                remaining: Arc::new(AtomicU32::new(count)),
-            }
-        } else {
-            StreamCompletion::ByFlag { done: false }
-        }
-    }
-
-    pub(crate) fn has_more(&self) -> bool {
-        match self {
-            StreamCompletion::ByCount { remaining } => remaining.load(Ordering::Relaxed) > 0,
-            StreamCompletion::ByFlag { done } => !*done,
-        }
-    }
-}
-
-// Enum to hold the data that is different for each completion type. RawSqe is
-// responsible to implement the logic.
-#[derive(Debug)]
-pub(crate) enum CompletionHandler {
-    Single {
-        result: Option<Result<i32>>,
-    },
-    BatchOrChain {
-        result: Option<Result<i32>>,
-
-        // Waker only set on the head, so we store a pointer to the head SQE.
-        head: usize,
-
-        // Reference counted counter to track how many SQEs are still pending.
-        remaining: Arc<AtomicUsize>,
-    },
-    Stream {
-        // We use the SqeStreamError to be able to distinguish between an IO
-        // error or an application error.
-        results: VecDeque<anyhow::Result<i32, IoError>>,
-
-        completion: StreamCompletion,
-    },
-    Message,
-}
-
-impl CompletionHandler {
-    pub(crate) fn new_single() -> CompletionHandler {
-        CompletionHandler::Single { result: None }
-    }
-
-    pub(crate) fn new_batch_or_chain(
-        head: usize,
-        remaining: Arc<AtomicUsize>,
-    ) -> CompletionHandler {
-        CompletionHandler::BatchOrChain {
-            head,
-            remaining,
-            result: None,
-        }
-    }
-
-    pub(crate) fn new_stream(count: u32) -> CompletionHandler {
-        CompletionHandler::Stream {
-            results: VecDeque::new(),
-            completion: StreamCompletion::new(count),
-        }
-    }
-
-    pub(crate) fn new_message() -> CompletionHandler {
-        CompletionHandler::Message
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CompletionEffect {
-    // We use this fancy way to decrement pending IO on the slab mostly because
-    // of MULTISHOT, where 1 SQE can generate N CQEs. We are only allowed to decrement
-    // the pending IO counter after receiving the *last CQE* for this stream.
-    DecrementPendingIo,
-    WakeHead { head: usize },
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum RawSqeState {
-    // Up for grabs
-    Available,
-
-    // Waiting to be submitted and completed
-    Pending,
-
-    // At least one result is ready to be consumed
-    Ready,
-
-    // Operation is completed and all results were consumed.
-    Completed,
-}
-
-#[derive(Debug)]
 pub(crate) struct RawSqe {
-    pub(crate) entry: Option<Entry>,
-
     pub(crate) waker: Option<Waker>,
 
     pub(crate) state: RawSqeState,
@@ -125,36 +16,31 @@ pub(crate) struct RawSqe {
     pub(crate) handler: CompletionHandler,
 }
 
-impl RawSqe {
-    pub(crate) fn new(entry: Entry, handler: CompletionHandler) -> Self {
+impl Default for RawSqe {
+    fn default() -> Self {
         Self {
-            entry: Some(entry),
-            handler,
             waker: None,
-            state: RawSqeState::Available,
+            state: RawSqeState::Pending,
+            handler: CompletionHandler::new_single(),
         }
     }
+}
 
-    pub(crate) fn get_entry(&self) -> Result<&Entry> {
-        self.entry
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "entry is none"))
-    }
-
-    pub(crate) fn take_entry(&mut self) -> Result<Entry> {
-        self.entry
-            .take()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "entry is none"))
-    }
-
-    pub(crate) fn set_available(&mut self) {
-        self.state = RawSqeState::Available;
+impl RawSqe {
+    pub(crate) fn new(handler: CompletionHandler) -> Self {
+        Self {
+            handler,
+            waker: None,
+            state: RawSqeState::Pending,
+        }
     }
 
     pub(crate) fn get_state(&self) -> RawSqeState {
         self.state
     }
 
+    // Used in tests.
+    #[allow(unused)]
     pub(crate) fn has_waker(&self) -> bool {
         self.waker.is_some()
     }
@@ -181,17 +67,6 @@ impl RawSqe {
         self.waker
             .take()
             .ok_or_else(|| Error::new(ErrorKind::NotFound, "take_waker failed: waker is none"))
-    }
-
-    pub(crate) fn set_user_data(&mut self, user_data: u64) -> Result<()> {
-        if !matches!(self.state, RawSqeState::Available) {
-            return Err(Error::other(format!("unexpected state: {:?}", self.state)));
-        }
-
-        self.state = RawSqeState::Pending;
-        self.entry = Some(self.take_entry()?.user_data(user_data));
-
-        Ok(())
     }
 
     pub(crate) fn on_completion(
@@ -265,9 +140,6 @@ impl RawSqe {
                     Ok(smallvec![])
                 }
             }
-            CompletionHandler::Message => {
-                unimplemented!("RingMessage are not yet implemented.")
-            }
         }
     }
 
@@ -310,7 +182,6 @@ impl RawSqe {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        let _entry = self.take_entry()?;
         let result = match &mut self.handler {
             CompletionHandler::Single { result } => result.take(),
             CompletionHandler::BatchOrChain { result, .. } => result.take(),
@@ -348,6 +219,107 @@ impl RawSqe {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum StreamCompletion {
+    // The operation completes after a known number of events (e.g., `Timeout`).
+    ByCount { remaining: Arc<AtomicU32> },
+
+    // The operation completes when a CQE arrives without the `IORING_CQE_F_MORE` flag.
+    ByFlag { done: bool },
+}
+
+impl StreamCompletion {
+    pub(crate) fn new(count: u32) -> Self {
+        if count > 0 {
+            StreamCompletion::ByCount {
+                remaining: Arc::new(AtomicU32::new(count)),
+            }
+        } else {
+            StreamCompletion::ByFlag { done: false }
+        }
+    }
+
+    pub(crate) fn has_more(&self) -> bool {
+        match self {
+            StreamCompletion::ByCount { remaining } => remaining.load(Ordering::Relaxed) > 0,
+            StreamCompletion::ByFlag { done } => !*done,
+        }
+    }
+}
+
+// Enum to hold the data that is different for each completion type. RawSqe is
+// responsible to implement the logic.
+#[derive(Debug)]
+pub(crate) enum CompletionHandler {
+    Single {
+        result: Option<Result<i32>>,
+    },
+    BatchOrChain {
+        result: Option<Result<i32>>,
+
+        // Waker only set on the head, so we store a pointer to the head SQE.
+        head: usize,
+
+        // Reference counted counter to track how many SQEs are still pending.
+        remaining: Arc<AtomicUsize>,
+    },
+    Stream {
+        // We use the SqeStreamError to be able to distinguish between an IO
+        // error or an application error.
+        results: VecDeque<anyhow::Result<i32, IoError>>,
+
+        completion: StreamCompletion,
+    },
+}
+
+impl CompletionHandler {
+    pub(crate) fn new_single() -> CompletionHandler {
+        CompletionHandler::Single { result: None }
+    }
+
+    pub(crate) fn new_batch_or_chain(
+        head: usize,
+        remaining: Arc<AtomicUsize>,
+    ) -> CompletionHandler {
+        CompletionHandler::BatchOrChain {
+            head,
+            remaining,
+            result: None,
+        }
+    }
+
+    pub(crate) fn new_stream(count: u32) -> CompletionHandler {
+        CompletionHandler::Stream {
+            results: VecDeque::new(),
+            completion: StreamCompletion::new(count),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CompletionEffect {
+    // We use this fancy way to decrement pending IO on the slab mostly because
+    // of MULTISHOT, where 1 SQE can generate N CQEs. We are only allowed to decrement
+    // the pending IO counter after receiving the *last CQE* for this stream.
+    DecrementPendingIo,
+    WakeHead { head: usize },
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) enum RawSqeState {
+    // Up for grabs
+    Available,
+
+    // Waiting to be submitted and completed
+    Pending,
+
+    // At least one result is ready to be consumed
+    Ready,
+
+    // Operation is completed and all results were consumed.
+    Completed,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -360,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_raw_sqe_set_waker_logic() -> Result<()> {
-        let mut sqe = RawSqe::new(nop(), CompletionHandler::new_single());
+        let mut sqe = RawSqe::new(CompletionHandler::new_single());
 
         let (waker1, waker1_data) = mock_waker();
 
@@ -390,10 +362,7 @@ mod tests {
         #[case] expected: io::Result<i32>,
     ) -> Result<()> {
         init_local_runtime_and_context(None)?;
-        let user_data = 42;
-
-        let mut sqe = RawSqe::new(nop(), CompletionHandler::new_single());
-        sqe.set_user_data(user_data)?;
+        let mut sqe = RawSqe::new(CompletionHandler::new_single());
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
@@ -404,11 +373,8 @@ mod tests {
 
         assert!(sqe.is_ready());
         let got = sqe.take_final_result();
-        // TODO: rawsqe has userdata?
-        // assert_eq!(entry.get_user_data(), user_data);
 
         // Result and entry consumed
-        assert!(sqe.entry.is_none());
         assert!(matches!(sqe.state, RawSqeState::Completed));
 
         // result matches
@@ -433,79 +399,69 @@ mod tests {
         #[case] n_sqes: usize,
     ) -> Result<()> {
         init_local_runtime_and_context(None)?;
-        let user_data = 12345;
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
 
-        let head_idx = with_slab_mut(|slab| -> Result<usize> {
-            let vacant = slab.vacant_entry()?;
-            let head_idx = vacant.key();
+        with_slab_mut(|slab| -> Result<()> {
+            let batch = slab.reserve_batch(n_sqes)?;
+            let indices = batch.keys();
+            let head_idx = indices[0];
 
-            let mut head = RawSqe::new(
-                nop(),
-                CompletionHandler::new_batch_or_chain(head_idx, Arc::clone(&remaining)),
-            );
-            head.set_user_data(user_data)?;
+            let entries = (0..n_sqes)
+                .map(|_| {
+                    let raw = RawSqe::new(CompletionHandler::new_batch_or_chain(
+                        head_idx,
+                        Arc::clone(&remaining),
+                    ));
+                    Ok(raw)
+                })
+                .collect::<Result<SmallVec<_>>>()?;
 
-            // Not woken up yet, we have `n_sqes - 1` remaining
-            assert_eq!(
-                *head.on_completion(res, None)?,
-                [CompletionEffect::DecrementPendingIo]
-            );
+            batch.commit(entries);
 
-            vacant.insert(head);
+            for i in (0..n_sqes) {
+                let raw = slab.get_mut(indices[i])?;
+                let effects = raw.on_completion(res, None)?;
 
-            Ok(head_idx)
-        })?;
-
-        while remaining.load(Ordering::Relaxed) > 0 {
-            let mut sqe = RawSqe::new(
-                nop(),
-                CompletionHandler::new_batch_or_chain(head_idx, Arc::clone(&remaining)),
-            );
-            sqe.set_user_data(user_data)?;
-
-            let effects = sqe.on_completion(res, None)?;
-
-            // Last SQE to complete triggers completion
-            if remaining.load(Ordering::Relaxed) == 0 {
-                assert!(matches!(effects[0], CompletionEffect::DecrementPendingIo));
-                assert!(matches!(effects[1], CompletionEffect::WakeHead { .. }));
-            } else {
-                assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
+                // Last SQE to complete triggers completion
+                if i == n_sqes - 1 {
+                    assert!(matches!(effects[0], CompletionEffect::DecrementPendingIo));
+                    assert!(matches!(effects[1], CompletionEffect::WakeHead { .. }));
+                } else {
+                    assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
+                }
             }
-        }
 
-        Ok(())
+            assert_eq!(remaining.load(Ordering::Relaxed), 0);
+            Ok(())
+        })
     }
 
     #[test]
     fn test_raw_sqe_lifecycle() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        let raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
-        assert_eq!(raw_sqe.get_state(), RawSqeState::Available);
+        let raw = RawSqe::new(CompletionHandler::new_single());
+        assert_eq!(raw.get_state(), RawSqeState::Pending);
 
         with_slab_mut(|slab| -> Result<()> {
             let (waker, waker_data) = mock_waker();
 
-            let idx = slab.insert(raw_sqe).map(|(idx, inserted)| {
-                assert_eq!(inserted.get_state(), RawSqeState::Pending);
-                inserted.set_waker(&waker);
-
-                assert!(inserted.on_completion(0, None).is_ok());
-                assert_eq!(inserted.get_state(), RawSqeState::Ready);
-
-                assert_eq!(waker_data.get_count(), 1);
-
+            let idx = {
+                let reserved = slab.reserve_entry()?;
+                let idx = reserved.key();
+                reserved.commit(raw);
                 idx
-            })?;
+            };
 
-            let removed = slab.try_remove(idx);
-            assert!(
-                removed
-                    .map(|sqe| assert_eq!(sqe.get_state(), RawSqeState::Available))
-                    .is_some()
-            );
+            let inserted = slab.get_mut(idx).unwrap();
+            assert_eq!(inserted.get_state(), RawSqeState::Pending);
+
+            inserted.set_waker(&waker);
+            assert!(inserted.on_completion(0, None).is_ok());
+            assert_eq!(inserted.get_state(), RawSqeState::Ready);
+
+            assert_eq!(waker_data.get_count(), 1);
+            assert!(slab.try_remove(idx).is_some());
 
             Ok(())
         })

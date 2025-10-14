@@ -1,9 +1,7 @@
 use crate::future::opcode::{OpParams, OpPayload, parse};
 use crate::sqe::IoError;
 use anyhow::{Context, Result};
-use io_uring::types::{
-    Fd, TimeoutFlags, Timespec,
-};
+use io_uring::types::{Fd, TimeoutFlags, Timespec};
 use pin_project::pin_project;
 use std::io;
 use std::mem::MaybeUninit;
@@ -29,14 +27,14 @@ pub struct AcceptOp {
 }
 
 impl AcceptOp {
-    pub fn new(fd: RawFd, with_addr: bool) -> Self {
+    pub fn new(fd: &impl AsRawFd, with_addr: bool) -> Self {
         let mut addrlen = MaybeUninit::uninit();
         if with_addr {
             addrlen.write(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
         }
 
         Self {
-            fd,
+            fd: fd.as_raw_fd(),
             addr: MaybeUninit::uninit(),
             addrlen,
             flags: libc::SOCK_CLOEXEC,
@@ -148,7 +146,7 @@ impl OpPayload for TimeoutOp {
 
 // TODO:
 // - need call Socket + SetSockOpt
-// - replace in accept test, need a receiving socket, need to create a new socket !
+// - replace in accept test, need a receiving socket, need to create a new socket
 // - create connect chain
 #[pin_project]
 pub struct ConnectOp {
@@ -201,7 +199,7 @@ mod tests {
     #[ringolo::test]
     async fn test_accept() -> Result<()> {
         // (1) EBADF - test error does not trigger UB when reading addr
-        let op = Op::new(AcceptOp::new(42, true));
+        let op = Op::new(AcceptOp::new(&42, true));
         let res = op.await;
 
         assert!(res.is_err());
@@ -217,7 +215,7 @@ mod tests {
             Ok(())
         });
 
-        let op = Op::new(AcceptOp::new(listener_fd, true));
+        let op = Op::new(AcceptOp::new(&listener_fd, true));
         let res = op.await;
         assert!(res.is_ok());
 

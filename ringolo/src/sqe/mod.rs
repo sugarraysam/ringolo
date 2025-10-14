@@ -1,3 +1,6 @@
+#![allow(unused)]
+
+use crate::context::with_core;
 use crate::runtime::Schedule;
 use crate::task::Header;
 use crate::with_scheduler;
@@ -6,42 +9,35 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
-// Public API
-pub mod single;
-use crate::context::with_core;
-
-pub use self::single::SqeSingle;
-
-pub mod list;
-pub use self::list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
-
-pub mod stream;
-pub use self::stream::SqeStream;
-
 // Re-exports
 pub(crate) mod errors;
 pub(crate) use errors::IoError;
 
-// TODO: revive this module to impl RingMessage protocol
-// #[allow(dead_code)]
-// pub mod message;
+pub(crate) mod list;
+pub(crate) use self::list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
 
 pub(crate) mod raw;
 pub(crate) use self::raw::RawSqe;
 pub(crate) use self::raw::{CompletionEffect, CompletionHandler, RawSqeState};
 
-pub trait Submittable {
+pub(crate) mod single;
+pub(crate) use self::single::SqeSingle;
+
+pub(crate) mod stream;
+pub(crate) use self::stream::SqeStream;
+
+pub(crate) trait Submittable {
     /// We pas the waker so we get access to the RawTask Header.
-    fn submit(&mut self, waker: &Waker) -> Result<i32, IoError>;
+    fn submit(&mut self, waker: &Waker) -> Result<(), IoError>;
 }
 
-pub trait Completable {
+pub(crate) trait Completable {
     type Output;
 
     /// We pas the waker so we get access to the RawTask Header but also because
     /// implementation of completable needs to guarantee the associated task will
     /// be woken up in the future.
-    fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output>;
+    fn poll_complete(&mut self, waker: &Waker) -> Poll<Self::Output>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,32 +47,33 @@ pub(super) enum State {
     Completed,
 }
 
-pub struct Sqe<T: Submittable + Completable> {
+#[derive(Debug)]
+pub(crate) struct Sqe<T: Submittable + Completable + Unpin> {
     state: State,
+
     inner: T,
 }
 
-impl<T: Submittable + Completable> Sqe<T> {
-    pub fn new(inner: T) -> Self {
+impl<T: Submittable + Completable + Unpin> Sqe<T> {
+    pub(crate) fn new(inner: T) -> Self {
         Self {
             state: State::Initial,
             inner,
         }
     }
 
-    pub fn get(&self) -> &T {
+    pub(crate) fn get(&self) -> &T {
         &self.inner
     }
 
-    pub fn get_mut(&mut self) -> &mut T {
+    pub(crate) fn get_mut(&mut self) -> &mut T {
         &mut self.inner
     }
 }
 
-// TODO: remove this with `pin-project`?
-impl<T: Submittable + Completable> Unpin for Sqe<T> {}
-
-impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future for Sqe<T> {
+impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send> Future
+    for Sqe<T>
+{
     type Output = T::Output;
 
     #[track_caller]
@@ -134,7 +131,8 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
     }
 }
 
-pub struct SqeCollection<T: Submittable + Completable> {
+#[derive(Debug)]
+pub(crate) struct SqeCollection<T: Submittable + Completable + Unpin> {
     inner: Vec<(usize, Sqe<T>)>,
 
     // Store results in internal future state to persist across poll calls.
@@ -143,8 +141,8 @@ pub struct SqeCollection<T: Submittable + Completable> {
     results: Vec<Option<T::Output>>,
 }
 
-impl<T: Submittable + Completable> SqeCollection<T> {
-    pub fn new(inner: Vec<T>) -> Self {
+impl<T: Submittable + Completable + Unpin> SqeCollection<T> {
+    pub(crate) fn new(inner: Vec<T>) -> Self {
         let results = (0..inner.len()).map(|_| None).collect();
         Self {
             inner: inner.into_iter().map(Sqe::new).enumerate().collect(),
@@ -152,14 +150,13 @@ impl<T: Submittable + Completable> SqeCollection<T> {
         }
     }
 
-    pub fn is_ready(&self) -> bool {
+    pub(crate) fn is_ready(&self) -> bool {
         self.inner.is_empty() && self.results.iter().all(Option::is_some)
     }
 }
 
-impl<T: Submittable + Completable> Unpin for SqeCollection<T> {}
-
-impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Send> Future
+// Since we store E inside SqeCollection, it also needs to be Unpin.
+impl<E: Unpin, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send> Future
     for SqeCollection<T>
 {
     type Output = Vec<T::Output>;
@@ -211,14 +208,20 @@ pub(super) fn increment_pending_io(waker: &Waker) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{with_core_mut, with_ring_mut};
+    use crate::context::{with_ring_mut, with_slab_and_ring_mut};
     use crate::test_utils::*;
     use anyhow::Result;
     use either::Either;
     use io_uring::squeue::Entry;
     use rstest::rstest;
+    use static_assertions::assert_impl_one;
     use std::pin::pin;
     use std::task::{Context, Poll};
+
+    // Make sure all our SQE backend impl Unpin.
+    assert_impl_one!(SqeSingle: Unpin);
+    assert_impl_one!(SqeList: Unpin);
+    assert_impl_one!(SqeStream: Unpin);
 
     #[rstest]
     #[case::collection_two_batches(
@@ -337,13 +340,13 @@ mod tests {
             });
         }
 
-        with_core_mut(|core| -> Result<()> {
+        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert_eq!(core.submit_and_wait(n_sqes, None)?, n_sqes);
+            assert_eq!(ring.submit_and_wait(n_sqes, None)?, n_sqes);
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert_eq!(core.process_cqes(None)?, n_sqes);
+            assert_eq!(ring.process_cqes(slab, None)?, n_sqes);
             assert_eq!(waker_data.get_count(), num_lists);
             assert_eq!(waker_data.get_pending_io(), 0);
             Ok(())

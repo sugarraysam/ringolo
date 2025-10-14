@@ -15,6 +15,11 @@ use std::thread;
 // - UnhandledPanic
 // - metrics
 
+// Used wherever we rely on SmallVec to store entries on stack first.
+// Prevent most heap allocations. Threads have 2 MB stack size by default and so
+// far the largest thing we store here is 64 byte Entry structs.
+pub(crate) const SPILL_TO_HEAP_THRESHOLD: usize = 16;
+
 /// Unimplemented!
 const MAX_BLOCKING_THREADS: usize = 512;
 

@@ -7,7 +7,6 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Waker;
 
 /// An owned handle to the task, tracked by ref count.

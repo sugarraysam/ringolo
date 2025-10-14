@@ -1,4 +1,4 @@
-use crate::context::{with_core, with_core_mut};
+use crate::context::{with_core, with_slab_and_ring_mut};
 use crate::runtime::local::worker::Worker;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
@@ -108,9 +108,9 @@ impl Schedule for Handle {
         self.track(Method::YieldNow, Call::YieldNow { reason });
         match reason {
             YieldReason::SqRingFull | YieldReason::SlabFull => {
-                if let Err(e) = with_core_mut(|core| -> Result<usize> {
-                    core.submit_and_wait(1, None)?;
-                    core.process_cqes(None)
+                if let Err(e) = with_slab_and_ring_mut(|slab, ring| -> Result<usize> {
+                    ring.submit_and_wait(1, None)?;
+                    ring.process_cqes(slab, None)
                 }) {
                     panic!(
                         "FATAL: scheduler error: {:?}. Unable to submit or process cqes: {:?}",

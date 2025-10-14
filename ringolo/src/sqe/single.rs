@@ -1,84 +1,84 @@
-use crate::context::{with_core_mut, with_slab_mut};
+use crate::context::{with_slab_and_ring_mut, with_slab_mut};
 use crate::sqe::{
     Completable, CompletionHandler, IoError, RawSqe, Sqe, Submittable, increment_pending_io,
 };
+use anyhow::anyhow;
 use io_uring::squeue::Entry;
 use std::io::{self, Error};
-use std::mem;
+use std::marker::PhantomPinned;
+use std::pin::Pin;
 use std::task::{Poll, Waker};
 
 #[derive(Debug)]
 pub(crate) enum SqeSingleState {
-    Preparing { entry: Entry },
-    Indexed { idx: usize },
+    Unsubmitted { entry: Entry },
+    Submitted { idx: usize },
 }
 
 #[derive(Debug)]
-pub struct SqeSingle {
+pub(crate) struct SqeSingle {
     state: SqeSingleState,
 }
 
 impl SqeSingle {
-    pub fn new(entry: Entry) -> Self {
+    pub(crate) fn new(entry: Entry) -> Self {
         Self {
-            state: SqeSingleState::Preparing { entry },
+            state: SqeSingleState::Unsubmitted { entry },
         }
     }
 
-    pub fn get_idx(&self) -> io::Result<usize> {
+    pub(crate) fn get_idx(&self) -> io::Result<usize> {
         match self.state {
-            SqeSingleState::Indexed { idx } => Ok(idx),
+            SqeSingleState::Submitted { idx } => Ok(idx),
             _ => Err(Error::other("sqe single state is not indexed")),
         }
     }
 }
 
 impl Submittable for SqeSingle {
-    fn submit(&mut self, waker: &Waker) -> Result<i32, IoError> {
-        let idx = match &mut self.state {
-            // Submit can be retried for example when the ring is full. We need to make sure we only count this IO once,
-            // and only insert the entry in the slab once.
-            SqeSingleState::Preparing { entry } => {
-                // We run `pre_push_validation` to make the submission *atomic*. This is
-                // because we must ensure that entries are added to both the ring and the slab
-                // to avoid corrupted state.
-                with_core_mut(|core| core.pre_push_validation(1))?;
-
-                // Important: clone entry so we can retry if Slab is full.
-                let entry = entry.clone();
-                let idx = with_slab_mut(|slab| {
-                    slab.insert(RawSqe::new(entry, CompletionHandler::new_single()))
-                        .map(|(idx, _)| idx)
-                })?;
-
-                _ = mem::replace(&mut self.state, SqeSingleState::Indexed { idx });
-                increment_pending_io(waker);
-
-                idx
+    /// Submit is a two-step process to avoid corrupted state. Slab and Ring are
+    /// interconnected so we use a reservation API on the slab and only commit
+    /// once we have successfully pushed to the ring. This enables safe retries
+    /// and avoids corrupted state.
+    fn submit(&mut self, waker: &Waker) -> Result<(), IoError> {
+        match &mut self.state {
+            SqeSingleState::Submitted { .. } => {
+                return Err(anyhow!("SqeSingle already submitted").into());
             }
-            SqeSingleState::Indexed { idx } => *idx,
-        };
+            SqeSingleState::Unsubmitted { entry } => with_slab_and_ring_mut(|slab, ring| {
+                let reserved = slab.reserve_entry()?;
+                let idx = reserved.key();
 
-        with_core_mut(|core| core.push_sqes([idx].iter()))
+                entry.set_user_data(idx as u64);
+                ring.push(entry)?;
+
+                reserved.commit(RawSqe::new(CompletionHandler::new_single()));
+
+                Ok(idx)
+            }),
+        }
+        // On successful push, we can transition the state and increment the
+        // number of local pending IOs for this task.
+        .map(|idx| {
+            self.state = SqeSingleState::Submitted { idx };
+            increment_pending_io(waker);
+        })
     }
 }
 
 impl Completable for SqeSingle {
     type Output = Result<i32, IoError>;
 
-    fn poll_complete(&self, waker: &Waker) -> Poll<Self::Output> {
+    fn poll_complete(&mut self, waker: &Waker) -> Poll<Self::Output> {
         let idx = self.get_idx()?;
 
         with_slab_mut(|slab| -> Poll<Self::Output> {
-            let raw_sqe = match slab.get_mut(idx) {
-                Ok(sqe) => sqe,
-                Err(e) => return Poll::Ready(Err(e.into())),
-            };
+            let raw = slab.get_mut(idx)?;
 
-            if raw_sqe.is_ready() {
-                Poll::Ready(raw_sqe.take_final_result().map_err(|e| e.into()))
+            if raw.is_ready() {
+                Poll::Ready(raw.take_final_result().map_err(|e| e.into()))
             } else {
-                raw_sqe.set_waker(waker);
+                raw.set_waker(waker);
                 Poll::Pending
             }
         })
@@ -112,14 +112,13 @@ mod tests {
     use crate::context::with_slab_and_ring_mut;
     use crate::test_utils::*;
     use anyhow::Result;
+    use static_assertions::assert_impl_one;
     use std::pin::pin;
     use std::task::{Context, Poll};
 
     #[test]
     fn test_submit_and_complete_single_sqe() -> Result<()> {
         init_local_runtime_and_context(None)?;
-
-        let mut idx = 0;
 
         let sqe = SqeSingle::new(nop());
         let mut sqe_fut = pin!(Sqe::new(sqe));
@@ -131,7 +130,7 @@ mod tests {
         // Polling N more times after this won't change the state.
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
-            idx = sqe_fut.get().get_idx()?;
+            let idx = sqe_fut.get().get_idx()?;
 
             assert_eq!(waker_data.get_count(), 0);
             assert_eq!(waker_data.get_pending_io(), 1);
@@ -149,24 +148,21 @@ mod tests {
             });
         }
 
-        with_core_mut(|core| {
+        with_slab_and_ring_mut(|slab, ring| {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
-            assert!(matches!(core.submit_and_wait(1, None), Ok(1)));
+            assert!(matches!(ring.submit_and_wait(1, None), Ok(1)));
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert!(matches!(core.process_cqes(None), Ok(1)));
+            assert!(matches!(ring.process_cqes(slab, None), Ok(1)));
             assert_eq!(waker_data.get_count(), 1);
             assert_eq!(waker_data.get_pending_io(), 0);
         });
 
-        if let Poll::Ready(Ok(result)) = sqe_fut.as_mut().poll(&mut ctx) {
-            assert_eq!(result, 0);
-            // TODO: rawsqe has userdata?
-            // assert_eq!(entry.get_user_data(), idx as u64);
-        } else {
-            assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
-        }
+        assert!(matches!(
+            sqe_fut.as_mut().poll(&mut ctx),
+            Poll::Ready(Ok(_))
+        ));
 
         Ok(())
     }

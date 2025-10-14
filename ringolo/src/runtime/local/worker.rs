@@ -1,4 +1,4 @@
-use crate::context::{expect_local_scheduler, with_core_mut, with_slab};
+use crate::context::{expect_local_scheduler, with_slab, with_slab_and_ring_mut};
 use crate::runtime::local;
 use crate::runtime::local::scheduler::LocalTask;
 use crate::runtime::runtime::RuntimeConfig;
@@ -55,9 +55,9 @@ struct EventLoopConfig {
 impl EventLoopConfig {
     #[inline(always)]
     fn update(&mut self, ctx: &local::Context) {
-        ctx.with_core(|core| {
-            self.unsubmitted_sqes = core.num_unsubmitted_sqes();
-            self.has_ready_cqes = core.has_ready_cqes();
+        ctx.with_ring_mut(|ring| {
+            self.unsubmitted_sqes = ring.num_unsubmitted_sqes();
+            self.has_ready_cqes = ring.has_ready_cqes();
         });
     }
 
@@ -192,9 +192,9 @@ impl Worker {
                 } else {
                     dbg!("parking thread waiting for completions");
                     // "Park" the thread waiting for next completion.
-                    with_core_mut(|core| -> Result<()> {
-                        core.submit_and_wait(1, None)?;
-                        core.process_cqes(None)?;
+                    with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+                        ring.submit_and_wait(1, None)?;
+                        ring.process_cqes(slab, None)?;
                         Ok(())
                     })?;
                 }
@@ -212,15 +212,15 @@ impl Worker {
         // pending SQEs in same syscall.
         } else if events.contains(TickerEvents::PROCESS_CQES) {
             dbg!("processing cqes");
-            ctx.with_core_mut(|core| {
-                core.submit_and_wait(1, None)?;
-                core.process_cqes(None)
+            ctx.with_slab_and_ring_mut(|slab, ring| {
+                ring.submit_and_wait(1, None)?;
+                ring.process_cqes(slab, None)
             })?;
 
         // Only submit, no need to wait for anything.
         } else if events.contains(TickerEvents::SUBMIT_SQES) {
             dbg!("submitting sqes");
-            ctx.with_core_mut(|core| core.submit_no_wait())?;
+            ctx.with_ring_mut(|ring| ring.submit_no_wait())?;
         }
 
         Ok(())

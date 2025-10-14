@@ -1,4 +1,4 @@
-use crate::task::{Header, Id, JoinError, RawTask, Result, id};
+use crate::task::{Header, Id, JoinError, RawTask, Result};
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
@@ -290,7 +290,7 @@ impl<T> JoinHandle<T> {
         unsafe { Header::get_id(self.raw.header_ptr()) }
     }
 
-    pub fn get_result(mut self) -> Result<T> {
+    pub fn get_result(self) -> Result<T> {
         let id = self.id();
         let mut this = pin!(self);
 

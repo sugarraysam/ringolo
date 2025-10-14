@@ -6,6 +6,7 @@ use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 use crate::task::Id;
 use crate::utils::ScopeGuard;
 use anyhow::Result;
+use io_uring::squeue::Entry;
 use std::cell::{Cell, RefCell};
 use std::io;
 use std::num::NonZeroU64;
@@ -56,124 +57,6 @@ impl Core {
 
     pub(crate) fn is_polling_root(&self) -> bool {
         self.polling_root_future.get()
-    }
-
-    // Must call before trying to call `push_sqes`. This is because we need to make sure our
-    // batch can fit in both the Slab and the SQ ring to avoid corrupted state.
-    pub(crate) fn pre_push_validation(&mut self, n_sqes: usize) -> Result<(), IoError> {
-        let slab = self.slab.borrow();
-        let sq = self.ring.get_mut().sq();
-
-        if n_sqes > sq.capacity() {
-            Err(IoError::SqBatchTooLarge)
-        } else if n_sqes + sq.len() > sq.capacity() {
-            Err(IoError::SqRingFull)
-        } else if n_sqes + slab.len() > slab.capacity() {
-            Err(IoError::SlabFull)
-        } else {
-            Ok(())
-        }
-    }
-
-    // Queues SQEs in the SQ ring, fetching them from the slab using the provided
-    // indices. To submit the SQEs to the kernel, we need to call `q.sync()` and
-    // make an `io_uring_enter` syscall unless kernel side SQ polling is enabled.
-    pub(crate) fn push_sqes<'a>(
-        &mut self,
-        indices: impl ExactSizeIterator<Item = &'a usize>,
-    ) -> Result<i32, IoError> {
-        let mut sq = self.ring.get_mut().sq();
-        let slab = self.slab.borrow();
-
-        // If we fail to add an entry at this point, we might violate SQE primitive contracts.
-        // This is unrecoverable and we return invalid state errors.
-        for idx in indices {
-            let entry = slab
-                .get(*idx)
-                .and_then(|sqe| sqe.get_entry())
-                .map_err(|_| IoError::SlabInvalidState)?;
-
-            unsafe { sq.push(entry) }.map_err(|_| IoError::SqRingInvalidState)?;
-        }
-
-        dbg!("pushed {} sqes to ring", sq.len());
-        Ok(0)
-    }
-
-    pub(crate) fn submit_and_wait(
-        &mut self,
-        num_to_wait: usize,
-        timeout: Option<Duration>,
-    ) -> io::Result<usize> {
-        self.ring.get_mut().submit_and_wait(num_to_wait, timeout)
-    }
-
-    pub(crate) fn submit_no_wait(&mut self) -> io::Result<usize> {
-        self.ring.get_mut().submit_no_wait()
-    }
-
-    // Will busy loop until `num_to_complete` has been achieved. It is the caller's
-    // responsibility to make sure the CQ will see that many completions, otherwise
-    // this will result in an infinite loop.
-    pub(crate) fn process_cqes(&mut self, num_to_complete: Option<usize>) -> Result<usize> {
-        let mut num_completed = 0;
-        let mut should_sync = false;
-
-        let to_complete = num_to_complete.unwrap_or(self.ring.get_mut().cq().len());
-
-        let slab = self.slab.get_mut();
-
-        while num_completed < to_complete {
-            let mut cq = self.ring.get_mut().cq();
-
-            // Avoid syncing on first pass
-            if should_sync {
-                cq.sync();
-            }
-
-            for cqe in cq {
-                let raw_sqe = match slab.get_mut(cqe.user_data() as usize) {
-                    Err(e) => {
-                        eprintln!("CQE user data not found in RawSqeSlab: {:?}", e);
-                        continue;
-                    }
-                    Ok(sqe) => {
-                        // Ignore unknown CQEs which might have valid index in
-                        // the Slab. Can this even happen?
-                        if !matches!(sqe.get_state(), RawSqeState::Pending | RawSqeState::Ready) {
-                            continue;
-                        }
-                        sqe
-                    }
-                };
-
-                let cqe_flags = match cqe.flags() {
-                    0 => None,
-                    flags => Some(flags),
-                };
-
-                num_completed += 1;
-
-                for effect in raw_sqe.on_completion(cqe.result(), cqe_flags)? {
-                    match effect {
-                        CompletionEffect::DecrementPendingIo => slab.pending_ios -= 1,
-                        CompletionEffect::WakeHead { head } => slab.get_mut(head)?.wake()?,
-                    }
-                }
-            }
-
-            should_sync = true;
-        }
-
-        Ok(num_completed)
-    }
-
-    pub(crate) fn num_unsubmitted_sqes(&self) -> usize {
-        self.ring.borrow_mut().sq().len()
-    }
-
-    pub(crate) fn has_ready_cqes(&self) -> bool {
-        self.ring.borrow_mut().has_ready_cqes()
     }
 }
 

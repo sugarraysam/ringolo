@@ -4,23 +4,18 @@ pub use ringolo_macros::main;
 #[doc(inline)]
 pub use ringolo_macros::test;
 
-pub mod context;
+mod context;
 
-pub mod future;
+mod future;
 
 pub mod runtime;
 pub use runtime::{block_on, spawn, spawn_cancel};
 
-pub mod sqe;
+mod sqe;
 
-#[allow(dead_code, unused)]
-pub mod task;
+mod task;
 
-pub mod utils;
+mod utils;
 
 #[cfg(test)]
-pub mod test_utils;
-
-// TODO: impl with ringolo-console
-// #[allow(dead_code, unused)]
-// pub mod protocol;
+mod test_utils;

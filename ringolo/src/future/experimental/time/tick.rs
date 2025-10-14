@@ -17,7 +17,7 @@ pub struct Tick {
 impl Tick {
     pub fn new(interval: Duration, count: u32) -> Self {
         Self {
-            inner: Multishot::new(TimeoutMultishot::new(interval, count)),
+            inner: Multishot::new(TimeoutMultishot::new(interval, count, None)),
         }
     }
 }

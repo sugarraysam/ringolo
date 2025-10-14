@@ -9,7 +9,9 @@
 //!
 //! - **Safety:** The public API for each operation is safe. Constructors take safe
 //!   Rust types (`&Path`, `Vec<u8>`, `Duration`, etc.) and handle conversions
-//!   to the raw C types required by the kernel internally.
+//!   to the raw C types required by the kernel internally. We leverage self-referential
+//!   structs and pinning to guarantee argument stability until submit and/or complete.
+//!   This is enforced by the rust compiler through Pin.
 //!
 //! - **Self-Reference:** Operations that require stable pointers to their own data
 //!   (e.g., `Timeout`) store that data directly. The `OpPayload` trait's design
@@ -19,6 +21,10 @@
 //!   and raw pointers. We expose `std::lib` types in the arguments and return
 //!   `std::lib` types in the results.
 //!
+//! - **Don't do too much:** Let's not make opinionated decisions about how raw
+//!   results should be parsed. This is meant to be a low-level building block
+//!   library.
+//!
 use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
 use futures::Stream;
 use io_uring::squeue::Entry;
@@ -27,23 +33,20 @@ use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-pub mod builder;
+pub(crate) mod builder;
+
+pub(crate) mod common;
+pub(crate) use common::Fd;
 
 pub mod multishot;
 pub use multishot::TimeoutMultishot;
 
 pub(super) mod parse;
 pub mod single;
-pub use single::{AcceptOp, TimeoutOp};
+pub use single::TimeoutOp;
 
 // TODO:
-// - fix test + SqeStream /w timeout multishot
-// - only impl for dangerous opcodes
 // - single :: impl Nop
-// - use `self.as_mut().project()` to avoid consuming the pin and be able to call `project()` multiple times
-// - fix `ring.rs` TimeoutBuilder
-// - dont store Entry in Slab
-// - dont return Entry in result
 // - start with stream + single, ponder on List because few issues, builder + try_build
 //   is a bit weird since we insert in Slab. Also, we would want to create a combination of N
 //   self-referential structs, not re-invent the wheel. This is where the crazy recursive macro
@@ -173,7 +176,7 @@ impl<T: MultishotPayload> Multishot<T> {
 
         // Safety: The logic above guarantees that `this.backend` has been initialized.
         let mut this = self.project();
-        let backend = unsafe { Pin::new_unchecked(this.backend.assume_init_mut()) };
+        let mut backend = unsafe { Pin::new_unchecked(this.backend.assume_init_mut()) };
         backend.cancel()
     }
 }
@@ -186,10 +189,7 @@ impl<T: MultishotPayload> Stream for Multishot<T> {
 
         if !*this.initialized {
             let params = this.data.as_mut().create_params();
-
-            // TODO: `try_new` -> `new` no need for validation, type safety instead
-            let backend =
-                SqeStream::try_new(params.entry, params.count).expect("Backend creation failed");
+            let backend = SqeStream::new(params.entry, params.count);
 
             this.backend.write(backend);
             *this.initialized = true;

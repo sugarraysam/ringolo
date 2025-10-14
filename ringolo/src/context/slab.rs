@@ -1,10 +1,13 @@
+use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
 use crate::sqe::raw::RawSqe;
-// use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, anyhow};
 use slab::{Slab, VacantEntry};
+use smallvec::SmallVec;
 use std::io::{self, Error, ErrorKind};
+use std::ops::{Deref, DerefMut};
 
-pub struct RawSqeSlab {
+pub(crate) struct RawSqeSlab {
     slab: slab::Slab<RawSqe>,
 
     // Keep track of number of pending IO operations. We can't rely on slab size
@@ -25,22 +28,35 @@ impl RawSqeSlab {
         }
     }
 
-    /// Always rely on our SlabVacantEntry wrapper for insertions as it will
-    /// take care of incrementing the number of `pending_ios`.
-    pub(crate) fn vacant_entry(&'_ mut self) -> Result<SlabVacantEntry<'_>, IoError> {
+    /// Reserve a single slab entry for insertion. Insertion is a 2-step process
+    /// where we first reserve the entry, but need to insert the entry to commit.
+    pub(crate) fn reserve_entry(&'_ mut self) -> Result<SlabReservedEntry<'_>, IoError> {
         if self.slab.len() == self.slab.capacity() {
             return Err(IoError::SlabFull);
         }
 
         let v = self.slab.vacant_entry();
-        Ok(SlabVacantEntry::new(v, &mut self.pending_ios))
+        Ok(SlabReservedEntry::new(v, &mut self.pending_ios))
     }
 
-    pub(crate) fn insert(&mut self, mut raw_sqe: RawSqe) -> Result<(usize, &mut RawSqe), IoError> {
-        let entry = self.vacant_entry()?;
-        raw_sqe.set_user_data(entry.key() as u64)?;
+    /// Reserve a batch of N slab entries for insertion. Insertion is a 2-step process
+    /// where we first reserve the batch, but need to insert the entries to commit.
+    pub(crate) fn reserve_batch(
+        &'_ mut self,
+        size: usize,
+    ) -> Result<SlabReservedBatch<'_>, IoError> {
+        if self.slab.len() + size > self.slab.capacity() {
+            return Err(IoError::SlabFull);
+        }
 
-        Ok((entry.key(), entry.insert(raw_sqe)))
+        // We do a tricky thing as we *can't* borrow mut N vacant entries at once. Instead
+        // we insert dummy RawSqe in the slab and collect indices. We will later replace them
+        // with the user entries OR cleanup upon exit if we did not commit the operation.
+        let indices = (0..size)
+            .map(|_| self.slab.insert(RawSqe::default()))
+            .collect::<SmallVec<_>>();
+
+        Ok(SlabReservedBatch::new(indices, self))
     }
 
     pub(crate) fn get(&self, key: usize) -> io::Result<&RawSqe> {
@@ -60,32 +76,30 @@ impl RawSqeSlab {
             )
         })
     }
+}
 
-    // Removes and drop the entry if it exists. Returns true if an entry was dropped.
-    pub(crate) fn try_remove(&mut self, key: usize) -> Option<RawSqe> {
-        self.slab.try_remove(key).map(|mut sqe| {
-            sqe.set_available();
-            sqe
-        })
+impl Deref for RawSqeSlab {
+    type Target = Slab<RawSqe>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.slab
     }
+}
 
-    pub(crate) fn len(&self) -> usize {
-        self.slab.len()
-    }
-
-    pub(crate) fn capacity(&self) -> usize {
-        self.slab.capacity()
+impl DerefMut for RawSqeSlab {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.slab
     }
 }
 
 /// A wrapper around slab::VacantEntry that increments a counter upon insertion.
-pub(crate) struct SlabVacantEntry<'a> {
+pub(crate) struct SlabReservedEntry<'a> {
     entry: VacantEntry<'a, RawSqe>,
     counter: &'a mut usize,
 }
 
-impl<'a> SlabVacantEntry<'a> {
-    /// Creates a new SlabVacantEntry.
+impl<'a> SlabReservedEntry<'a> {
+    /// Creates a new SlabReservedEntry.
     fn new(entry: slab::VacantEntry<'a, RawSqe>, counter: &'a mut usize) -> Self {
         Self { entry, counter }
     }
@@ -97,9 +111,71 @@ impl<'a> SlabVacantEntry<'a> {
 
     /// Inserts a value into the slab, incrementing the `pending_io` counter.
     /// This consumes the entry, just like the original `insert` method.
-    pub(crate) fn insert(self, value: RawSqe) -> &'a mut RawSqe {
+    pub(crate) fn commit(self, value: RawSqe) -> &'a mut RawSqe {
         *self.counter += 1;
         self.entry.insert(value)
+    }
+}
+
+/// Reserve a batch of N slab entries for insertion. Insertion is a 2-step process
+/// where we first reserve the batch, but need to insert the entries to commit.
+pub(crate) struct SlabReservedBatch<'a> {
+    indices: SmallVec<[usize; SPILL_TO_HEAP_THRESHOLD]>,
+    slab: &'a mut RawSqeSlab,
+    committed: bool,
+}
+
+impl<'a> SlabReservedBatch<'a> {
+    fn new(indices: SmallVec<[usize; SPILL_TO_HEAP_THRESHOLD]>, slab: &'a mut RawSqeSlab) -> Self {
+        Self {
+            indices,
+            slab,
+            committed: false,
+        }
+    }
+
+    pub(crate) fn keys(&self) -> SmallVec<[usize; SPILL_TO_HEAP_THRESHOLD]> {
+        self.indices.clone()
+    }
+
+    pub(crate) fn commit(
+        mut self,
+        values: SmallVec<[RawSqe; SPILL_TO_HEAP_THRESHOLD]>,
+    ) -> Result<(), IoError> {
+        if values.len() != self.indices.len() {
+            return Err(anyhow!(
+                "You need to insert *exactly* {} values, got {}.",
+                self.indices.len(),
+                values.len()
+            )
+            .into());
+        }
+
+        for (idx, entry) in self.indices.iter().zip(values.into_iter()) {
+            let placeholder = self
+                .slab
+                .get_mut(*idx)
+                .map_err(|_| IoError::SlabInvalidState)?;
+
+            *placeholder = entry;
+        }
+
+        self.committed = true;
+        self.slab.pending_ios += self.indices.len();
+
+        Ok(())
+    }
+}
+
+impl Drop for SlabReservedBatch<'_> {
+    fn drop(&mut self) {
+        // If we did not commit the batch, release the reserved entries.
+        if !self.committed {
+            // SAFETY: we know the indices are valid so should not panic.
+            self.indices.iter().for_each(|idx| {
+                self.slab.remove(*idx);
+            })
+        }
     }
 }
 
@@ -111,6 +187,7 @@ mod tests {
     use crate::sqe::raw::CompletionHandler;
     use crate::test_utils::*;
     use anyhow::Result;
+    use libc::CN_IDX_BB;
 
     #[test]
     fn test_new_and_capacity() {
@@ -121,18 +198,16 @@ mod tests {
     }
 
     #[test]
-    fn test_insert_get_and_user_data() -> Result<()> {
+    fn test_insert_and_len() -> Result<()> {
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes);
 
         for i in 1..=n_sqes {
-            let sqe = RawSqe::new(nop(), CompletionHandler::new_single());
+            let reserved = slab.reserve_entry()?;
+            let idx = reserved.key();
+            reserved.commit(RawSqe::new(CompletionHandler::new_single()));
 
-            let (key, inserted) = slab.insert(sqe)?;
-
-            assert_eq!(inserted.get_entry()?.get_user_data(), key as u64);
-            assert_eq!(slab.get(key)?.get_entry()?.get_user_data(), key as u64);
-
+            assert!(slab.get(idx).is_ok());
             assert_eq!(slab.len(), i);
         }
 
@@ -145,7 +220,10 @@ mod tests {
         let mut slab = RawSqeSlab::new(n_sqes - 1);
 
         for i in 1..=n_sqes {
-            let res = slab.insert(RawSqe::new(nop(), CompletionHandler::new_single()));
+            let res = slab.reserve_entry().map(|reserved| {
+                reserved.commit(RawSqe::new(CompletionHandler::new_single()));
+            });
+
             if i == n_sqes {
                 assert!(res.is_err());
             } else {
@@ -164,11 +242,14 @@ mod tests {
 
             let indices = (0..n_sqes)
                 .map(|_| {
-                    let mut raw_sqe = RawSqe::new(nop(), CompletionHandler::new_single());
-                    raw_sqe.set_waker(&waker);
-                    slab.insert(raw_sqe)
-                        .map(|(idx, _)| idx)
-                        .map_err(|e| e.into())
+                    let reserved = slab.reserve_entry()?;
+                    let idx = reserved.key();
+
+                    let mut raw = RawSqe::new(CompletionHandler::new_single());
+                    raw.set_waker(&waker);
+
+                    reserved.commit(raw);
+                    Ok(idx)
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -183,6 +264,49 @@ mod tests {
             // Nothing has actually decremented the slab, we need a handler on the effects.
             assert_eq!(slab.pending_ios, n_sqes);
             assert_eq!(waker_data.get_count(), n_sqes);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_reserve_batch() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
+        with_slab_mut(|slab| -> Result<()> {
+            let n_sqes = 16;
+
+            {
+                let batch = slab.reserve_batch(n_sqes)?;
+
+                // Slab entries are reserved but *not committed*
+                assert_eq!(batch.slab.pending_ios, 0);
+                assert_eq!(batch.slab.len(), n_sqes);
+                assert_eq!(batch.keys().len(), n_sqes);
+            }
+
+            // Batch was not committed, so slab entries are released.
+            assert_eq!(slab.pending_ios, 0);
+            assert_eq!(slab.len(), 0);
+
+            {
+                let batch = slab.reserve_batch(n_sqes)?;
+
+                // Slab entries are reserved but *not committed*
+                assert_eq!(batch.slab.pending_ios, 0);
+                assert_eq!(batch.slab.len(), n_sqes);
+                assert_eq!(batch.keys().len(), n_sqes);
+
+                // Commit the batch
+                let entries = (0..n_sqes)
+                    .map(|_| RawSqe::new(CompletionHandler::new_single()))
+                    .collect::<SmallVec<[_; SPILL_TO_HEAP_THRESHOLD]>>();
+
+                batch.commit(entries)?;
+            } // Batch was committed, nothing happens.
+
+            assert_eq!(slab.pending_ios, n_sqes);
+            assert_eq!(slab.len(), n_sqes);
 
             Ok(())
         })
