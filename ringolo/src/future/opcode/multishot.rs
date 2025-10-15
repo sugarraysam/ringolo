@@ -1,7 +1,6 @@
 use crate::future::opcode::{Fd, MultishotParams, MultishotPayload};
 use crate::sqe::IoError;
 use anyhow::Result;
-use io_uring::opcode::Accept;
 use io_uring::types::{TimeoutFlags, Timespec};
 use pin_project::pin_project;
 use std::io;
@@ -46,8 +45,7 @@ impl MultishotPayload for AcceptMultishot {
             Ok(fd) => Ok(if self.allocate_file_index {
                 Fd::Registered(fd as u32)
             } else {
-                // TODO: lookup registered fd table for this thread, and convert
-                // to a TcpStream directly.
+                // TODO: lookup registered fd table for this thread, provide better API
                 Fd::Unregistered(fd)
             }),
             Err(e) => Err(e.into()),
@@ -106,24 +104,21 @@ impl MultishotPayload for TimeoutMultishot {
 mod tests {
     use std::{
         io::{Read, Write},
-        net::{IpAddr, Ipv4Addr, TcpListener, TcpStream},
+        net::{TcpListener, TcpStream},
         os::fd::FromRawFd,
-        sync::{Arc, Barrier, atomic::AtomicBool},
     };
 
     use super::*;
+    use crate::utils::scheduler::Method;
     use crate::{self as ringolo, future::opcode::Multishot};
     use anyhow::Result;
     use futures::StreamExt;
 
-    #[ignore = "test hanging, can only accept 1 ? client side fine"]
+    // #[ignore = "WOW completion bug. Now runtime blocks, parks thread waiting for completion. Needs to cancel itself when goes out of scope."]
     #[ringolo::test]
     async fn test_accept_multi() -> Result<()> {
         let n = 2;
         let hello = b"hello";
-
-        let barrier = Arc::new(Barrier::new(2));
-        let clone_barrier = Arc::clone(&barrier);
 
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let listen_addr = listener.local_addr()?;
@@ -132,43 +127,45 @@ mod tests {
             for _ in 0..n {
                 if let Ok(mut stream) = TcpStream::connect(listen_addr) {
                     let mut buf = Vec::with_capacity(hello.len());
-                    dbg!("waiting for server...");
                     stream.read_to_end(&mut buf)?;
                     assert_eq!(buf, hello);
-                    dbg!("client done");
                 } else {
                     assert!(false, "failed to connect to server");
                 }
             }
 
-            clone_barrier.wait();
             Ok(())
         });
 
-        let mut stream = Multishot::new(AcceptMultishot::new(&listener, false, None)).take(n);
-
-        let mut got = 0;
-        while let Some(res) = stream.next().await
-            && got < n
         {
-            assert!(res.is_ok());
+            let mut stream = Multishot::new(AcceptMultishot::new(&listener, false, None)).take(n);
 
-            let mut stream = match res.unwrap() {
-                Fd::Unregistered(fd) => unsafe { TcpStream::from_raw_fd(fd.into()) },
-                Fd::Registered(_) => panic!("should not be registered"),
-            };
+            let mut got = 0;
+            while let Some(res) = stream.next().await
+                && got < n
+            {
+                assert!(res.is_ok());
 
-            dbg!("writing to client");
-            stream.write_all(hello)?;
-            got += 1;
-            dbg!("server done");
-        }
+                let mut stream = match res.unwrap() {
+                    Fd::Unregistered(fd) => unsafe { TcpStream::from_raw_fd(fd.into()) },
+                    Fd::Registered(_) => panic!("should not be registered"),
+                };
 
-        dbg!("server barrier");
-        barrier.wait();
-        assert_eq!(got, n);
+                stream.write_all(hello)?;
+                got += 1;
+            }
 
-        handle.join().unwrap()?;
+            handle.join().unwrap()?;
+        } // stream dropped here, schedules async cancel task
+
+        ringolo::with_scheduler!(|s| {
+            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
+            assert_eq!(spawn_calls.len(), 1);
+
+            let unhandled_panic_calls = s.tracker.get_calls(&Method::UnhandledPanic);
+            assert!(unhandled_panic_calls.is_empty());
+        });
+
         Ok(())
     }
 }

@@ -9,7 +9,7 @@ mod context;
 mod future;
 
 pub mod runtime;
-pub use runtime::{block_on, spawn, spawn_cancel};
+pub use runtime::{block_on, spawn};
 
 mod sqe;
 

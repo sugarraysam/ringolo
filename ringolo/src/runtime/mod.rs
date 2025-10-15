@@ -1,4 +1,5 @@
 use crate::{
+    runtime::cancel::OpCancelPayload,
     task::{JoinHandle, Notified, Task},
     with_scheduler,
 };
@@ -7,13 +8,13 @@ use bitflags::bitflags;
 use std::task::Waker;
 
 // Public API
-pub mod cancel;
-pub use cancel::{CancelBuilder, CancellationTask};
-
 pub mod runtime;
 pub use runtime::Builder;
 
 // Exports
+pub(crate) mod cancel;
+pub(crate) use cancel::{CancelTask, CancelTaskBuilder};
+
 pub(crate) mod local;
 
 pub(crate) mod registry;
@@ -140,13 +141,8 @@ where
     with_scheduler!(|s| { s.spawn(future, None) })
 }
 
-pub fn spawn_cancel(builder: CancelBuilder, user_data: usize) {
-    let cancel_task = CancellationTask::new(builder, user_data);
-
+pub(crate) fn spawn_cancel<T: OpCancelPayload>(task: CancelTask<T>) -> JoinHandle<()> {
     // Cancel tasks need to be sticky to the local thread. It does not make sense
     // to cancel an io_uring operation from another thread.
-    let _join_handle = with_scheduler!(|s| { s.spawn(cancel_task.run(), Some(TaskOpts::STICKY)) });
-
-    // TODO: add join_handle to CancellationHandler?? retry/logging?
-    // the task itself is doing all of this so might be OK to just drop this one.
+    with_scheduler!(|s| { s.spawn(task.into_future(), Some(TaskOpts::STICKY)) })
 }

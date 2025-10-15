@@ -1,14 +1,12 @@
-use crate as ringolo;
 use crate::future::opcode::{Multishot, TimeoutMultishot};
 use futures::Stream;
-use io_uring::types::CancelBuilder;
-use pin_project::{pin_project, pinned_drop};
+use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
-#[pin_project(PinnedDrop)]
+#[pin_project]
 pub struct Tick {
     #[pin]
     inner: Multishot<TimeoutMultishot>,
@@ -38,30 +36,6 @@ impl Stream for Tick {
     }
 }
 
-// TODO:
-// - if cancel fails, should provide a signal, cancellation is async in nature, but we want to know
-//   if we are leaking resources. If many multishot fail to get cancelled its really bad.
-#[pinned_drop]
-impl PinnedDrop for Tick {
-    fn drop(self: Pin<&mut Self>) {
-        let this = self.project();
-
-        let user_data = match this.inner.cancel() {
-            Some(idx) => idx,
-            None => {
-                // Nothing to cancel.
-                return;
-            }
-        };
-
-        // TODO: OnCancelError::{Ignore, Panic} struct to choose from
-        // - if fixed count we dont care just ignore
-        // - if infinite then panic as we leak resources
-        let builder = CancelBuilder::user_data(user_data as u64).all();
-        ringolo::spawn_cancel(builder, user_data);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,9 +46,9 @@ mod tests {
     use std::time::Duration;
 
     #[rstest]
-    #[case::single(Duration::from_millis(2), 1)]
-    #[case::three(Duration::from_millis(2), 3)]
-    #[case::five(Duration::from_millis(2), 5)]
+    #[case::single(Duration::from_millis(1), 1)]
+    #[case::three(Duration::from_millis(1), 3)]
+    #[case::five(Duration::from_millis(1), 5)]
     #[ringolo::test]
     async fn test_tick_with_count(#[case] interval: Duration, #[case] count: u32) -> Result<()> {
         let tick = Tick::new(interval, count);
@@ -85,6 +59,5 @@ mod tests {
         Ok(())
     }
 
-    // TODO:
-    // - test Cancelling scenarios
+    // TODO: test safe cancellation
 }

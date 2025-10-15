@@ -206,7 +206,7 @@ mod tests {
     fn test_taskrun_flag() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        let mut sqe_fut = pin!(Op::new(TimeoutOp::new(Duration::from_millis(2))));
+        let mut sqe_fut = pin!(Op::new(TimeoutOp::new(Duration::from_millis(1))));
         let (waker, _) = mock_waker();
 
         let mut ctx = Context::from_waker(&waker);

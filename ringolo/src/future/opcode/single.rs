@@ -1,4 +1,5 @@
 use crate::future::opcode::{OpParams, OpPayload, parse};
+use crate::runtime::cancel::CancelOutputT;
 use crate::sqe::IoError;
 use anyhow::{Context, Result};
 use io_uring::types::{Fd, TimeoutFlags, Timespec};
@@ -11,6 +12,7 @@ use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::time::Duration;
 
+#[derive(Debug)]
 #[pin_project]
 pub struct AcceptOp {
     fd: RawFd,
@@ -91,6 +93,35 @@ impl OpPayload for AcceptOp {
         };
 
         Ok((fd, addr_info))
+    }
+}
+
+// Safety: ok *to not implement* drop even though we have MaybeUninit fields because
+// they are POD.
+
+#[derive(Debug, Clone)]
+pub(crate) struct AsyncCancelOp {
+    entry: Option<io_uring::squeue::Entry>,
+}
+
+impl AsyncCancelOp {
+    pub(crate) fn new(builder: io_uring::types::CancelBuilder) -> Self {
+        Self {
+            entry: Some(io_uring::opcode::AsyncCancel2::new(builder).build()),
+        }
+    }
+}
+
+impl OpPayload for AsyncCancelOp {
+    type Output = CancelOutputT;
+
+    fn create_params(mut self: Pin<&mut Self>) -> OpParams {
+        self.entry.take().expect("only called once").into()
+    }
+
+    fn into_output(self: Pin<&mut Self>, result: Result<i32, IoError>) -> Self::Output {
+        // Untouched, we want to rely on IoError `is_retryable` logic.
+        result
     }
 }
 

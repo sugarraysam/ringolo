@@ -124,7 +124,8 @@ impl RawSqe {
                     StreamCompletion::ByFlag { done } => {
                         // If we have the `IORING_CQE_F_MORE` flags set, it means we are
                         // expecting more results, otherwise this was the final result.
-                        *done = cqe_flags.is_some_and(io_uring::cqueue::more);
+                        let has_more = cqe_flags.is_some_and(io_uring::cqueue::more);
+                        *done = !has_more;
                         *done
                     }
                 };
@@ -434,6 +435,46 @@ mod tests {
             assert_eq!(remaining.load(Ordering::Relaxed), 0);
             Ok(())
         })
+    }
+
+    #[test]
+    fn test_raw_sqe_stream_by_flag_completion() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+        // TODO: Hardcoded for now, need to expose all flags with `bitflags!` macro
+        //       from `tokio-rs/io_uring` crate.
+        const IORING_CQE_F_MORE: Option<u32> = Some(2);
+
+        let n = 5;
+
+        // count = 0 triggers ByFlag completion
+        let mut sqe = RawSqe::new(CompletionHandler::new_stream(0));
+
+        let (waker, waker_data) = mock_waker();
+        sqe.set_waker(&waker);
+        assert_eq!(sqe.state, RawSqeState::Pending);
+
+        for i in 1..=n {
+            let effects = sqe.on_completion(123, IORING_CQE_F_MORE)?;
+            assert!(effects.is_empty()); // NO DecrementPendingIo
+            assert_eq!(waker_data.get_count(), i);
+
+            assert!(sqe.has_waker(), "waker should NOT be consumed");
+            assert_eq!(sqe.state, RawSqeState::Ready);
+
+            assert!(matches!(sqe.pop_next_result()?, Some(123)));
+        }
+
+        let effects = sqe.on_completion(789, None)?;
+        assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
+        assert_eq!(waker_data.get_count(), n + 1);
+        assert!(!sqe.has_waker(), "waker SHOULD be consumed now");
+
+        assert!(matches!(sqe.pop_next_result()?, Some(789)));
+        assert_eq!(sqe.state, RawSqeState::Completed);
+
+        assert!(sqe.pop_next_result()?.is_none());
+
+        Ok(())
     }
 
     #[test]

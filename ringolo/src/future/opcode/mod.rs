@@ -25,10 +25,13 @@
 //!   results should be parsed. This is meant to be a low-level building block
 //!   library.
 //!
+use crate::future::opcode::single::AsyncCancelOp;
+use crate::runtime::CancelTaskBuilder;
 use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
+use crate::task::JoinHandle;
 use futures::Stream;
 use io_uring::squeue::Entry;
-use pin_project::pin_project;
+use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
@@ -62,7 +65,7 @@ pub use single::TimeoutOp;
 //   - Socket + SetSocketOpt + Connect -> RawFd
 
 /// Traits and structs for one-shot `io_uring` operation (i.e.: SqeSingle).
-pub trait OpPayload {
+pub(crate) trait OpPayload {
     type Output;
 
     fn create_params(self: Pin<&mut Self>) -> OpParams;
@@ -73,7 +76,7 @@ pub trait OpPayload {
 }
 
 #[derive(Debug)]
-pub struct OpParams(Entry);
+pub(crate) struct OpParams(Entry);
 
 impl From<Entry> for OpParams {
     fn from(entry: Entry) -> Self {
@@ -81,8 +84,9 @@ impl From<Entry> for OpParams {
     }
 }
 
-#[pin_project]
-pub struct Op<T: OpPayload> {
+#[pin_project(PinnedDrop)]
+#[derive(Debug)]
+pub(crate) struct Op<T: OpPayload> {
     #[pin]
     data: T,
 
@@ -90,14 +94,27 @@ pub struct Op<T: OpPayload> {
     backend: MaybeUninit<Sqe<SqeSingle>>,
 
     initialized: bool,
+    dropped: bool,
+}
+
+impl<T: OpPayload + Clone> Clone for Op<T> {
+    fn clone(&self) -> Self {
+        Self {
+            data: self.data.clone(),
+            backend: MaybeUninit::uninit(),
+            initialized: false,
+            dropped: false,
+        }
+    }
 }
 
 impl<T: OpPayload> Op<T> {
-    pub fn new(data: T) -> Self {
+    pub(crate) fn new(data: T) -> Self {
         Self {
             data,
             backend: MaybeUninit::uninit(),
             initialized: false,
+            dropped: false,
         }
     }
 }
@@ -116,7 +133,7 @@ impl<T: OpPayload> Future for Op<T> {
         }
 
         // Safety: The logic above guarantees that `this.backend` has been initialized.
-        let backend = unsafe { Pin::new_unchecked(this.backend.assume_init_mut()) };
+        let backend = Pin::new(unsafe { this.backend.assume_init_mut() });
 
         let res = ready!(backend.poll(cx));
         let output = this.data.as_mut().into_output(res);
@@ -124,8 +141,23 @@ impl<T: OpPayload> Future for Op<T> {
     }
 }
 
+#[pinned_drop]
+impl<T: OpPayload> PinnedDrop for Op<T> {
+    fn drop(mut self: Pin<&mut Self>) {
+        let mut this = self.project();
+        let dropped = std::mem::replace(this.dropped, true);
+
+        // We must manually drop the Sqe if it was initialized. Make sure we invoke
+        // the backend destructor only once with the dropped flag.
+        if *this.initialized && !dropped {
+            // SAFETY: We know the backend was initialized and has not been dropped.
+            unsafe { this.backend.assume_init_drop() };
+        }
+    }
+}
+
 /// Traits and structs for multishot `io_uring` operations (i.e.: SqeStream).
-pub trait MultishotPayload {
+pub(crate) trait MultishotPayload {
     type Item;
 
     fn create_params(self: Pin<&mut Self>) -> MultishotParams;
@@ -134,22 +166,22 @@ pub trait MultishotPayload {
 }
 
 #[derive(Debug)]
-pub struct MultishotParams {
-    pub entry: Entry,
+pub(crate) struct MultishotParams {
+    pub(crate) entry: Entry,
 
     // count == 0 means infinite multishot
     // count == n means complete after n completions
-    pub count: u32,
+    pub(crate) count: u32,
 }
 
 impl MultishotParams {
-    pub fn new(entry: Entry, count: u32) -> Self {
+    pub(crate) fn new(entry: Entry, count: u32) -> Self {
         Self { entry, count }
     }
 }
 
-#[pin_project]
-pub struct Multishot<T: MultishotPayload> {
+#[pin_project(PinnedDrop)]
+pub(crate) struct Multishot<T: MultishotPayload> {
     #[pin]
     data: T,
 
@@ -157,27 +189,44 @@ pub struct Multishot<T: MultishotPayload> {
     backend: MaybeUninit<SqeStream>,
 
     initialized: bool,
+    cancelled: bool,
 }
 
 impl<T: MultishotPayload> Multishot<T> {
-    pub fn new(data: T) -> Self {
+    pub(crate) fn new(data: T) -> Self {
         Self {
             data,
             backend: MaybeUninit::uninit(),
             initialized: false,
+            cancelled: false,
         }
     }
 
-    pub fn cancel(self: Pin<&mut Self>) -> Option<usize> {
-        // Nothing to cancel.
-        if !self.initialized {
+    pub(crate) fn cancel(self: Pin<&mut Self>) -> Option<JoinHandle<()>> {
+        let mut this = self.project();
+
+        let cancelled = std::mem::replace(this.cancelled, true);
+        if cancelled || !*this.initialized {
+            // Nothing to cancel.
             return None;
         }
 
         // Safety: The logic above guarantees that `this.backend` has been initialized.
-        let mut this = self.project();
-        let mut backend = unsafe { Pin::new_unchecked(this.backend.assume_init_mut()) };
-        backend.cancel()
+        let mut backend = Pin::new(unsafe { this.backend.assume_init_mut() });
+
+        let user_data = match backend.cancel() {
+            Some(idx) => idx,
+            None => {
+                // Nothing to cancel.
+                return None;
+            }
+        };
+
+        // TODO: make OnCancelError configurable? Runtime config?
+        let builder = io_uring::types::CancelBuilder::user_data(user_data as u64).all();
+        let cancel_task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data).build();
+
+        Some(crate::runtime::spawn_cancel(cancel_task))
     }
 }
 
@@ -196,7 +245,7 @@ impl<T: MultishotPayload> Stream for Multishot<T> {
         }
 
         // Safety: The logic above guarantees that `this.backend` has been initialized.
-        let backend = unsafe { Pin::new_unchecked(this.backend.assume_init_mut()) };
+        let backend = Pin::new(unsafe { this.backend.assume_init_mut() });
 
         match ready!(backend.poll_next(cx)) {
             Some(res) => {
@@ -205,5 +254,53 @@ impl<T: MultishotPayload> Stream for Multishot<T> {
             }
             None => Poll::Ready(None),
         }
+    }
+}
+
+#[pinned_drop]
+impl<T: MultishotPayload> PinnedDrop for Multishot<T> {
+    fn drop(self: Pin<&mut Self>) {
+        // CancelTask is responsible for dropping the backend. It is async in
+        // nature and we can't block and wait for the result here. The task handles
+        // errors and retries internally. It is also safe to drop the JoinHandle,
+        // the task will continue in the background and it's result will be lost.
+        let _ = self.cancel();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_utils::*;
+    use anyhow::Result;
+    use core::panic;
+    use std::pin::pin;
+
+    #[test]
+    fn test_op_double_drop_no_undefined_behavior() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
+        let op = Op::new(AsyncCancelOp::new(
+            io_uring::types::CancelBuilder::user_data(42).all(),
+        ));
+
+        let (mock_waker, _) = mock_waker();
+        let mut cx = Context::from_waker(&mock_waker);
+
+        // Poll once to initialize the backend
+        let mut op_fut = pin!(op);
+        assert!(matches!(op_fut.as_mut().poll(&mut cx), Poll::Pending));
+
+        let res = std::panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            unsafe {
+                // Drop is idempotent
+                let ptr = op_fut.get_unchecked_mut();
+                std::ptr::drop_in_place(ptr);
+                std::ptr::drop_in_place(ptr);
+            }
+        }));
+        assert!(res.is_ok());
+
+        Ok(())
     }
 }

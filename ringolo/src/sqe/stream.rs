@@ -43,6 +43,8 @@ impl SqeStream {
         }
     }
 
+    // This API helps determine if the stream should be cleaned up. Important
+    // otherwise we will keep posting CQE forever depending on the stream config.
     pub(crate) fn cancel(&mut self) -> Option<usize> {
         let old = mem::replace(&mut self.state, SqeStreamState::Cancelled);
         match old {
@@ -165,6 +167,7 @@ impl Drop for SqeStream {
         }
 
         if let Err(e) = self.get_idx().map(|idx| {
+            dbg!("Dropping SqeStream: removing idx {}", idx);
             with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);
