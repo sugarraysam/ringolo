@@ -29,7 +29,7 @@ impl Future for Sleep {
         match ready!(this.inner.poll(cx)) {
             Ok(_) => Poll::Ready(Ok(())),
             Err(e) if e.raw_os_error() == Some(libc::ETIME) => Poll::Ready(Ok(())),
-            Err(e) => Poll::Ready(Err(e)),
+            Err(e) => Poll::Ready(Err(e.into())),
         }
     }
 }

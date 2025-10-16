@@ -22,6 +22,7 @@ futures = "~0.3.31"
 # io-uring = "^0.7.10"
 io-uring = { version = "0.7.10", path = "../../io-uring" }
 libc = { version = "~0.2.98", default-features = false }
+nix = { version = "~0.30.1", features = ["socket"] }
 paste = "~1.0.15"
 pin-project = "~1.1.10"
 ringolo-macros = { version = "0.1.0", path = "../ringolo-macros" }

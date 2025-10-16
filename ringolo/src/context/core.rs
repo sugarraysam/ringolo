@@ -2,19 +2,12 @@
 
 use crate::context::RawSqeSlab;
 use crate::runtime::RuntimeConfig;
-use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 use crate::task::Id;
-use crate::utils::ScopeGuard;
 use anyhow::Result;
-use io_uring::squeue::Entry;
 use std::cell::{Cell, RefCell};
-use std::io;
 use std::num::NonZeroU64;
 use std::os::unix::io::RawFd;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::Poll;
-use std::time::Duration;
 
 use crate::context::ring::SingleIssuerRing;
 
@@ -41,7 +34,7 @@ pub(crate) struct Core {
 
 impl Core {
     pub(crate) fn try_new(cfg: &RuntimeConfig) -> Result<Self> {
-        let ring = SingleIssuerRing::try_new(cfg.sq_ring_size as u32)?;
+        let ring = SingleIssuerRing::try_new(cfg)?;
 
         Ok(Self {
             thread_id: ThreadId::next(),

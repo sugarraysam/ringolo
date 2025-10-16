@@ -5,7 +5,6 @@ use crate::sqe::{
 use anyhow::anyhow;
 use io_uring::squeue::Entry;
 use std::io::{self, Error};
-use std::pin::Pin;
 use std::task::{Poll, Waker};
 
 #[derive(Debug)]

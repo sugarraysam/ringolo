@@ -2,14 +2,14 @@ use crate::context::slab::SlabReservedBatch;
 use crate::context::{with_slab_and_ring_mut, with_slab_mut};
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
-use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
+use crate::sqe::{increment_pending_io, Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::anyhow;
 use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
 use std::io::{self, Error};
 use std::iter;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 // Batch and Chain APIs resolve to this type
@@ -27,7 +27,7 @@ pub(crate) enum SqeListState {
         indices: SmallVec<[usize; SPILL_TO_HEAP_THRESHOLD]>,
         remaining: Arc<AtomicUsize>,
 
-        #[allow(unused)]
+        #[allow(dead_code)]
         kind: SqeListKind,
     },
 }

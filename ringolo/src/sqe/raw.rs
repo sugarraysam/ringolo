@@ -40,7 +40,7 @@ impl RawSqe {
     }
 
     // Used in tests.
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) fn has_waker(&self) -> bool {
         self.waker.is_some()
     }
@@ -291,6 +291,9 @@ impl CompletionHandler {
 
     pub(crate) fn new_stream(count: u32) -> CompletionHandler {
         CompletionHandler::Stream {
+            // Make sure to store results on the heap. CompletionHandler enum is as large as
+            // the largest variant so if we were to use a SmallVec here, the size of every
+            // RawSqe in the slab would be bound by the size of CompletionHandler::Stream.
             results: VecDeque::new(),
             completion: StreamCompletion::new(count),
         }
@@ -417,7 +420,7 @@ mod tests {
                 })
                 .collect::<Result<SmallVec<_>>>()?;
 
-            batch.commit(entries);
+            let _ = batch.commit(entries)?;
 
             for i in (0..n_sqes) {
                 let raw = slab.get_mut(indices[i])?;

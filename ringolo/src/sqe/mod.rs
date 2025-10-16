@@ -1,4 +1,4 @@
-#![allow(unused)]
+#![allow(dead_code)]
 
 use crate::context::with_core;
 use crate::runtime::{Schedule, SchedulerPanic};
@@ -14,7 +14,8 @@ pub(crate) mod errors;
 pub(crate) use errors::IoError;
 
 pub(crate) mod list;
-pub(crate) use self::list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
+#[allow(unused)]
+pub(crate) use list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
 
 pub(crate) mod raw;
 pub(crate) use self::raw::RawSqe;
@@ -207,6 +208,7 @@ pub(super) fn increment_pending_io(waker: &Waker) {
 
 #[cfg(test)]
 mod tests {
+    use super::list::{SqeList, SqeListKind};
     use super::*;
     use crate::context::{with_ring_mut, with_slab_and_ring_mut};
     use crate::test_utils::*;

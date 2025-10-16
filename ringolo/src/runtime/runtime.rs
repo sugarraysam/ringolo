@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use std::cell::Cell;
 use std::convert::TryFrom;
 use std::fmt;
+use std::io;
 use std::sync::Arc;
 use std::thread;
 
@@ -29,6 +30,9 @@ const SQ_RING_SIZE: usize = 64;
 
 /// Final cq ring size is SQ_RING_SIZE * multipler
 const CQ_RING_SIZE_MULTIPLIER: usize = 2;
+
+/// Number of direct file descriptors per ring
+const DIRECT_FDS_PER_RING: u32 = 1024;
 
 ///
 /// Event Loop policies
@@ -123,6 +127,10 @@ pub struct Builder {
     /// loud signal to the user and runtim configuration needs to be changed ASAP.
     pub(super) cq_ring_size_multiplier: usize,
 
+    /// Number of direct file descriptors per ring. We use `register_files_sparse`
+    /// so make sure you use `KernelFdMode::DirectAuto` for best results.
+    pub(super) direct_fds_per_ring: u32,
+
     /// When cancellation an `io_uring` operation fails, what to do?
     pub(super) on_cancel_error: OnCancelError,
 }
@@ -142,6 +150,7 @@ impl Builder {
             sq_ring_size: SQ_RING_SIZE,
             cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
             on_cancel_error: OnCancelError::default(),
+            direct_fds_per_ring: DIRECT_FDS_PER_RING,
         }
     }
 
@@ -251,6 +260,11 @@ impl Builder {
 
     pub fn cq_ring_size_multiplier(mut self, val: usize) -> Self {
         self.cq_ring_size_multiplier = val;
+        self
+    }
+
+    pub fn direct_fds_per_ring(mut self, val: u32) -> Self {
+        self.direct_fds_per_ring = val;
         self
     }
 
@@ -379,7 +393,24 @@ pub(crate) struct RuntimeConfig {
     pub(crate) max_unsubmitted_sqes: usize,
     pub(crate) sq_ring_size: usize,
     pub(crate) cq_ring_size_multiplier: usize,
+    pub(crate) direct_fds_per_ring: u32,
     pub(crate) on_cancel_error: OnCancelError,
+}
+
+impl RuntimeConfig {
+    fn validate(&self) -> Result<()> {
+        if self.sq_ring_size == 0 {
+            return Err(anyhow!("sq_ring_size must be greater than 0"));
+        }
+
+        if self.cq_ring_size_multiplier == 0 {
+            return Err(anyhow!("cq_ring_size_multiplier must be greater than 0"));
+        }
+
+        check_fd_ulimit(self.worker_threads * self.direct_fds_per_ring as usize)?;
+
+        Ok(())
+    }
 }
 
 impl TryFrom<Builder> for RuntimeConfig {
@@ -390,7 +421,7 @@ impl TryFrom<Builder> for RuntimeConfig {
             .worker_threads
             .unwrap_or(thread::available_parallelism()?.get());
 
-        Ok(RuntimeConfig {
+        let cfg = RuntimeConfig {
             worker_threads,
             max_blocking_threads: builder.max_blocking_threads,
             thread_name: builder.thread_name,
@@ -401,8 +432,45 @@ impl TryFrom<Builder> for RuntimeConfig {
             max_unsubmitted_sqes: builder.max_unsubmitted_sqes,
             sq_ring_size: builder.sq_ring_size,
             cq_ring_size_multiplier: builder.cq_ring_size_multiplier,
+            direct_fds_per_ring: builder.direct_fds_per_ring,
             on_cancel_error: builder.on_cancel_error,
-        })
+        };
+
+        cfg.validate()?;
+
+        Ok(cfg)
+    }
+}
+
+/// Checks if the desired number of file descriptors is within the system's soft limit.
+///
+/// # Arguments
+/// * `desired_fds` - The total number of file descriptors your application requires.
+///
+/// # Returns
+/// * `Ok(())` if the limit is sufficient.
+/// * `Err(std::io::Error)` with a descriptive message if the limit is too low or cannot be read.
+fn check_fd_ulimit(desired_fds: usize) -> io::Result<()> {
+    let mut rlimit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, rlimit.as_mut_ptr()) };
+
+    if ret != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let rlimit = unsafe { rlimit.assume_init() };
+    let current_limit = rlimit.rlim_cur as usize;
+
+    if desired_fds > current_limit {
+        let error_message = format!(
+            "Required file descriptors ({}) exceed the current ulimit ({}) for open files. \
+             Please increase the limit. For example, run 'ulimit -n 65536' in your shell before \
+             starting the application.",
+            desired_fds, current_limit
+        );
+        Err(io::Error::other(error_message))
+    } else {
+        Ok(())
     }
 }
 

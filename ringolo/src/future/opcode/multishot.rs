@@ -1,55 +1,60 @@
-use crate::future::opcode::{Fd, MultishotParams, MultishotPayload};
+use crate::future::opcode::{
+    KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, UringFd,
+};
 use crate::sqe::IoError;
 use anyhow::Result;
+use anyhow::anyhow;
 use io_uring::types::{TimeoutFlags, Timespec};
 use pin_project::pin_project;
-use std::io;
-use std::os::fd::{AsRawFd, RawFd};
 use std::pin::Pin;
 use std::time::Duration;
 
 #[derive(Debug)]
 pub struct AcceptMultishot {
-    fd: RawFd,
-    allocate_file_index: bool,
-    flags: i32,
+    sockfd: UringFd,
+    mode: KernelFdMode,
+    flags: i32, // TODO: nix flags
 }
 
 impl AcceptMultishot {
     /// The `allocate_file_index` flag maps to the `IORING_FILE_INDEX_ALLOC` from the docs.
     /// The kernel will dynamically choose a direct descriptor index if this option is true.
     /// You need to have registered direct descriptors prior for this to work.
-    pub fn new(fd: &impl AsRawFd, allocate_file_index: bool, flags: Option<i32>) -> Self {
-        Self {
-            fd: fd.as_raw_fd(),
-            allocate_file_index,
-            flags: flags.unwrap_or(0),
+    pub fn try_new(sockfd: UringFd, mode: KernelFdMode, flags: Option<i32>) -> Result<Self> {
+        if matches!(mode, KernelFdMode::Direct(_)) {
+            Err(anyhow!("AcceptMultishot does not support fixed slots"))
+        } else {
+            Ok(Self {
+                sockfd,
+                mode,
+                flags: flags.unwrap_or(0),
+            })
         }
     }
 }
 
 impl MultishotPayload for AcceptMultishot {
-    type Item = io::Result<Fd>;
+    type Item = UringFd;
 
-    fn create_params(self: Pin<&mut Self>) -> MultishotParams {
-        let entry = io_uring::opcode::AcceptMulti::new(io_uring::types::Fd(self.fd))
-            .allocate_file_index(self.allocate_file_index)
-            .flags(self.flags)
-            .build();
+    fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError> {
+        let mut entry = resolve_fd!(self.sockfd, |fd| io_uring::opcode::AcceptMulti::new(fd));
 
-        MultishotParams::new(entry, 0 /* infinite */)
+        if self.mode == KernelFdMode::DirectAuto {
+            entry = entry.allocate_file_index(true);
+        };
+
+        Ok(MultishotParams::new(
+            entry.flags(self.flags).build(),
+            0, /* infinite */
+        ))
     }
 
-    fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>) -> Self::Item {
-        match result {
-            Ok(fd) => Ok(if self.allocate_file_index {
-                Fd::Registered(fd as u32)
-            } else {
-                // TODO: lookup registered fd table for this thread, provide better API
-                Fd::Unregistered(fd)
-            }),
-            Err(e) => Err(e.into()),
-        }
+    fn into_next(
+        self: Pin<&mut Self>,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Item, IoError> {
+        let fd = result?;
+        Ok(UringFd::from_result(fd, self.mode))
     }
 }
 
@@ -76,9 +81,9 @@ impl TimeoutMultishot {
 }
 
 impl MultishotPayload for TimeoutMultishot {
-    type Item = io::Result<()>;
+    type Item = ();
 
-    fn create_params(self: Pin<&mut Self>) -> MultishotParams {
+    fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError> {
         let this = self.project();
 
         let timespec_addr = &*this.timespec as *const Timespec;
@@ -88,14 +93,17 @@ impl MultishotPayload for TimeoutMultishot {
             .flags(*this.flags)
             .build();
 
-        MultishotParams::new(entry, *this.count)
+        Ok(MultishotParams::new(entry, *this.count))
     }
 
-    fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>) -> Self::Item {
+    fn into_next(
+        self: Pin<&mut Self>,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Item, IoError> {
         match result {
             Ok(_) => Ok(()),
             Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
-            Err(e) => Err(e.into()),
+            Err(e) => Err(e),
         }
     }
 }
@@ -105,12 +113,12 @@ mod tests {
     use std::{
         io::{Read, Write},
         net::{TcpListener, TcpStream},
-        os::fd::FromRawFd,
+        os::fd::{AsRawFd, FromRawFd},
     };
 
     use super::*;
-    use crate::utils::scheduler::Method;
     use crate::{self as ringolo, future::opcode::Multishot};
+    use crate::{future::opcode::common::UringFdKind, utils::scheduler::Method};
     use anyhow::Result;
     use futures::StreamExt;
 
@@ -138,7 +146,12 @@ mod tests {
         });
 
         {
-            let mut stream = Multishot::new(AcceptMultishot::new(&listener, false, None)).take(n);
+            let mut stream = Multishot::new(AcceptMultishot::try_new(
+                listener.as_raw_fd().into(),
+                KernelFdMode::Legacy,
+                None,
+            )?)
+            .take(n);
 
             let mut got = 0;
             while let Some(res) = stream.next().await
@@ -146,9 +159,9 @@ mod tests {
             {
                 assert!(res.is_ok());
 
-                let mut stream = match res.unwrap() {
-                    Fd::Unregistered(fd) => unsafe { TcpStream::from_raw_fd(fd.into()) },
-                    Fd::Registered(_) => panic!("should not be registered"),
+                let mut stream = match res.unwrap().kind() {
+                    UringFdKind::Raw(raw) => unsafe { TcpStream::from_raw_fd(raw) },
+                    UringFdKind::Fixed(_) => panic!("should not be fixed"),
                 };
 
                 stream.write_all(hello)?;

@@ -1,8 +1,7 @@
-use std::io::{self, Error};
-
-use io_uring::squeue::PushError;
-
+use crate::future::opcode::OpcodeError;
 use crate::runtime::{PanicReason, YieldReason};
+use io_uring::squeue::PushError;
+use std::io::{self, Error};
 
 /// A centralized error type for all scheduler and runtime operations.
 #[derive(thiserror::Error, Debug)]
@@ -23,6 +22,9 @@ pub enum IoError {
 
     #[error("FATAL: Slab allocator is in an invalid state")]
     SlabInvalidState,
+
+    #[error("Opcode error: {0}")]
+    Opcode(#[from] OpcodeError),
 
     /// An I/O error occurred.
     #[error("I/O error: {0}")]
@@ -67,6 +69,13 @@ impl IoError {
             _ => PanicReason::Unknown,
         }
     }
+
+    pub(crate) fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            IoError::Io(e) => e.raw_os_error(),
+            _ => None,
+        }
+    }
 }
 
 impl PartialEq for IoError {
@@ -75,6 +84,7 @@ impl PartialEq for IoError {
             (Self::SqRingFull { .. }, Self::SqRingFull { .. }) => true,
             (Self::SlabFull, Self::SlabFull) => true,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
+            (Self::Opcode(a), Self::Opcode(b)) => a == b,
             _ => false,
         }
     }

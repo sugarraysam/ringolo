@@ -20,7 +20,7 @@ pub(crate) struct Context {
     /// TODO: implement RingMessage protocol so runtime threads can communicate
     /// with each other. Most interesting use case is ringolo-console CLI to
     /// send various commands from a TUI/GUI.
-    #[allow(unused)]
+    #[allow(dead_code)]
     pub(crate) ring_msg_counter: RefCell<u32>,
 }
 

@@ -1,54 +1,181 @@
+#![allow(unsafe_op_in_unsafe_fn)]
+use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-/// A helper function to safely convert raw `sockaddr_storage` and `socklen_t`
-/// into a high-level Rust `SocketAddr`.
-pub(super) fn sockaddr_storage_to_socket_addr(
-    storage: &libc::sockaddr_storage,
-    len: libc::socklen_t,
-) -> io::Result<SocketAddr> {
-    match storage.ss_family as libc::c_int {
-        libc::AF_INET => {
-            // Sanity check: ensure the length is at least the size of the IPv4 struct.
-            if (len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid length for sockaddr_in",
-                ));
-            }
-            // SAFETY: We've checked the address family (AF_INET) and the length,
-            // so it is safe to cast the pointer to the correct type.
-            let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
-            let ip = Ipv4Addr::from(addr.sin_addr.s_addr.to_ne_bytes());
+///
+/// C socket integration with `libc`, copied from `std::net`.
+///
+#[repr(C)]
+pub(super) union SocketAddrCRepr {
+    v4: libc::sockaddr_in,
+    v6: libc::sockaddr_in6,
+}
 
-            // Port is in network byte order, so convert it to host byte order.
-            let port = u16::from_be(addr.sin_port);
-            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+impl SocketAddrCRepr {
+    pub(super) fn as_ptr(&self) -> *const libc::sockaddr {
+        std::ptr::from_ref(self).cast()
+    }
+
+    pub(super) fn as_socket_addr(&self) -> Option<SocketAddr> {
+        // SAFETY: Reading `sin_family` is safe because it's the first field
+        // in both union variants and has the same type.
+        match unsafe { self.v4.sin_family } as i32 {
+            libc::AF_INET => {
+                let addr = unsafe { self.v4 };
+                Some(SocketAddr::V4(socket_addr_v4_from_c(addr)))
+            }
+            libc::AF_INET6 => {
+                let addr = unsafe { self.v6 };
+                Some(SocketAddr::V6(socket_addr_v6_from_c(addr)))
+            }
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Debug for SocketAddrCRepr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(addr) = self.as_socket_addr() {
+            fmt::Debug::fmt(&addr, f)
+        } else {
+            // Fallback for unknown address families
+            let family = unsafe { self.v4.sin_family };
+            f.debug_struct("SocketAddrCRepr")
+                .field("unknown_family", &family)
+                .finish()
+        }
+    }
+}
+
+pub(super) fn socket_addr_to_c(addr: &SocketAddr) -> (SocketAddrCRepr, libc::socklen_t) {
+    match addr {
+        SocketAddr::V4(a) => {
+            let sockaddr = SocketAddrCRepr {
+                v4: socket_addr_v4_to_c(a),
+            };
+            (sockaddr, size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        SocketAddr::V6(a) => {
+            let sockaddr = SocketAddrCRepr {
+                v6: socket_addr_v6_to_c(a),
+            };
+            (sockaddr, size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
+}
+
+pub(super) unsafe fn socket_addr_from_c(
+    storage: *const libc::sockaddr_storage,
+    len: usize,
+) -> io::Result<SocketAddr> {
+    match (*storage).ss_family as libc::c_int {
+        libc::AF_INET => {
+            assert!(len >= size_of::<libc::sockaddr_in>());
+            Ok(SocketAddr::V4(socket_addr_v4_from_c(*(storage.cast()))))
         }
         libc::AF_INET6 => {
-            // Sanity check for IPv6.
-            if (len as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "invalid length for sockaddr_in6",
-                ));
-            }
-            // SAFETY: We've checked the address family (AF_INET6) and the length.
-            let addr = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
-            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
-
-            // Port is in network byte order, so convert it to host byte order.
-            let port = u16::from_be(addr.sin6_port);
-            Ok(SocketAddr::V6(SocketAddrV6::new(
-                ip,
-                port,
-                addr.sin6_flowinfo,
-                addr.sin6_scope_id,
-            )))
+            assert!(len >= size_of::<libc::sockaddr_in6>());
+            Ok(SocketAddr::V6(socket_addr_v6_from_c(*(storage.cast()))))
         }
         _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "unsupported address family",
+            io::ErrorKind::InvalidInput,
+            "invalid argument",
         )),
+    }
+}
+
+fn socket_addr_v4_to_c(addr: &SocketAddrV4) -> libc::sockaddr_in {
+    libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: addr.port().to_be(),
+        sin_addr: ip_v4_addr_to_c(addr.ip()),
+        ..unsafe { std::mem::zeroed() }
+    }
+}
+
+fn socket_addr_v6_to_c(addr: &SocketAddrV6) -> libc::sockaddr_in6 {
+    libc::sockaddr_in6 {
+        sin6_family: libc::AF_INET6 as libc::sa_family_t,
+        sin6_port: addr.port().to_be(),
+        sin6_addr: ip_v6_addr_to_c(addr.ip()),
+        sin6_flowinfo: addr.flowinfo(),
+        sin6_scope_id: addr.scope_id(),
+        ..unsafe { std::mem::zeroed() }
+    }
+}
+
+fn socket_addr_v4_from_c(addr: libc::sockaddr_in) -> SocketAddrV4 {
+    SocketAddrV4::new(
+        ip_v4_addr_from_c(addr.sin_addr),
+        u16::from_be(addr.sin_port),
+    )
+}
+
+fn socket_addr_v6_from_c(addr: libc::sockaddr_in6) -> SocketAddrV6 {
+    SocketAddrV6::new(
+        ip_v6_addr_from_c(addr.sin6_addr),
+        u16::from_be(addr.sin6_port),
+        addr.sin6_flowinfo,
+        addr.sin6_scope_id,
+    )
+}
+
+fn ip_v4_addr_to_c(addr: &Ipv4Addr) -> libc::in_addr {
+    // `s_addr` is stored as BE on all machines and the array is in BE order.
+    // So the native endian conversion method is used so that it's never swapped.
+    libc::in_addr {
+        s_addr: u32::from_ne_bytes(addr.octets()),
+    }
+}
+
+fn ip_v6_addr_to_c(addr: &Ipv6Addr) -> libc::in6_addr {
+    libc::in6_addr {
+        s6_addr: addr.octets(),
+    }
+}
+
+fn ip_v4_addr_from_c(addr: libc::in_addr) -> Ipv4Addr {
+    Ipv4Addr::from(addr.s_addr.to_ne_bytes())
+}
+
+fn ip_v6_addr_from_c(addr: libc::in6_addr) -> Ipv6Addr {
+    Ipv6Addr::from(addr.s6_addr)
+}
+
+pub(super) fn sockname<F>(f: F) -> io::Result<SocketAddr>
+where
+    F: FnOnce(*mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int,
+{
+    unsafe {
+        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = size_of_val(&storage) as libc::socklen_t;
+        cvt(f((&raw mut storage).cast(), &mut len))?;
+        socket_addr_from_c(&storage, len as usize)
+    }
+}
+
+#[doc(hidden)]
+pub(super) trait IsMinusOne {
+    fn is_minus_one(&self) -> bool;
+}
+
+macro_rules! impl_is_minus_one {
+    ($($t:ident)*) => ($(impl IsMinusOne for $t {
+        fn is_minus_one(&self) -> bool {
+            *self == -1
+        }
+    })*)
+}
+
+impl_is_minus_one! { i8 i16 i32 i64 isize }
+
+/// Converts native return values to Result using the *-1 means error is in `errno`*  convention.
+/// Non-error values are `Ok`-wrapped.
+pub(super) fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
+    if t.is_minus_one() {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(t)
     }
 }

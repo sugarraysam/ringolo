@@ -1,4 +1,5 @@
 use crate::future::opcode::{Multishot, TimeoutMultishot};
+use crate::sqe::IoError;
 use futures::Stream;
 use pin_project::pin_project;
 use std::io;
@@ -31,7 +32,7 @@ impl Stream for Tick {
 
         match res {
             None => Poll::Ready(None),
-            Some(r) => Poll::Ready(Some(r)),
+            Some(r) => Poll::Ready(Some(r.map_err(IoError::into))),
         }
     }
 }

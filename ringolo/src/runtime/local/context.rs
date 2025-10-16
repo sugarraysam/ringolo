@@ -1,12 +1,10 @@
 // Expose rich API for developers even if unused.
-#![allow(unused)]
+#![allow(dead_code)]
 
 use crate::context::Core;
 use crate::context::RawSqeSlab;
 use crate::context::SingleIssuerRing;
-use crate::runtime::OwnedTasks;
 use crate::runtime::RuntimeConfig;
-use crate::runtime::local;
 use crate::utils::ScopeGuard;
 use anyhow::Result;
 use std::cell::RefCell;

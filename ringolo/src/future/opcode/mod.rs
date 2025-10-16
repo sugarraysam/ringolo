@@ -38,15 +38,19 @@ use std::task::{Context, Poll, ready};
 
 pub(crate) mod builder;
 
+pub(crate) mod errors;
+pub(crate) use errors::OpcodeError;
+
+#[macro_use]
 pub(crate) mod common;
-pub(crate) use common::Fd;
+pub(crate) use common::{KernelFdMode, UringFd};
 
 pub mod multishot;
 pub use multishot::TimeoutMultishot;
 
 pub(super) mod parse;
 pub mod single;
-pub use single::TimeoutOp;
+pub use single::{CloseOp, TimeoutOp};
 
 // TODO:
 // - single :: impl Nop
@@ -68,11 +72,14 @@ pub use single::TimeoutOp;
 pub(crate) trait OpPayload {
     type Output;
 
-    fn create_params(self: Pin<&mut Self>) -> OpParams;
+    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError>;
 
     // Safety: This method should only be called once, when the operation is complete.
     // It is allowed to "consume the pin" so we can return owned data without copies.
-    fn into_output(self: Pin<&mut Self>, result: Result<i32, IoError>) -> Self::Output;
+    fn into_output(
+        self: Pin<&mut Self>,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError>;
 }
 
 #[derive(Debug)]
@@ -120,13 +127,13 @@ impl<T: OpPayload> Op<T> {
 }
 
 impl<T: OpPayload> Future for Op<T> {
-    type Output = T::Output;
+    type Output = Result<T::Output, IoError>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut this = self.project();
 
         if !*this.initialized {
-            let params = this.data.as_mut().create_params();
+            let params = this.data.as_mut().create_params()?;
             let backend = Sqe::new(SqeSingle::new(params.0));
             this.backend.write(backend);
             *this.initialized = true;
@@ -160,9 +167,10 @@ impl<T: OpPayload> PinnedDrop for Op<T> {
 pub(crate) trait MultishotPayload {
     type Item;
 
-    fn create_params(self: Pin<&mut Self>) -> MultishotParams;
+    fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError>;
 
-    fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>) -> Self::Item;
+    fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>)
+    -> Result<Self::Item, IoError>;
 }
 
 #[derive(Debug)]
@@ -232,13 +240,13 @@ impl<T: MultishotPayload> Multishot<T> {
 }
 
 impl<T: MultishotPayload> Stream for Multishot<T> {
-    type Item = T::Item;
+    type Item = Result<T::Item, IoError>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut this = self.project();
 
         if !*this.initialized {
-            let params = this.data.as_mut().create_params();
+            let params = this.data.as_mut().create_params()?;
             let backend = SqeStream::new(params.entry, params.count);
 
             this.backend.write(backend);

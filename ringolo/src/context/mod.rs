@@ -1,7 +1,7 @@
 // Keep unused context methods to provide rich API for future developers.
-#![allow(unused)]
+#![allow(dead_code)]
 
-use crate::runtime::{RuntimeConfig, Schedule, Scheduler, local, stealing};
+use crate::runtime::{local, stealing, RuntimeConfig, Scheduler};
 use crate::task::Id;
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};

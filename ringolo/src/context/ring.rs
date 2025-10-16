@@ -7,6 +7,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
 use crate::context::RawSqeSlab;
+use crate::runtime::RuntimeConfig;
 use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 
 pub(crate) struct SingleIssuerRing {
@@ -14,7 +15,7 @@ pub(crate) struct SingleIssuerRing {
 }
 
 impl SingleIssuerRing {
-    pub(crate) fn try_new(sq_ring_size: u32) -> Result<Self> {
+    pub(crate) fn try_new(cfg: &RuntimeConfig) -> Result<Self> {
         let ring = IoUring::builder()
             // Keep submitting requests even if we encounter error. This is
             // important to reduce the number of syscall. We also want to produce
@@ -34,7 +35,7 @@ impl SingleIssuerRing {
             // Setup IORING_SQ_TASKRUN flag on SQ ring to indicate if completions
             // are pending w/o a syscall to `io_uring_enter`
             .setup_taskrun_flag()
-            .build(sq_ring_size)?;
+            .build(cfg.sq_ring_size as u32)?;
 
         // Check features and warn users.
         if !ring.params().is_feature_nodrop() {
@@ -42,6 +43,9 @@ impl SingleIssuerRing {
                 "Warning: IORING_FEAT_NODROP is not enabled for this kernel. The kernel will silently drop completions if the CQ ring is full."
             )
         }
+
+        ring.submitter()
+            .register_files_sparse(cfg.direct_fds_per_ring)?;
 
         Ok(SingleIssuerRing { ring })
     }
@@ -264,7 +268,7 @@ mod tests {
                     raws.push(RawSqe::new(CompletionHandler::new_single()));
                 });
 
-                batch.commit(raws);
+                let _ = batch.commit(raws)?;
             };
 
             ring.push_batch(&nops)?;
@@ -321,7 +325,7 @@ mod tests {
                     raws.push(raw);
                 });
 
-                batch.commit(raws);
+                let _ = batch.commit(raws)?;
             };
 
             ring.push_batch(&nops)?;

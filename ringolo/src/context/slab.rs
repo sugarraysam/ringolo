@@ -1,7 +1,7 @@
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
 use crate::sqe::raw::RawSqe;
-use anyhow::{Context, anyhow};
+use anyhow::anyhow;
 use slab::{Slab, VacantEntry};
 use smallvec::SmallVec;
 use std::io::{self, Error, ErrorKind};
