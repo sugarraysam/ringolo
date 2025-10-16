@@ -222,11 +222,12 @@ impl<T: MultishotPayload> Multishot<T> {
             }
         };
 
-        // TODO: make OnCancelError configurable? Runtime config?
-        let builder = io_uring::types::CancelBuilder::user_data(user_data as u64).all();
-        let cancel_task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data).build();
+        // Using `.all()` will NOT return -ENOENT if we can't find the associated SQE with user_data.
+        // Better to target a single SQE even if it is multishot.
+        let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
+        let task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data);
 
-        Some(crate::runtime::spawn_cancel(cancel_task))
+        Some(crate::runtime::spawn_cancel(task))
     }
 }
 

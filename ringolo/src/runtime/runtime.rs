@@ -1,6 +1,7 @@
 use crate as ringolo;
 use crate::context::init_local_context;
 use crate::runtime::Scheduler;
+use crate::runtime::cancel::OnCancelError;
 use crate::runtime::local;
 use crate::runtime::stealing;
 use crate::task::JoinHandle;
@@ -121,6 +122,9 @@ pub struct Builder {
     /// In all cases, if the SQ ring goes above capacity, the program should send a
     /// loud signal to the user and runtim configuration needs to be changed ASAP.
     pub(super) cq_ring_size_multiplier: usize,
+
+    /// When cancellation an `io_uring` operation fails, what to do?
+    pub(super) on_cancel_error: OnCancelError,
 }
 
 impl Builder {
@@ -137,6 +141,7 @@ impl Builder {
             max_unsubmitted_sqes: MAX_UNSUBMITTED_SQES,
             sq_ring_size: SQ_RING_SIZE,
             cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
+            on_cancel_error: OnCancelError::default(),
         }
     }
 
@@ -246,6 +251,11 @@ impl Builder {
 
     pub fn cq_ring_size_multiplier(mut self, val: usize) -> Self {
         self.cq_ring_size_multiplier = val;
+        self
+    }
+
+    pub fn on_cancel_error(mut self, on_cancel: OnCancelError) -> Self {
+        self.on_cancel_error = on_cancel;
         self
     }
 
@@ -369,6 +379,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) max_unsubmitted_sqes: usize,
     pub(crate) sq_ring_size: usize,
     pub(crate) cq_ring_size_multiplier: usize,
+    pub(crate) on_cancel_error: OnCancelError,
 }
 
 impl TryFrom<Builder> for RuntimeConfig {
@@ -390,6 +401,7 @@ impl TryFrom<Builder> for RuntimeConfig {
             max_unsubmitted_sqes: builder.max_unsubmitted_sqes,
             sq_ring_size: builder.sq_ring_size,
             cq_ring_size_multiplier: builder.cq_ring_size_multiplier,
+            on_cancel_error: builder.on_cancel_error,
         })
     }
 }

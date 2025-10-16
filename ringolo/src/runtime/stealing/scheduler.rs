@@ -1,7 +1,7 @@
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
-use crate::runtime::{PanicReason, Schedule, TaskOpts, YieldReason};
+use crate::runtime::{PanicReason, Schedule, SchedulerPanic, TaskOpts, YieldReason};
 use crate::sqe::IoError;
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
@@ -116,8 +116,8 @@ impl Schedule for Handle {
         unimplemented!("todo");
     }
 
-    /// Polling the task resulted in a panic. Should the runtime shutdown?
-    fn unhandled_panic(&self, _reason: PanicReason) {
+    /// Polling the task resulted in a panic.
+    fn unhandled_panic(&self, payload: SchedulerPanic) {
         unimplemented!("todo");
     }
 }
@@ -134,8 +134,7 @@ impl Handle {
     {
         let id = crate::task::Id::next();
 
-        let (task, notified, join_handle) =
-            crate::task::new_task(future, task_opts, self.clone(), id);
+        let (task, notified, join_handle) = crate::task::new_task(future, task_opts, self.clone());
 
         // TODO: insert task take ownership
         // debug_assert!(self.tasks.insert(task).is_none());

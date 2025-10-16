@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::Result;
 use bitflags::bitflags;
+use std::fmt;
 use std::task::Waker;
 
 // Public API
@@ -13,7 +14,7 @@ pub use runtime::Builder;
 
 // Exports
 pub(crate) mod cancel;
-pub(crate) use cancel::{CancelTask, CancelTaskBuilder};
+pub(crate) use cancel::CancelTaskBuilder;
 
 pub(crate) mod local;
 
@@ -51,8 +52,9 @@ pub(crate) trait Schedule: Sync + Sized + 'static {
     /// If the scheduler has already released the task, then None is returned.
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>>;
 
-    /// Polling the task resulted in a panic. Should the runtime shutdown?
-    fn unhandled_panic(&self, reason: PanicReason);
+    /// Polling the task resulted in a panic. Let the scheduler handle it according
+    /// to runtime config and policies.
+    fn unhandled_panic(&self, payload: SchedulerPanic);
 }
 
 #[derive(Debug)]
@@ -74,7 +76,25 @@ pub(crate) enum PanicReason {
     SqBatchTooLarge,
     SqRingInvalidState,
     SlabInvalidState,
+    PollingFuture,
+    StoringTaskOutput,
+    CancelTask,
     Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SchedulerPanic {
+    pub(crate) reason: PanicReason,
+    pub(crate) msg: String,
+}
+
+impl SchedulerPanic {
+    pub fn new(reason: PanicReason, msg: impl fmt::Display) -> Self {
+        Self {
+            reason,
+            msg: msg.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -141,8 +161,13 @@ where
     with_scheduler!(|s| { s.spawn(future, None) })
 }
 
-pub(crate) fn spawn_cancel<T: OpCancelPayload>(task: CancelTask<T>) -> JoinHandle<()> {
-    // Cancel tasks need to be sticky to the local thread. It does not make sense
-    // to cancel an io_uring operation from another thread.
-    with_scheduler!(|s| { s.spawn(task.into_future(), Some(TaskOpts::STICKY)) })
+pub(crate) fn spawn_cancel<T: OpCancelPayload>(builder: CancelTaskBuilder<T>) -> JoinHandle<()> {
+    with_scheduler!(|s| {
+        // Copy the runtime OnCancelError policy into the builder.
+        let task = builder.on_error(s.cfg.on_cancel_error).build();
+
+        // Cancel tasks need to be sticky to the local thread. It does not make sense
+        // to cancel an io_uring operation from another thread.
+        s.spawn(task.into_future(), Some(TaskOpts::STICKY))
+    })
 }

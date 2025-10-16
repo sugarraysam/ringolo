@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 use crate::context::with_core;
-use crate::runtime::Schedule;
+use crate::runtime::{Schedule, SchedulerPanic};
 use crate::task::Header;
 use crate::with_scheduler;
 use std::future::Future;
@@ -104,10 +104,10 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send
                             this.state = State::Completed;
 
                             if e.is_fatal() {
-                                with_scheduler!(|s| {
-                                    s.unhandled_panic(e.as_panic_reason());
-                                });
-                                unreachable!("scheduler should panic");
+                                std::panic::panic_any(SchedulerPanic::new(
+                                    e.as_panic_reason(),
+                                    e.to_string(),
+                                ));
                             }
 
                             return Poll::Ready(Err(e));

@@ -1,8 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{PanicReason, Schedule, YieldReason};
+use crate::runtime::{Schedule, SchedulerPanic, YieldReason};
 use crate::task::layout::vtable;
-use crate::task::{Header, JoinHandle, Notified, State, Task};
+use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
-#[derive(Debug)]
+#[derive(Debug, Default, Copy, Clone)]
 pub(crate) struct DummyScheduler;
 
 impl Schedule for DummyScheduler {
@@ -26,7 +26,7 @@ impl Schedule for DummyScheduler {
         unimplemented!("dummy scheduler");
     }
 
-    fn unhandled_panic(&self, _reason: PanicReason) {
+    fn unhandled_panic(&self, _payload: SchedulerPanic) {
         unimplemented!("dummy scheduler");
     }
 }
@@ -47,7 +47,7 @@ impl WakerData {
         let vtable = vtable::<Ready<()>, DummyScheduler>();
 
         Self {
-            header: Header::new(State::new(), vtable, None),
+            header: Header::new(State::new(), vtable, None, Id::next()),
             wake_count: AtomicUsize::new(0),
         }
     }

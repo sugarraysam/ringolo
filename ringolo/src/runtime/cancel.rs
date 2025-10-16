@@ -1,8 +1,7 @@
 use crate::context::with_slab_mut;
 use crate::future::opcode::{Op, OpPayload};
-use crate::runtime::{PanicReason, Schedule};
+use crate::runtime::{PanicReason, SchedulerPanic};
 use crate::sqe::IoError;
-use crate::with_scheduler;
 use std::pin::pin;
 
 /// Traits for cancellation operations.
@@ -45,7 +44,7 @@ impl<T: OpCancelPayload> CancelTaskBuilder<T> {
 const DEFAULT_NUM_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OnCancelError {
+pub enum OnCancelError {
     Ignore,
     Panic,
     Retry(usize),
@@ -82,6 +81,7 @@ impl<T: OpCancelPayload> CancelTask<T> {
     pub(crate) async fn into_future(mut self) {
         loop {
             let res = pin!(self.cancel_op.clone()).await;
+
             match res {
                 Ok(_) => break,
                 Err(err) => {
@@ -93,8 +93,13 @@ impl<T: OpCancelPayload> CancelTask<T> {
                         }
 
                         (_, OnCancelError::Panic | OnCancelError::Retry(_)) => {
-                            with_scheduler!(|s| { s.unhandled_panic(err.as_panic_reason()) });
-                            unreachable!("scheduler should have panicked");
+                            std::panic::panic_any(SchedulerPanic::new(
+                                PanicReason::CancelTask,
+                                format!(
+                                    "CancelTask failed. OnCancelError: {:?}, err: {:?}",
+                                    self.on_error, err
+                                ),
+                            ));
                         }
                     }
                 }
@@ -106,27 +111,28 @@ impl<T: OpCancelPayload> CancelTask<T> {
         // as we release the entry, it can be reused by another async operation.
         with_slab_mut(|slab| {
             if slab.try_remove(self.user_data).is_none()
-                && let OnCancelError::Panic = self.on_error
+                && !matches!(self.on_error, OnCancelError::Ignore)
             {
-                with_scheduler!(|s| {
-                    s.unhandled_panic(PanicReason::SlabInvalidState);
-                });
+                std::panic::panic_any(SchedulerPanic::new(
+                    PanicReason::SlabInvalidState,
+                    "Failed to remove entry from slab in CancelTask".to_string(),
+                ));
             }
         });
     }
 }
 
-// TODO: tests
-// - test OnCancelError::Ignore
-// - test OnCancelError::Panic ++scheduler unhandled_panic test
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::with_slab;
+    use crate::future::opcode::single::AsyncCancelOp;
+    use crate::runtime::Builder;
+    use crate::test_utils::init_local_runtime_and_context;
+    use crate::utils::scheduler::{Call, Method};
     use crate::{
         self as ringolo,
         future::opcode::{Multishot, TimeoutMultishot},
-        utils::scheduler::Method,
     };
     use anyhow::Result;
     use futures::StreamExt;
@@ -151,7 +157,7 @@ mod tests {
         assert!(cancel_handle.is_some());
         assert!(cancel_handle.unwrap().await.is_ok());
 
-        with_scheduler!(|s| {
+        crate::with_scheduler!(|s| {
             let spawn_calls = s.tracker.get_calls(&Method::Spawn);
             assert_eq!(spawn_calls.len(), 1);
 
@@ -166,6 +172,77 @@ mod tests {
         // Make sure all entries were cleared from the slab.
         with_slab(|slab| {
             assert!(slab.is_empty());
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_on_cancel_error_ignore() -> Result<()> {
+        let builder = Builder::new_local().on_cancel_error(OnCancelError::Ignore);
+        init_local_runtime_and_context(Some(builder))?;
+
+        let user_data = 42;
+
+        let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
+        let task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data);
+
+        let handle = crate::runtime::spawn_cancel(task);
+
+        ringolo::block_on(async {
+            assert!(handle.await.is_ok());
+        });
+
+        // Make sure there was no panic
+        crate::with_scheduler!(|s| {
+            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
+            assert_eq!(spawn_calls.len(), 1);
+
+            let unhandled_panic_calls = s.tracker.get_calls(&Method::UnhandledPanic);
+            assert!(unhandled_panic_calls.is_empty());
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_on_cancel_error_panic() -> Result<()> {
+        let builder = Builder::new_local().on_cancel_error(OnCancelError::Panic);
+        init_local_runtime_and_context(Some(builder))?;
+
+        let user_data = 42;
+
+        let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
+        let task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data);
+
+        let handle = crate::runtime::spawn_cancel(task);
+
+        let root_res = std::panic::catch_unwind(|| {
+            ringolo::block_on(async {
+                // We dont await the handle as the root future otherwise root future would
+                // panic. We want to check the panic triggered in a spawned task vs. root future.
+                assert!(true);
+            });
+        });
+
+        // Scheduler panics and we stored JoinHandle output before.
+        assert!(root_res.is_err());
+        let res = handle.get_result();
+        assert!(res.is_err());
+        assert!(res.unwrap_err().is_panic());
+
+        crate::with_scheduler!(|s| {
+            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
+            assert_eq!(spawn_calls.len(), 1);
+
+            let unhandled_panic_calls = s.tracker.get_calls(&Method::UnhandledPanic);
+            assert_eq!(unhandled_panic_calls.len(), 1);
+            assert_eq!(
+                unhandled_panic_calls.first(),
+                Some(&Call::UnhandledPanic {
+                    reason: PanicReason::CancelTask
+                })
+            );
         });
 
         Ok(())

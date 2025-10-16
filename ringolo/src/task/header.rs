@@ -48,11 +48,12 @@ impl Header {
         state: State,
         vtable: &'static Vtable,
         task_opts: Option<TaskOpts>,
+        id: Id,
     ) -> Header {
         Header {
             state,
             vtable,
-            id: Id::next(),
+            id,
             pending_io: Cell::new(0),
             opts: Cell::new(task_opts.unwrap_or(TaskOpts::empty())),
         }

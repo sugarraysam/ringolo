@@ -3,7 +3,6 @@
 //!
 //! A similar primitive is provided in the `sync_wrapper` crate.
 
-use std::any::Any;
 
 pub(crate) struct SyncWrapper<T> {
     value: T,
@@ -22,16 +21,20 @@ impl<T> SyncWrapper<T> {
         Self { value }
     }
 
+    pub(crate) fn get_ref(&self) -> &T {
+        &self.value
+    }
+
     pub(crate) fn into_inner(self) -> T {
         self.value
     }
 }
 
-impl SyncWrapper<Box<dyn Any + Send>> {
-    /// Attempt to downcast using `Any::downcast_ref()` to a type that is known to be `Sync`.
-    pub(crate) fn downcast_ref_sync<T: Any + Sync>(&self) -> Option<&T> {
-        // SAFETY: if the downcast fails, the inner value is not touched,
-        // so no thread-safety violation can occur.
-        self.value.downcast_ref()
-    }
-}
+// impl SyncWrapper<Box<dyn Any + Send>> {
+//     /// Attempt to downcast using `Any::downcast_ref()` to a type that is known to be `Sync`.
+//     pub(crate) fn downcast_ref_sync<T: Any + Sync>(&self) -> Option<&T> {
+//         // SAFETY: if the downcast fails, the inner value is not touched,
+//         // so no thread-safety violation can occur.
+//         self.value.downcast_ref()
+//     }
+// }

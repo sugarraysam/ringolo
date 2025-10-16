@@ -52,12 +52,12 @@ impl<T: Future, S: Schedule> TaskLayout<T, S> {
         task_opts: Option<TaskOpts>,
         scheduler: S,
         state: State,
-        id: Id,
     ) -> Box<TaskLayout<T, S>> {
         let vtable = vtable::<T, S>();
+        let id = Id::next();
 
         let result = Box::new(TaskLayout {
-            header: Header::new(state, vtable, task_opts),
+            header: Header::new(state, vtable, task_opts, id),
             core: Core {
                 scheduler,
                 id,

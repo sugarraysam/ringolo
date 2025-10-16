@@ -99,3 +99,28 @@ impl Drop for TaskIdGuard {
         set_current_task_id(self.parent_task_id);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_utils::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn test_new_task_id_unique() {
+        let n = 13;
+        let scheduler = DummyScheduler::default();
+
+        let mut all_ids = HashSet::with_capacity(n);
+
+        for _ in 1..=n {
+            let (task, notified, join) = crate::task::new_task(async { 42 }, None, scheduler);
+
+            assert_eq!(task.id(), notified.id());
+            assert_eq!(task.id(), join.id());
+
+            all_ids.insert(task.id());
+        }
+
+        assert_eq!(all_ids.len(), n);
+    }
+}

@@ -4,7 +4,7 @@ use crate::runtime::{Schedule, TaskOpts};
 use crate::task::layout::TaskLayout;
 use crate::task::state::{Snapshot, State, TransitionToNotifiedByRef, TransitionToNotifiedByVal};
 use crate::task::trailer::Trailer;
-use crate::task::{Header, Id};
+use crate::task::Header;
 use std::future::Future;
 use std::ptr::NonNull;
 use std::task::Waker;
@@ -16,7 +16,7 @@ pub(crate) struct RawTask {
 }
 
 impl RawTask {
-    pub(super) fn new<T, S>(task: T, task_opts: Option<TaskOpts>, scheduler: S, id: Id) -> RawTask
+    pub(super) fn new<T, S>(task: T, task_opts: Option<TaskOpts>, scheduler: S) -> RawTask
     where
         T: Future + 'static,
         S: Schedule,
@@ -26,7 +26,6 @@ impl RawTask {
             task_opts,
             scheduler,
             State::new(),
-            id,
         ));
         let ptr = unsafe { NonNull::new_unchecked(ptr.cast()) };
 

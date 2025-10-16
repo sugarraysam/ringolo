@@ -132,7 +132,7 @@ impl fmt::Display for JoinError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.repr {
             Repr::Cancelled => write!(fmt, "task {} was cancelled", self.id),
-            Repr::Panic(p) => match panic_payload_as_str(p) {
+            Repr::Panic(p) => match panic_payload_as_str(p.get_ref()) {
                 Some(panic_str) => {
                     write!(
                         fmt,
@@ -152,7 +152,7 @@ impl fmt::Debug for JoinError {
     fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.repr {
             Repr::Cancelled => write!(fmt, "JoinError::Cancelled({:?})", self.id),
-            Repr::Panic(p) => match panic_payload_as_str(p) {
+            Repr::Panic(p) => match panic_payload_as_str(p.get_ref()) {
                 Some(panic_str) => {
                     write!(fmt, "JoinError::Panic({:?}, {:?}, ...)", self.id, panic_str)
                 }
@@ -173,17 +173,17 @@ impl From<JoinError> for io::Error {
     }
 }
 
-fn panic_payload_as_str(payload: &SyncWrapper<Box<dyn Any + Send>>) -> Option<&str> {
+pub(super) fn panic_payload_as_str(payload: &Box<dyn Any + Send>) -> Option<&str> {
     // Panic payloads are almost always `String` (if invoked with formatting arguments)
     // or `&'static str` (if invoked with a string literal).
     //
     // Non-string panic payloads have niche use-cases,
     // so we don't really need to worry about those.
-    if let Some(s) = payload.downcast_ref_sync::<String>() {
+    if let Some(s) = payload.downcast_ref::<String>() {
         return Some(s);
     }
 
-    if let Some(s) = payload.downcast_ref_sync::<&'static str>() {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
         return Some(s);
     }
 

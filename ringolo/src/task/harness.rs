@@ -1,19 +1,21 @@
-use crate::runtime::{PanicReason, Schedule};
+use crate::runtime::{PanicReason, Schedule, SchedulerPanic};
+use crate::task::error::panic_payload_as_str;
 use crate::task::layout::{Core, TaskLayout};
 use crate::task::raw::can_read_output;
 use crate::task::state::{State, TransitionToIdle, TransitionToRunning};
 use crate::task::trailer::Trailer;
 use crate::task::waker::waker_ref;
 use crate::task::{Header, Id, JoinError, Notified, Task};
+use crate::with_scheduler;
 
 use std::future::Future;
 
 use std::any::Any;
-use std::mem;
 use std::mem::ManuallyDrop;
 use std::panic;
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
+use std::mem;
 
 /// Typed raw task handle.
 pub(super) struct Harness<T: Future, S: 'static> {
@@ -127,6 +129,12 @@ impl<T: Future, S: Schedule> Harness<T, S> {
                 self.dealloc();
             }
             PollFuture::Done => (),
+            PollFuture::Panicked(payload) => {
+                self.complete();
+                with_scheduler!(|s| {
+                    s.unhandled_panic(payload);
+                });
+            }
         }
     }
 
@@ -159,17 +167,21 @@ impl<T: Future, S: Schedule> Harness<T, S> {
                 let header_ptr = self.header_ptr();
                 let waker_ref = waker_ref::<S>(&header_ptr);
                 let cx = Context::from_waker(&waker_ref);
-                let res = poll_future(self.core(), cx);
 
-                if res == Poll::Ready(()) {
-                    // The future completed. Move on to complete the task.
-                    return PollFuture::Complete;
+                // Propagate panic to `poll` method as it can call `self.complete()` and
+                // we can make the panic output available to the `JoinHandle`.
+                if let Poll::Ready(panic_payload) = poll_future(self.core(), cx) {
+                    if let Some(payload) = panic_payload {
+                        return PollFuture::Panicked(payload);
+                    } else {
+                        return PollFuture::Complete;
+                    }
                 }
 
                 let transition_res = self.state().transition_to_idle();
                 if let TransitionToIdle::Cancelled = transition_res {
                     // The transition to idle failed because the task was
-                    // canlayouted during the poll.
+                    // cancelled during the poll.
                     cancel_task(self.core());
                 }
                 transition_result_to_poll_future(transition_res)
@@ -320,6 +332,7 @@ enum PollFuture {
     Notified,
     Done,
     Dealloc,
+    Panicked(SchedulerPanic),
 }
 
 /// Cancels the task and store the appropriate error in the stage field.
@@ -344,7 +357,10 @@ fn panic_result_to_join_error(
 
 /// Polls the future. If the future completes, the output is written to the
 /// stage field.
-fn poll_future<T: Future, S: Schedule>(core: &Core<T, S>, cx: Context<'_>) -> Poll<()> {
+fn poll_future<T: Future, S: Schedule>(
+    core: &Core<T, S>,
+    cx: Context<'_>,
+) -> Poll<Option<SchedulerPanic>> {
     // Poll the future.
     let output = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         struct Guard<'a, T: Future, S: Schedule> {
@@ -364,30 +380,41 @@ fn poll_future<T: Future, S: Schedule>(core: &Core<T, S>, cx: Context<'_>) -> Po
     }));
 
     // Prepare output for being placed in the core stage.
-    let output = match output {
+    let (scheduler_panic, output) = match output {
         Ok(Poll::Pending) => return Poll::Pending,
-        Ok(Poll::Ready(output)) => Ok(output),
-        Err(panic) => Err(panic_to_error(&core.scheduler, core.id, panic)),
+        Ok(Poll::Ready(output)) => (None, Ok(output)),
+        Err(panic) => {
+            let (scheduler_panic, join_error) = parse_panic(core.id, panic);
+            (Some(scheduler_panic), Err(join_error))
+        }
     };
 
-    // Catch and ignore panics if the future panics on drop.
+    // Store output for JoinHandle to reap before we panic.
     let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
         core.store_output(output);
     }));
 
-    if res.is_err() {
-        core.scheduler.unhandled_panic(PanicReason::Unknown);
-    }
+    let panic_payload = scheduler_panic.or_else(|| {
+        res.is_err().then(|| {
+            SchedulerPanic::new(
+                PanicReason::StoringTaskOutput,
+                "failed to store task output after poll",
+            )
+        })
+    });
 
-    Poll::Ready(())
+    Poll::Ready(panic_payload)
 }
 
-#[cold]
-fn panic_to_error<S: Schedule>(
-    scheduler: &S,
-    task_id: Id,
-    panic: Box<dyn Any + Send + 'static>,
-) -> JoinError {
-    scheduler.unhandled_panic(PanicReason::Unknown);
-    JoinError::panic(task_id, panic)
+fn parse_panic(task_id: Id, panic: Box<dyn Any + Send + 'static>) -> (SchedulerPanic, JoinError) {
+    let scheduler_panic = {
+        if let Some(payload) = panic.downcast_ref::<SchedulerPanic>() {
+            payload.clone()
+        } else {
+            let msg = panic_payload_as_str(&panic);
+            SchedulerPanic::new(PanicReason::Unknown, msg.unwrap_or("unknown").to_string())
+        }
+    };
+
+    (scheduler_panic, JoinError::panic(task_id, panic))
 }

@@ -88,7 +88,6 @@ impl Completable for SqeSingle {
 impl Drop for SqeSingle {
     fn drop(&mut self) {
         if let Err(e) = self.get_idx().map(|idx| {
-            dbg!("Dropping SqeSingle: removing idx {}", idx);
             with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);

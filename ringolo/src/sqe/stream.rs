@@ -1,5 +1,5 @@
 use crate::context::{with_slab_and_ring_mut, with_slab_mut};
-use crate::runtime::Schedule;
+use crate::runtime::{Schedule, SchedulerPanic};
 use crate::sqe::{
     CompletionHandler, IoError, RawSqe, RawSqeState, Submittable, increment_pending_io,
 };
@@ -118,10 +118,10 @@ impl Stream for SqeStream {
                             self.state = SqeStreamState::Completed;
 
                             if e.is_fatal() {
-                                with_scheduler!(|s| {
-                                    s.unhandled_panic(e.as_panic_reason());
-                                });
-                                unreachable!("scheduler should panic");
+                                std::panic::panic_any(SchedulerPanic::new(
+                                    e.as_panic_reason(),
+                                    e.to_string(),
+                                ));
                             }
 
                             return Poll::Ready(Some(Err(e)));
@@ -167,7 +167,6 @@ impl Drop for SqeStream {
         }
 
         if let Err(e) = self.get_idx().map(|idx| {
-            dbg!("Dropping SqeStream: removing idx {}", idx);
             with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);

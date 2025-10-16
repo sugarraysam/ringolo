@@ -212,7 +212,7 @@ impl OpPayload for ConnectOp {
             .into()
     }
 
-    fn into_output(self: Pin<&mut Self>, result: Result<i32, IoError>) -> Self::Output {
+    fn into_output(self: Pin<&mut Self>, _result: Result<i32, IoError>) -> Self::Output {
         // let this = self.project();
         // result.map(|_| *this.fd) // TODO
         Ok(0)

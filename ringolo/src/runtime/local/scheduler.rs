@@ -3,9 +3,9 @@ use crate::runtime::local::worker::Worker;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
 use crate::runtime::{
-    AddMode, EventLoop, OwnedTasks, PanicReason, Schedule, TaskOpts, YieldReason,
+    AddMode, EventLoop, OwnedTasks, Schedule, SchedulerPanic, TaskOpts, YieldReason,
 };
-use crate::task::{Id, JoinHandle, Notified, Task};
+use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
 use anyhow::Result;
@@ -140,17 +140,21 @@ impl Schedule for Handle {
         self.tasks.remove(&task.id())
     }
 
-    fn unhandled_panic(&self, reason: PanicReason) {
-        self.track(Method::UnhandledPanic, Call::UnhandledPanic { reason });
-
-        // TODO: how to handle? What does tokio do? For now just crash.
-        panic!(
-            "FATAL: scheduler error. Unhandled panic in task {:?}.",
-            reason
+    fn unhandled_panic(&self, payload: SchedulerPanic) {
+        self.track(
+            Method::UnhandledPanic,
+            Call::UnhandledPanic {
+                reason: payload.reason,
+            },
         );
 
-        // By default, we shutdown the runtime.
-        // self.tasks.shutdown_all();
+        // TODO:
+        // - cleanup? drain? clean shutdown?
+
+        panic!(
+            "FATAL: scheduler panic. Reason: {:?}, msg: {:?}",
+            payload.reason, payload.msg
+        );
     }
 }
 
@@ -173,8 +177,7 @@ impl Handle {
         // All tasks are sticky on local scheduler.
         let task_opts = task_opts.map(|opt| opt | TaskOpts::STICKY);
 
-        let (task, notified, join_handle) =
-            crate::task::new_task(future, task_opts, self.clone(), Id::next());
+        let (task, notified, join_handle) = crate::task::new_task(future, task_opts, self.clone());
 
         let existed = self.tasks.insert(task);
         debug_assert!(existed.is_none());

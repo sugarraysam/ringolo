@@ -33,20 +33,18 @@ pub enum IoError {
     Other(#[from] anyhow::Error),
 }
 
-// Let's rely on kernel errors instead of `io::ErrorKind` for more accuracy and
-// direct mapping to io_uring documentation.
-fn is_retryable_io_error(e: &io::Error) -> bool {
-    e.raw_os_error()
-        // TODO: non-exhaustive add more as we identify them
-        .is_some_and(|errno| matches!(errno, libc::EAGAIN))
-}
-
 impl IoError {
     pub fn is_retryable(&self) -> bool {
         match self {
             IoError::SlabFull => true,
             IoError::SqRingFull { .. } => true,
-            IoError::Io(e) if is_retryable_io_error(e) => true,
+            IoError::Io(e) => {
+                // Let's rely on kernel errors instead of `io::ErrorKind` for more accuracy and
+                // direct mapping to io_uring documentation.
+                e.raw_os_error()
+                    // TODO: non-exhaustive add more as we identify them
+                    .is_some_and(|errno| matches!(errno, libc::EAGAIN))
+            }
             _ => false,
         }
     }

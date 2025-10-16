@@ -48,14 +48,13 @@ pub(crate) fn new_task<T, S>(
     task: T,
     task_opts: Option<TaskOpts>,
     scheduler: S,
-    id: Id,
 ) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
 where
     S: Schedule,
     T: Future + 'static,
     T::Output: 'static,
 {
-    let raw = RawTask::new::<T, S>(task, task_opts, scheduler, id);
+    let raw = RawTask::new::<T, S>(task, task_opts, scheduler);
     let task = Task::new(raw);
     let notified = Notified::new(Task::new(raw));
     let join = JoinHandle::new(raw);
