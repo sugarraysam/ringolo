@@ -1,4 +1,4 @@
-use crate::future::opcode::{Multishot, TimeoutMultishot};
+use crate::future::lib::{Multishot, TimeoutMultishot};
 use crate::sqe::IoError;
 use futures::Stream;
 use pin_project::pin_project;

@@ -1,5 +1,5 @@
 use crate::{
-    runtime::cancel::OpCancelPayload,
+    runtime::cleanup::OpCleanupPayload,
     task::{JoinHandle, Notified, Task},
     with_scheduler,
 };
@@ -13,8 +13,8 @@ pub mod runtime;
 pub use runtime::Builder;
 
 // Exports
-pub(crate) mod cancel;
-pub(crate) use cancel::CancelTaskBuilder;
+pub(crate) mod cleanup;
+pub(crate) use cleanup::CleanupTaskBuilder;
 
 pub(crate) mod local;
 
@@ -78,7 +78,7 @@ pub(crate) enum PanicReason {
     SlabInvalidState,
     PollingFuture,
     StoringTaskOutput,
-    CancelTask,
+    CleanupTask,
     Unknown,
 }
 
@@ -161,12 +161,12 @@ where
     with_scheduler!(|s| { s.spawn(future, None) })
 }
 
-pub(crate) fn spawn_cancel<T: OpCancelPayload>(builder: CancelTaskBuilder<T>) -> JoinHandle<()> {
+pub(crate) fn spawn_cleanup<T: OpCleanupPayload>(builder: CleanupTaskBuilder<T>) -> JoinHandle<()> {
     with_scheduler!(|s| {
-        // Copy the runtime OnCancelError policy into the builder.
-        let task = builder.on_error(s.cfg.on_cancel_error).build();
+        // Copy the runtime OnCleanupError policy into the builder.
+        let task = builder.on_error(s.cfg.on_cleanup_error).build();
 
-        // Cancel tasks need to be sticky to the local thread. It does not make sense
+        // Cleanup tasks need to be sticky to the local thread. It does not make sense
         // to cancel an io_uring operation from another thread.
         s.spawn(task.into_future(), Some(TaskOpts::STICKY))
     })

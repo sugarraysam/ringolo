@@ -25,8 +25,8 @@
 //!   results should be parsed. This is meant to be a low-level building block
 //!   library.
 //!
-use crate::future::opcode::single::AsyncCancelOp;
-use crate::runtime::CancelTaskBuilder;
+use crate::future::lib::single::AsyncCancelOp;
+use crate::runtime::CleanupTaskBuilder;
 use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
 use crate::task::JoinHandle;
 use futures::Stream;
@@ -39,11 +39,11 @@ use std::task::{Context, Poll, ready};
 pub(crate) mod builder;
 
 pub(crate) mod errors;
-pub(crate) use errors::OpcodeError;
+pub(crate) use errors::{OpcodeError, OwnershipError};
 
 #[macro_use]
-pub(crate) mod common;
-pub(crate) use common::{KernelFdMode, UringFd};
+pub(crate) mod fd;
+pub(crate) use fd::{KernelFdMode, UringFd};
 
 pub mod multishot;
 pub use multishot::TimeoutMultishot;
@@ -233,9 +233,9 @@ impl<T: MultishotPayload> Multishot<T> {
         // Using `.all()` will NOT return -ENOENT if we can't find the associated SQE with user_data.
         // Better to target a single SQE even if it is multishot.
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data);
+        let task = CleanupTaskBuilder::new(AsyncCancelOp::new(builder)).with_slab_entry(user_data);
 
-        Some(crate::runtime::spawn_cancel(task))
+        Some(crate::runtime::spawn_cleanup(task))
     }
 }
 

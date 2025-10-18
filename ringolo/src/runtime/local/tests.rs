@@ -1,6 +1,6 @@
 use super::*;
 use crate as ringolo;
-use crate::future::opcode::builder::NopBuilder;
+use crate::future::lib::builder::NopBuilder;
 use crate::runtime::waker::Wake;
 use crate::runtime::{Builder, Schedule, YieldReason};
 use crate::sqe::{IoError, Sqe, SqeCollection};

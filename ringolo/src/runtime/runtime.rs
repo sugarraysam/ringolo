@@ -1,7 +1,7 @@
 use crate as ringolo;
 use crate::context::init_local_context;
 use crate::runtime::Scheduler;
-use crate::runtime::cancel::OnCancelError;
+use crate::runtime::cleanup::OnCleanupError;
 use crate::runtime::local;
 use crate::runtime::stealing;
 use crate::task::JoinHandle;
@@ -38,7 +38,11 @@ const DIRECT_FDS_PER_RING: u32 = 1024;
 /// Event Loop policies
 //
 /// Fairly arbitrary, copied from tokio `event_interval`.
+#[cfg(not(test))]
 const PROCESS_CQES_INTERVAL: u32 = 61;
+
+#[cfg(test)]
+const PROCESS_CQES_INTERVAL: u32 = 4; // make tests tick faster
 
 /// Submit 4 times as frequently as we complete to keep kernel busy.
 const SUBMIT_INTERVAL: u32 = PROCESS_CQES_INTERVAL / 4;
@@ -131,8 +135,8 @@ pub struct Builder {
     /// so make sure you use `KernelFdMode::DirectAuto` for best results.
     pub(super) direct_fds_per_ring: u32,
 
-    /// When cancellation an `io_uring` operation fails, what to do?
-    pub(super) on_cancel_error: OnCancelError,
+    /// When an async cleanup operation fails, what to do?
+    pub(super) on_cleanup_error: OnCleanupError,
 }
 
 impl Builder {
@@ -149,7 +153,7 @@ impl Builder {
             max_unsubmitted_sqes: MAX_UNSUBMITTED_SQES,
             sq_ring_size: SQ_RING_SIZE,
             cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
-            on_cancel_error: OnCancelError::default(),
+            on_cleanup_error: OnCleanupError::default(),
             direct_fds_per_ring: DIRECT_FDS_PER_RING,
         }
     }
@@ -268,8 +272,8 @@ impl Builder {
         self
     }
 
-    pub fn on_cancel_error(mut self, on_cancel: OnCancelError) -> Self {
-        self.on_cancel_error = on_cancel;
+    pub fn on_cleanup_error(mut self, on_cleanup: OnCleanupError) -> Self {
+        self.on_cleanup_error = on_cleanup;
         self
     }
 
@@ -383,6 +387,7 @@ impl Runtime {
 // scheduler and their associated context.
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeConfig {
+    pub(crate) kind: Kind,
     pub(crate) worker_threads: usize,
     pub(crate) max_blocking_threads: usize,
     pub(crate) thread_name: ThreadNameFn,
@@ -394,7 +399,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) sq_ring_size: usize,
     pub(crate) cq_ring_size_multiplier: usize,
     pub(crate) direct_fds_per_ring: u32,
-    pub(crate) on_cancel_error: OnCancelError,
+    pub(crate) on_cleanup_error: OnCleanupError,
 }
 
 impl RuntimeConfig {
@@ -407,7 +412,12 @@ impl RuntimeConfig {
             return Err(anyhow!("cq_ring_size_multiplier must be greater than 0"));
         }
 
-        check_fd_ulimit(self.worker_threads * self.direct_fds_per_ring as usize)?;
+        let num_workers = match self.kind {
+            Kind::Local => 1,
+            Kind::Stealing => self.worker_threads,
+        };
+
+        check_fd_ulimit(num_workers * self.direct_fds_per_ring as usize)?;
 
         Ok(())
     }
@@ -422,6 +432,7 @@ impl TryFrom<Builder> for RuntimeConfig {
             .unwrap_or(thread::available_parallelism()?.get());
 
         let cfg = RuntimeConfig {
+            kind: builder.kind,
             worker_threads,
             max_blocking_threads: builder.max_blocking_threads,
             thread_name: builder.thread_name,
@@ -433,7 +444,7 @@ impl TryFrom<Builder> for RuntimeConfig {
             sq_ring_size: builder.sq_ring_size,
             cq_ring_size_multiplier: builder.cq_ring_size_multiplier,
             direct_fds_per_ring: builder.direct_fds_per_ring,
-            on_cancel_error: builder.on_cancel_error,
+            on_cleanup_error: builder.on_cleanup_error,
         };
 
         cfg.validate()?;

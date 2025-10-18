@@ -1,4 +1,4 @@
-use crate::future::opcode::{Op, TimeoutOp};
+use crate::future::lib::{Op, TimeoutOp};
 use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;

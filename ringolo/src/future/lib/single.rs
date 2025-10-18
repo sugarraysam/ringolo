@@ -1,10 +1,10 @@
 #![allow(dead_code)]
 
-use crate::future::opcode::{KernelFdMode, OpParams, OpPayload, OpcodeError, UringFd, parse};
-use crate::runtime::cancel::CancelOutputT;
+use crate::future::lib::{KernelFdMode, OpParams, OpPayload, OpcodeError, UringFd, parse};
 use crate::sqe::IoError;
 use anyhow::{Context, Result};
-use io_uring::types::{TimeoutFlags, Timespec};
+use either::Either;
+use io_uring::types::{Fd, Fixed, TimeoutFlags, Timespec};
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
 use pin_project::pin_project;
 use std::mem::MaybeUninit;
@@ -12,9 +12,6 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::time::Duration;
-
-// TODO:
-// - setsockopt
 
 ///
 /// === Accept ===
@@ -106,7 +103,7 @@ impl OpPayload for AcceptOp {
             None
         };
 
-        Ok((UringFd::from_result(fd, *this.mode), addr_info))
+        Ok((UringFd::from_result_into_owned(fd, *this.mode), addr_info))
     }
 }
 
@@ -127,7 +124,7 @@ impl AsyncCancelOp {
 }
 
 impl OpPayload for AsyncCancelOp {
-    type Output = CancelOutputT;
+    type Output = i32;
 
     fn create_params(mut self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
         Ok(self.entry.take().expect("only called once").into())
@@ -137,8 +134,8 @@ impl OpPayload for AsyncCancelOp {
         self: Pin<&mut Self>,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        // Untouched, we want to rely on IoError `is_retryable` logic.
-        Ok(result)
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -197,22 +194,34 @@ impl OpPayload for BindOp {
 ///
 /// === Close ===
 ///
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CloseOp {
-    fd: UringFd,
+    fd: Either<Fd, Fixed>,
 }
 
 impl CloseOp {
-    pub fn new(fd: UringFd) -> Self {
+    /// Does not take an Owned UringFd as we intend to use this in Drop impls to
+    /// perform async cleanup.
+    pub fn new(fd: Either<Fd, Fixed>) -> Self {
         Self { fd }
     }
 }
 
 impl OpPayload for CloseOp {
-    type Output = ();
+    type Output = i32;
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
-        let entry = resolve_fd!(self.fd, |fd| io_uring::opcode::Close::new(fd));
+        let entry = match self.fd {
+            Either::Left(raw) => {
+                dbg!("Creating CloseOp for raw fd {}", raw);
+                io_uring::opcode::Close::new(raw)
+            }
+            Either::Right(fixed) => {
+                dbg!("Creating CloseOp for fixed fd {}", fixed);
+                io_uring::opcode::Close::new(fixed)
+            }
+        };
+
         Ok(entry.build().into())
     }
 
@@ -220,8 +229,8 @@ impl OpPayload for CloseOp {
         self: Pin<&mut Self>,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        let _ = result?;
-        Ok(())
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -357,7 +366,7 @@ impl OpPayload for SocketOp {
         self: Pin<&mut Self>,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        Ok(UringFd::from_result(result?, self.mode))
+        Ok(UringFd::from_result_into_owned(result?, self.mode))
     }
 }
 
@@ -421,17 +430,22 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::{self as ringolo, future::opcode::Op, task::JoinHandle};
+    use crate::{self as ringolo, future::lib::Op, task::JoinHandle};
     use anyhow::Result;
     use rstest::rstest;
 
-    const LOCALHOST4: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-    const LOCALHOST6: SocketAddr = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0);
+    const LOCALHOST4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const LOCALHOST6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
     #[ringolo::test]
     async fn test_accept_safe_unpacking() -> Result<()> {
         // (1) EBADF - test error does not trigger UB when reading addr
-        let op = Op::new(AcceptOp::new(42.into(), KernelFdMode::Legacy, true, None));
+        let op = Op::new(AcceptOp::new(
+            UringFd::new_raw_borrowed(42),
+            KernelFdMode::Legacy,
+            true,
+            None,
+        ));
         let res = op.await;
 
         assert!(res.is_err());
@@ -440,18 +454,22 @@ mod tests {
         Ok(())
     }
 
-    // TODO:
-    // - KernelFdMod::DirectAuto, dont use `:0` dynamic port, pre-allocate port
-    // - impl Close, need to pass Either, can't keep a ref count on UringFd
+    // TODO: cant have direct without setsockopt for test stability
     #[rstest]
-    #[case::legacy_ipv4(KernelFdMode::Legacy, AddressFamily::Inet, LOCALHOST4)]
-    #[case::legacy_ipv6(KernelFdMode::Legacy, AddressFamily::Inet6, LOCALHOST6)]
+    #[case::legacy_ipv4(KernelFdMode::Legacy, AddressFamily::Inet, LOCALHOST4, 9000)]
+    #[case::legacy_ipv6(KernelFdMode::Legacy, AddressFamily::Inet6, LOCALHOST6, 9001)]
+    // #[case::auto_ipv4(KernelFdMode::DirectAuto, AddressFamily::Inet, LOCALHOST4, 9002)]
+    // #[case::auto_ipv6(KernelFdMode::DirectAuto, AddressFamily::Inet6, LOCALHOST6, 9003)]
     #[ringolo::test]
     async fn test_socket_bind_listen_accept_connect(
         #[case] mode: KernelFdMode,
         #[case] addr_family: AddressFamily,
-        #[case] bind_addr: SocketAddr,
+        #[case] ip_addr: IpAddr,
+        #[case] port: u16,
     ) -> Result<()> {
+        // TODO: getsockname for direct descriptors
+        let sock_addr = SocketAddr::new(ip_addr, port);
+
         // (1) Create listening socket
         let socket_op = Op::new(SocketOp::new(
             mode,
@@ -460,19 +478,33 @@ mod tests {
             SockProtocol::Tcp,
         ));
 
+        // TODO: impl setsockopt with `io_uring`, we need this option otherwise
+        // we need to wait for the kernel to cleanup sockets and we can't reuse
+        // them right-away causing tests to fail.
         let listener_fd = socket_op.await.expect("server socket creation failed");
+        listener_fd
+            .with_raw_fd(|raw| unsafe {
+                let optval = 1 as libc::c_int;
+                assert_eq!(
+                    libc::setsockopt(
+                        raw,
+                        libc::SOL_SOCKET,
+                        libc::SO_REUSEADDR,
+                        std::ptr::from_ref(&optval).cast(),
+                        size_of::<libc::c_int>() as libc::socklen_t,
+                    ),
+                    0
+                );
+            })
+            .context("failed to set SO_REUSEADDR")?;
 
         // (2) Bind to address
-        let bind_op = Op::new(BindOp::try_new(listener_fd.clone(), &bind_addr)?);
-        assert!(bind_op.await.is_ok());
+        let bind_op = Op::new(BindOp::try_new(listener_fd.clone(), &sock_addr)?);
+        bind_op.await.context("bind failed")?;
 
         // (3) Listen
         let listen_op = Op::new(ListenOp::new(listener_fd.clone(), 128));
-        assert!(listen_op.await.is_ok());
-
-        let dynamic_addr = listener_fd
-            .socket_addr()
-            .expect("could not get socket address");
+        listen_op.await.context("listen failed")?;
 
         // (4) Spawn Connect
         let handle: JoinHandle<Result<()>> = ringolo::spawn(async move {
@@ -487,24 +519,20 @@ mod tests {
 
             // TODO:
             // - cant call `getsockname` on Direct descriptor? How to find which port the kernel dynamically allocated?
-            let connect_op = Op::new(ConnectOp::try_new(sockfd, &dynamic_addr)?);
-            assert!(connect_op.await.is_ok());
+            let connect_op = Op::new(ConnectOp::try_new(sockfd, &sock_addr)?);
+            connect_op.await.context("connect failed")?;
 
             Ok(())
         });
 
         // (5) Accept
         let op = Op::new(AcceptOp::new(listener_fd, KernelFdMode::Legacy, true, None));
-        let res = op.await;
-        assert!(res.is_ok());
+        let (_fd, got_addr) = op.await.context("accept failed")?;
+        assert_eq!(got_addr.context("missing address")?.ip(), sock_addr.ip());
 
-        let (fd, got_addr) = res.unwrap();
-        assert!(fd > 0);
-        assert!(got_addr.is_some());
-        assert_eq!(got_addr.unwrap().ip(), bind_addr.ip());
+        handle.await.context("client task failed")??;
 
-        assert!(handle.await.is_ok());
-
+        // TODO: uring fd async cleanup
         Ok(())
     }
 }

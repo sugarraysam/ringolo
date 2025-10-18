@@ -1,10 +1,9 @@
-use crate::future::opcode::{
-    KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, UringFd,
-};
+use crate::future::lib::{KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, UringFd};
 use crate::sqe::IoError;
 use anyhow::Result;
 use anyhow::anyhow;
 use io_uring::types::{TimeoutFlags, Timespec};
+use nix::sys::socket::SockFlag;
 use pin_project::pin_project;
 use std::pin::Pin;
 use std::time::Duration;
@@ -13,21 +12,21 @@ use std::time::Duration;
 pub struct AcceptMultishot {
     sockfd: UringFd,
     mode: KernelFdMode,
-    flags: i32, // TODO: nix flags
+    flags: SockFlag,
 }
 
 impl AcceptMultishot {
     /// The `allocate_file_index` flag maps to the `IORING_FILE_INDEX_ALLOC` from the docs.
     /// The kernel will dynamically choose a direct descriptor index if this option is true.
     /// You need to have registered direct descriptors prior for this to work.
-    pub fn try_new(sockfd: UringFd, mode: KernelFdMode, flags: Option<i32>) -> Result<Self> {
+    pub fn try_new(sockfd: UringFd, mode: KernelFdMode, flags: Option<SockFlag>) -> Result<Self> {
         if matches!(mode, KernelFdMode::Direct(_)) {
             Err(anyhow!("AcceptMultishot does not support fixed slots"))
         } else {
             Ok(Self {
                 sockfd,
                 mode,
-                flags: flags.unwrap_or(0),
+                flags: SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
             })
         }
     }
@@ -44,7 +43,7 @@ impl MultishotPayload for AcceptMultishot {
         };
 
         Ok(MultishotParams::new(
-            entry.flags(self.flags).build(),
+            entry.flags(self.flags.bits()).build(),
             0, /* infinite */
         ))
     }
@@ -54,7 +53,7 @@ impl MultishotPayload for AcceptMultishot {
         result: Result<i32, IoError>,
     ) -> Result<Self::Item, IoError> {
         let fd = result?;
-        Ok(UringFd::from_result(fd, self.mode))
+        Ok(UringFd::from_result_into_owned(fd, self.mode))
     }
 }
 
@@ -86,7 +85,7 @@ impl MultishotPayload for TimeoutMultishot {
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError> {
         let this = self.project();
 
-        let timespec_addr = &*this.timespec as *const Timespec;
+        let timespec_addr = std::ptr::from_ref(&*this.timespec).cast();
 
         let entry = io_uring::opcode::Timeout::new(timespec_addr)
             .count(*this.count)
@@ -117,25 +116,31 @@ mod tests {
     };
 
     use super::*;
-    use crate::{self as ringolo, future::opcode::Multishot};
-    use crate::{future::opcode::common::UringFdKind, utils::scheduler::Method};
-    use anyhow::Result;
+    use crate::future::lib::fd::UringFdKind;
+    use crate::utils::scheduler::Method;
+    use crate::{self as ringolo, future::lib::Multishot};
+    use anyhow::{Context, Result};
     use futures::StreamExt;
+    use rstest::rstest;
 
-    // #[ignore = "WOW completion bug. Now runtime blocks, parks thread waiting for completion. Needs to cancel itself when goes out of scope."]
+    #[rstest]
+    #[case::ipv4("127.0.0.1:0")]
+    #[case::ipv6("[::1]:0")]
     #[ringolo::test]
-    async fn test_accept_multi() -> Result<()> {
+    async fn test_accept_multi(#[case] addr: &str) -> Result<()> {
         let n = 2;
         let hello = b"hello";
 
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let listen_addr = listener.local_addr()?;
+        let listener = TcpListener::bind(addr).context("creating tcp listener")?;
+        let listen_addr = listener.local_addr().context("getting listener addr")?;
 
         let handle = std::thread::spawn(move || -> Result<()> {
             for _ in 0..n {
                 if let Ok(mut stream) = TcpStream::connect(listen_addr) {
                     let mut buf = Vec::with_capacity(hello.len());
-                    stream.read_to_end(&mut buf)?;
+                    stream
+                        .read_to_end(&mut buf)
+                        .context("reading from stream")?;
                     assert_eq!(buf, hello);
                 } else {
                     assert!(false, "failed to connect to server");
@@ -147,7 +152,7 @@ mod tests {
 
         {
             let mut stream = Multishot::new(AcceptMultishot::try_new(
-                listener.as_raw_fd().into(),
+                UringFd::new_raw_borrowed(listener.as_raw_fd()),
                 KernelFdMode::Legacy,
                 None,
             )?)
@@ -157,11 +162,15 @@ mod tests {
             while let Some(res) = stream.next().await
                 && got < n
             {
-                assert!(res.is_ok());
-
-                let mut stream = match res.unwrap().kind() {
-                    UringFdKind::Raw(raw) => unsafe { TcpStream::from_raw_fd(raw) },
-                    UringFdKind::Fixed(_) => panic!("should not be fixed"),
+                let new_sockfd = res.context("stream socket")?;
+                let mut stream = match new_sockfd.kind() {
+                    UringFdKind::Raw => unsafe {
+                        TcpStream::from_raw_fd(
+                            // We pass ownership of the Fd to TcpStream to avoid double free.
+                            new_sockfd.into_raw().context("cant pass ownership")?,
+                        )
+                    },
+                    UringFdKind::Fixed => panic!("should not be fixed"),
                 };
 
                 stream.write_all(hello)?;

@@ -1,21 +1,24 @@
 use std::io::{self};
 
-use crate::future::opcode::UringFd;
+use crate::future::lib::fd::UringFdKind;
 
 /// A centralized error type for all scheduler and runtime operations.
 #[derive(thiserror::Error, Debug)]
 pub enum OpcodeError {
-    #[error("Incorrect UringFd variant for the conversion")]
-    IncorrectFdVariant(UringFd),
+    #[error("Incorrect UringFd variant")]
+    IncorrectFdVariant(UringFdKind),
 
     #[error("Invalid fixed `io_uring` fd. Should be between 0 and u32::MAX - 2.")]
     InvalidFixedFd(u32),
 
-    #[error("IO error occurred: {0}")]
+    #[error("Ownership error: {0}")]
+    Ownership(#[from] OwnershipError),
+
+    #[error("IO error: {0}")]
     Io(#[from] io::Error),
 
     /// A catch-all for any other type of unexpected error.
-    #[error("An unexpected error occurred: {0}")]
+    #[error("Unexpected error: {0}")]
     Other(#[from] anyhow::Error),
 }
 
@@ -37,4 +40,13 @@ impl PartialEq for OpcodeError {
             _ => false,
         }
     }
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum OwnershipError {
+    #[error("cannot take ownership of a shared UringFd (strong_count: {0})")]
+    SharedFd(usize),
+
+    #[error("cannot take ownership of a borrowed UringFd")]
+    BorrowedFd,
 }

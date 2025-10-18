@@ -172,7 +172,12 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        self.track(Method::Spawn, Call::Spawn);
+        self.track(
+            Method::Spawn,
+            Call::Spawn {
+                opts: task_opts.unwrap_or_default(),
+            },
+        );
 
         // All tasks are sticky on local scheduler.
         let task_opts = task_opts.map(|opt| opt | TaskOpts::STICKY);

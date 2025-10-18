@@ -1,58 +1,59 @@
 use crate::context::with_slab_mut;
-use crate::future::opcode::{Op, OpPayload};
+use crate::future::lib::{Op, OpPayload};
 use crate::runtime::{PanicReason, SchedulerPanic};
-use crate::sqe::IoError;
 use std::pin::pin;
 
-/// Traits for cancellation operations.
-pub(crate) type CancelOutputT = Result<i32, IoError>;
+pub(crate) trait OpCleanupPayload: OpPayload<Output = i32> + Clone + Send + 'static {}
 
-pub(crate) trait OpCancelPayload:
-    OpPayload<Output = CancelOutputT> + Clone + Send + 'static
-{
-}
-
-impl<T> OpCancelPayload for T where T: OpPayload<Output = CancelOutputT> + Clone + Send + 'static {}
+impl<T> OpCleanupPayload for T where T: OpPayload<Output = i32> + Clone + Send + 'static {}
 
 #[derive(Debug)]
-pub(crate) struct CancelTaskBuilder<T: OpCancelPayload> {
-    cancel_op: T,
-    user_data: usize,
-    on_error: OnCancelError,
+pub(crate) struct CleanupTaskBuilder<T: OpCleanupPayload> {
+    cleanup: T,
+    user_data: Option<usize>,
+    on_error: OnCleanupError,
 }
 
-impl<T: OpCancelPayload> CancelTaskBuilder<T> {
-    pub(crate) fn new(cancel_op: T, user_data: usize) -> Self {
+impl<T: OpCleanupPayload> CleanupTaskBuilder<T> {
+    pub(crate) fn new(cleanup: T) -> Self {
         Self {
-            cancel_op,
-            user_data,
+            cleanup,
+            user_data: None,
             // Defaults to retrying a few times.
-            on_error: OnCancelError::default(),
+            on_error: OnCleanupError::default(),
         }
     }
 
-    pub(crate) fn on_error(mut self, on_error: OnCancelError) -> Self {
+    /// Associates the cleanup task with a `RawSqe` entry in the slab.
+    /// The entry will be removed from the slab after the cleanup operation completes.
+    pub(crate) fn with_slab_entry(mut self, user_data: usize) -> Self {
+        self.user_data = Some(user_data);
+        self
+    }
+
+    /// Sets the error handling policy for the cleanup task.
+    pub(crate) fn on_error(mut self, on_error: OnCleanupError) -> Self {
         self.on_error = on_error;
         self
     }
 
-    pub(crate) fn build(self) -> CancelTask<T> {
-        CancelTask::new(Op::new(self.cancel_op), self.user_data, self.on_error)
+    pub(crate) fn build(self) -> CleanupTask<T> {
+        CleanupTask::new(Op::new(self.cleanup), self.user_data, self.on_error)
     }
 }
 
 const DEFAULT_NUM_RETRIES: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OnCancelError {
+pub enum OnCleanupError {
     Ignore,
     Panic,
     Retry(usize),
 }
 
-impl Default for OnCancelError {
+impl Default for OnCleanupError {
     fn default() -> Self {
-        OnCancelError::Retry(DEFAULT_NUM_RETRIES)
+        OnCleanupError::Retry(DEFAULT_NUM_RETRIES)
     }
 }
 
@@ -61,42 +62,41 @@ impl Default for OnCancelError {
 /// This struct encapsulates all the logic for building the cancellation future,
 /// handling its result, and cleaning up associated resources.
 #[derive(Debug)]
-pub(crate) struct CancelTask<T: OpCancelPayload> {
-    cancel_op: Op<T>,
-    user_data: usize,
-    on_error: OnCancelError,
+pub(crate) struct CleanupTask<T: OpCleanupPayload> {
+    op: Op<T>,
+    user_data: Option<usize>,
+    on_error: OnCleanupError,
 }
 
-impl<T: OpCancelPayload> CancelTask<T> {
-    fn new(cancel_op: Op<T>, user_data: usize, on_error: OnCancelError) -> Self {
+impl<T: OpCleanupPayload> CleanupTask<T> {
+    fn new(op: Op<T>, user_data: Option<usize>, on_error: OnCleanupError) -> Self {
         Self {
-            cancel_op,
+            op,
             user_data,
             on_error,
         }
     }
 
-    /// Converts the `CancelTask` into a future that performs the cancellation.
-    /// Can panic if we exhausted retries or OnCancelError::Panic is set.
+    /// Converts the `CleanupTask` into a future that performs the cleanup.
+    /// Can panic if we exhausted retries or OnCleanupError::Panic is set.
     pub(crate) async fn into_future(mut self) {
         loop {
-            let res = pin!(self.cancel_op.clone()).await;
-
+            let res = pin!(self.op.clone()).await;
             match res {
                 Ok(_) => break,
                 Err(err) => {
                     match (err.is_retryable(), &mut self.on_error) {
-                        (_, OnCancelError::Ignore) => break,
-                        (true, OnCancelError::Retry(retries_left)) if *retries_left > 0 => {
+                        (_, OnCleanupError::Ignore) => break,
+                        (true, OnCleanupError::Retry(retries_left)) if *retries_left > 0 => {
                             *retries_left -= 1;
                             continue; // Continue to the next iteration of the loop to retry.
                         }
 
-                        (_, OnCancelError::Panic | OnCancelError::Retry(_)) => {
+                        (_, OnCleanupError::Panic | OnCleanupError::Retry(_)) => {
                             std::panic::panic_any(SchedulerPanic::new(
-                                PanicReason::CancelTask,
+                                PanicReason::CleanupTask,
                                 format!(
-                                    "CancelTask failed. OnCancelError: {:?}, err: {:?}",
+                                    "CleanupTask failed. OnCleanupError: {:?}, err: {:?}",
                                     self.on_error, err
                                 ),
                             ));
@@ -106,19 +106,21 @@ impl<T: OpCancelPayload> CancelTask<T> {
             }
         } // cancel loop /w retries
 
-        // The cancellation task is now responsible for removing the RawSqe from the slab.
-        // We do this at the very end to avoid race condition on the slab, because as soon
-        // as we release the entry, it can be reused by another async operation.
-        with_slab_mut(|slab| {
-            if slab.try_remove(self.user_data).is_none()
-                && !matches!(self.on_error, OnCancelError::Ignore)
-            {
-                std::panic::panic_any(SchedulerPanic::new(
-                    PanicReason::SlabInvalidState,
-                    "Failed to remove entry from slab in CancelTask".to_string(),
-                ));
-            }
-        });
+        if let Some(user_data) = self.user_data {
+            // The cleanup task is now responsible for removing the RawSqe from the slab.
+            // We do this at the very end to avoid race condition on the slab, because as soon
+            // as we release the entry, it can be reused by another async operation.
+            with_slab_mut(|slab| {
+                if slab.try_remove(user_data).is_none()
+                    && !matches!(self.on_error, OnCleanupError::Ignore)
+                {
+                    std::panic::panic_any(SchedulerPanic::new(
+                        PanicReason::SlabInvalidState,
+                        "Failed to remove entry from slab in CleanupTask".to_string(),
+                    ));
+                }
+            });
+        }
     }
 }
 
@@ -126,13 +128,13 @@ impl<T: OpCancelPayload> CancelTask<T> {
 mod tests {
     use super::*;
     use crate::context::with_slab;
-    use crate::future::opcode::single::AsyncCancelOp;
+    use crate::future::lib::single::AsyncCancelOp;
     use crate::runtime::Builder;
     use crate::test_utils::init_local_runtime_and_context;
     use crate::utils::scheduler::{Call, Method};
     use crate::{
         self as ringolo,
-        future::opcode::{Multishot, TimeoutMultishot},
+        future::lib::{Multishot, TimeoutMultishot},
     };
     use anyhow::Result;
     use futures::StreamExt;
@@ -152,7 +154,7 @@ mod tests {
             assert!(matches!(res, Ok(())));
         }
 
-        // Cancel once
+        // Cleanup once
         let cancel_handle = timeout.as_mut().cancel();
         assert!(cancel_handle.is_some());
         assert!(cancel_handle.unwrap().await.is_ok());
@@ -165,7 +167,7 @@ mod tests {
             assert!(unhandled_panic_calls.is_empty());
         });
 
-        // Cancel twice is no-op
+        // Cleanup twice is no-op
         assert!(matches!(timeout.next().await, None));
         assert!(timeout.cancel().is_none());
 
@@ -178,16 +180,16 @@ mod tests {
     }
 
     #[test]
-    fn test_on_cancel_error_ignore() -> Result<()> {
-        let builder = Builder::new_local().on_cancel_error(OnCancelError::Ignore);
+    fn test_on_cleanup_error_ignore() -> Result<()> {
+        let builder = Builder::new_local().on_cleanup_error(OnCleanupError::Ignore);
         init_local_runtime_and_context(Some(builder))?;
 
         let user_data = 42;
 
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data);
+        let task = CleanupTaskBuilder::new(AsyncCancelOp::new(builder)).with_slab_entry(user_data);
 
-        let handle = crate::runtime::spawn_cancel(task);
+        let handle = crate::runtime::spawn_cleanup(task);
 
         ringolo::block_on(async {
             assert!(handle.await.is_ok());
@@ -205,18 +207,17 @@ mod tests {
         Ok(())
     }
 
-    #[ignore = "Test is now failing, getting InvalidSlabState error instead of CancelTask panic. Why?"]
     #[test]
-    fn test_on_cancel_error_panic() -> Result<()> {
-        let builder = Builder::new_local().on_cancel_error(OnCancelError::Panic);
+    fn test_on_cleanup_error_panic() -> Result<()> {
+        let builder = Builder::new_local().on_cleanup_error(OnCleanupError::Panic);
         init_local_runtime_and_context(Some(builder))?;
 
         let user_data = 333;
 
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CancelTaskBuilder::new(AsyncCancelOp::new(builder), user_data);
+        let task = CleanupTaskBuilder::new(AsyncCancelOp::new(builder)).with_slab_entry(user_data);
 
-        let handle = crate::runtime::spawn_cancel(task);
+        let handle = crate::runtime::spawn_cleanup(task);
 
         let root_res = std::panic::catch_unwind(|| {
             ringolo::block_on(async {
@@ -241,7 +242,7 @@ mod tests {
             assert_eq!(
                 unhandled_panic_calls.first(),
                 Some(&Call::UnhandledPanic {
-                    reason: PanicReason::CancelTask
+                    reason: PanicReason::CleanupTask
                 })
             );
         });

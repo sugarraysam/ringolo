@@ -195,7 +195,7 @@ impl SingleIssuerRing {
 mod tests {
     use super::*;
     use crate::context::with_slab_and_ring_mut;
-    use crate::future::opcode::{Op, TimeoutOp};
+    use crate::future::lib::{Op, TimeoutOp};
     use crate::runtime::Builder;
     use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
     use crate::sqe::{CompletionHandler, IoError, RawSqe};

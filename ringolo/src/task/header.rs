@@ -55,7 +55,7 @@ impl Header {
             vtable,
             id,
             pending_io: Cell::new(0),
-            opts: Cell::new(task_opts.unwrap_or(TaskOpts::empty())),
+            opts: Cell::new(task_opts.unwrap_or_default()),
         }
     }
 

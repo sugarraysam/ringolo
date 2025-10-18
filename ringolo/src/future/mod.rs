@@ -1,4 +1,4 @@
 // #[cfg(feature = "experimental")]
 pub mod experimental;
 
-pub mod opcode;
+pub mod lib;

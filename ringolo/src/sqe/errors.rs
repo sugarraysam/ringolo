@@ -1,4 +1,4 @@
-use crate::future::opcode::OpcodeError;
+use crate::future::lib::OpcodeError;
 use crate::runtime::{PanicReason, YieldReason};
 use io_uring::squeue::PushError;
 use std::io::{self, Error};
