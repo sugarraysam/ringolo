@@ -1,4 +1,4 @@
-use crate::future::lib::{CloseOp, OpcodeError, OwnershipError};
+use crate::future::lib::{Close, OpcodeError, OwnershipError};
 use crate::runtime::CleanupTaskBuilder;
 use either::Either;
 use io_uring::types::{DestinationSlot, Fd, Fixed};
@@ -51,8 +51,7 @@ impl Drop for UringFdInner {
         match &self {
             UringFdInner::Borrowed(_) => (),
             UringFdInner::Owned(kind) => {
-                dbg!("Spawning async cleanup task for UringFd: {:?}", &self);
-                let task = CleanupTaskBuilder::new(CloseOp::new(kind.as_either()));
+                let task = CleanupTaskBuilder::new(Close::new(kind.as_either()));
                 crate::runtime::spawn_cleanup(task);
             }
         }
@@ -360,12 +359,13 @@ impl TryFrom<&UringFd> for Fd {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Add;
     use std::{net::TcpListener, os::fd::AsRawFd};
 
     use super::*;
     use crate as ringolo;
     use crate::{
-        future::lib::{Op, single::SocketOp},
+        future::lib::{Op, single::Socket},
         runtime::{Builder, TaskOpts},
         test_utils::*,
         utils::scheduler::{Call, Method},
@@ -374,19 +374,10 @@ mod tests {
     use nix::sys::socket::{AddressFamily, SockProtocol, SockType};
     use rstest::rstest;
 
-    fn socket_op(mode: KernelFdMode) -> Op<SocketOp> {
-        Op::new(SocketOp::new(
-            mode,
-            AddressFamily::Inet,
-            SockType::Stream,
-            SockProtocol::Tcp,
-        ))
-    }
-
     #[ringolo::test]
     async fn test_owned_uringfd() -> Result<()> {
         {
-            let sockfd = socket_op(KernelFdMode::DirectAuto)
+            let sockfd = tcp_socket4(KernelFdMode::DirectAuto)
                 .await
                 .context("failed to create sockfd")?;
 
@@ -471,7 +462,7 @@ mod tests {
             let mut sockets = Vec::with_capacity(n as usize);
 
             for _ in 0..n {
-                let sockfd = socket_op(KernelFdMode::DirectAuto)
+                let sockfd = tcp_socket4(KernelFdMode::DirectAuto)
                     .await
                     .expect("failed to create sockfd");
                 sockets.push(sockfd);
@@ -479,7 +470,7 @@ mod tests {
 
             // Creating one more exhausts our fixed slots and triggers -ENFILE
             assert!(
-                matches!(socket_op(KernelFdMode::DirectAuto).await, Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ENFILE))
+                matches!(tcp_socket4(KernelFdMode::DirectAuto).await, Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ENFILE))
             );
         });
 
@@ -518,9 +509,9 @@ mod tests {
     ) -> Result<()> {
         {
             let (sockfd, _clone, _listener) = match ownership {
-                Ownership::OwnedUnique => (socket_op(mode).await?, None, None),
+                Ownership::OwnedUnique => (tcp_socket4(mode).await?, None, None),
                 Ownership::OwnedShared => {
-                    let sock = socket_op(mode).await?;
+                    let sock = tcp_socket4(mode).await?;
                     let sock_clone = sock.clone();
                     (sock, Some(sock_clone), None)
                 }

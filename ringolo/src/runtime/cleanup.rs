@@ -128,7 +128,7 @@ impl<T: OpCleanupPayload> CleanupTask<T> {
 mod tests {
     use super::*;
     use crate::context::with_slab;
-    use crate::future::lib::single::AsyncCancelOp;
+    use crate::future::lib::AsyncCancel;
     use crate::runtime::Builder;
     use crate::test_utils::init_local_runtime_and_context;
     use crate::utils::scheduler::{Call, Method};
@@ -187,7 +187,7 @@ mod tests {
         let user_data = 42;
 
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CleanupTaskBuilder::new(AsyncCancelOp::new(builder)).with_slab_entry(user_data);
+        let task = CleanupTaskBuilder::new(AsyncCancel::new(builder)).with_slab_entry(user_data);
 
         let handle = crate::runtime::spawn_cleanup(task);
 
@@ -215,7 +215,7 @@ mod tests {
         let user_data = 333;
 
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CleanupTaskBuilder::new(AsyncCancelOp::new(builder)).with_slab_entry(user_data);
+        let task = CleanupTaskBuilder::new(AsyncCancel::new(builder)).with_slab_entry(user_data);
 
         let handle = crate::runtime::spawn_cleanup(task);
 

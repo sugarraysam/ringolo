@@ -195,22 +195,21 @@ impl SingleIssuerRing {
 mod tests {
     use super::*;
     use crate::context::with_slab_and_ring_mut;
-    use crate::future::lib::{Op, TimeoutOp};
+    use crate::future::lib::{Op, Timeout};
     use crate::runtime::Builder;
     use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
-    use crate::sqe::{CompletionHandler, IoError, RawSqe};
+    use crate::sqe::{CompletionHandler, RawSqe};
     use crate::test_utils::*;
     use rstest::rstest;
     use smallvec::SmallVec;
     use std::pin::pin;
     use std::task::{Context, Poll};
-    use tracing::Span;
 
     #[test]
     fn test_taskrun_flag() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        let mut sqe_fut = pin!(Op::new(TimeoutOp::new(Duration::from_millis(1))));
+        let mut sqe_fut = pin!(Op::new(Timeout::new(Duration::from_millis(1))));
         let (waker, _) = mock_waker();
 
         let mut ctx = Context::from_waker(&waker);

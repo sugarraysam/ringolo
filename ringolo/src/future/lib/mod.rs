@@ -25,7 +25,6 @@
 //!   results should be parsed. This is meant to be a low-level building block
 //!   library.
 //!
-use crate::future::lib::single::AsyncCancelOp;
 use crate::runtime::CleanupTaskBuilder;
 use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
 use crate::task::JoinHandle;
@@ -42,15 +41,19 @@ pub(crate) mod errors;
 pub(crate) use errors::{OpcodeError, OwnershipError};
 
 #[macro_use]
-pub(crate) mod fd;
-pub(crate) use fd::{KernelFdMode, UringFd};
+pub mod fd;
+pub use fd::{KernelFdMode, UringFd};
 
 pub mod multishot;
 pub use multishot::TimeoutMultishot;
 
 pub(super) mod parse;
+
 pub mod single;
-pub use single::{CloseOp, TimeoutOp};
+pub use single::*;
+
+pub mod sockopt;
+pub use sockopt::*;
 
 // TODO:
 // - single :: impl Nop
@@ -233,7 +236,7 @@ impl<T: MultishotPayload> Multishot<T> {
         // Using `.all()` will NOT return -ENOENT if we can't find the associated SQE with user_data.
         // Better to target a single SQE even if it is multishot.
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CleanupTaskBuilder::new(AsyncCancelOp::new(builder)).with_slab_entry(user_data);
+        let task = CleanupTaskBuilder::new(AsyncCancel::new(builder)).with_slab_entry(user_data);
 
         Some(crate::runtime::spawn_cleanup(task))
     }
@@ -289,7 +292,7 @@ mod tests {
     fn test_op_double_drop_no_undefined_behavior() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        let op = Op::new(AsyncCancelOp::new(
+        let op = Op::new(AsyncCancel::new(
             io_uring::types::CancelBuilder::user_data(42).all(),
         ));
 

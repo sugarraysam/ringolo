@@ -1,4 +1,4 @@
-use crate::future::lib::{Op, TimeoutOp};
+use crate::future::lib::{Op, Timeout};
 use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;
@@ -8,13 +8,13 @@ use std::time::Duration;
 #[pin_project]
 pub struct Sleep {
     #[pin]
-    inner: Op<TimeoutOp>,
+    inner: Op<Timeout>,
 }
 
 impl Sleep {
     pub fn new(when: Duration) -> Self {
         Self {
-            inner: Op::new(TimeoutOp::new(when)),
+            inner: Op::new(Timeout::new(when)),
         }
     }
 }

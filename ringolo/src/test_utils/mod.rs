@@ -11,6 +11,9 @@ use std::os::fd::AsRawFd;
 pub(crate) mod context;
 pub(crate) use context::init_local_runtime_and_context;
 
+pub(crate) mod future;
+pub(crate) use future::*;
+
 pub(crate) mod mocks;
 pub(crate) use mocks::{DummyScheduler, mock_waker};
 
