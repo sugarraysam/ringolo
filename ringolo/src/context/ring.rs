@@ -169,14 +169,9 @@ impl SingleIssuerRing {
                     }
                 };
 
-                let cqe_flags = match cqe.flags() {
-                    0 => None,
-                    flags => Some(flags),
-                };
-
                 num_completed += 1;
 
-                for effect in raw_sqe.on_completion(cqe.result(), cqe_flags)? {
+                for effect in raw_sqe.on_completion(cqe.result(), cqe.flags())? {
                     match effect {
                         CompletionEffect::DecrementPendingIo => slab.pending_ios -= 1,
                         CompletionEffect::WakeHead { head } => slab.get_mut(head)?.wake()?,
@@ -209,7 +204,7 @@ mod tests {
     fn test_taskrun_flag() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        let mut sqe_fut = pin!(Op::new(Timeout::new(Duration::from_millis(1))));
+        let mut sqe_fut = pin!(Op::new(Timeout::new(Duration::from_millis(1), None)));
         let (waker, _) = mock_waker();
 
         let mut ctx = Context::from_waker(&waker);

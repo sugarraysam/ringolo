@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{Schedule, SchedulerPanic, YieldReason};
+use crate::runtime::{AddMode, Schedule, SchedulerPanic, YieldReason};
 use crate::task::layout::vtable;
 use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
@@ -18,7 +18,7 @@ impl Schedule for DummyScheduler {
         unimplemented!("dummy scheduler");
     }
 
-    fn yield_now(&self, _waker: &Waker, _reason: YieldReason) {
+    fn yield_now(&self, _waker: &Waker, _reason: YieldReason, _mode: Option<AddMode>) {
         unimplemented!("dummy scheduler");
     }
 

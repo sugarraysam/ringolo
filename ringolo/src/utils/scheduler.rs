@@ -1,4 +1,4 @@
-use crate::runtime::{PanicReason, TaskOpts, YieldReason};
+use crate::runtime::{AddMode, PanicReason, TaskOpts, YieldReason};
 use crate::task::Id;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -14,11 +14,23 @@ pub(crate) enum Method {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
-    Schedule { is_new: bool, id: Id },
-    YieldNow { reason: YieldReason },
-    Release { id: Id },
-    Spawn { opts: TaskOpts },
-    UnhandledPanic { reason: PanicReason },
+    Schedule {
+        is_new: bool,
+        id: Id,
+    },
+    YieldNow {
+        reason: YieldReason,
+        mode: Option<AddMode>,
+    },
+    Release {
+        id: Id,
+    },
+    Spawn {
+        opts: TaskOpts,
+    },
+    UnhandledPanic {
+        reason: PanicReason,
+    },
 }
 
 #[derive(Debug, Clone)]

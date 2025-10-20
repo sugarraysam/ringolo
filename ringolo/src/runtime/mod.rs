@@ -39,11 +39,15 @@ pub(crate) trait Schedule: Sync + Sized + 'static {
     /// of running again soon without being woken up. Very useful if a task was
     /// unable to register the waker for example, can fallback to yielding and
     /// try to register the waker again.
+    ///
+    /// By default, the scheduler will figure out the optimal AddMode and decide
+    /// if task should be run again next (Lifo :: front of queue) or run again
+    /// soon (Fifo :: back of queue). Only override if you have special insights.
     //
     // We pass the Waker as this is how we are able to reconstruct the appropriate
     // task. The Waker data ptr carries the task information if we are not polling
     // the root future.
-    fn yield_now(&self, waker: &Waker, reason: YieldReason);
+    fn yield_now(&self, waker: &Waker, reason: YieldReason, mode: Option<AddMode>);
 
     /// The task has completed work and is ready to be released. The scheduler
     /// should release it immediately and return it. The task module will batch
@@ -68,6 +72,7 @@ pub(crate) enum YieldReason {
     SlabFull,
     SqRingFull,
     NoTaskBudget,
+    SelfYielded,
     Unknown,
 }
 

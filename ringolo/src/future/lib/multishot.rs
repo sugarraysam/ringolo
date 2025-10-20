@@ -70,11 +70,16 @@ impl TimeoutMultishot {
     /// Create a new multishot timeout operation.
     /// - If `count` is `n`, the timeout will fire n times.
     /// - If `count` is `0`, it will fire indefinitely.
+    ///
+    /// The `IORING_TIMEOUT_MULTISHOT` and `IORING_TIMEOUT_ETIME_SUCCESS` flags
+    /// are added by default.
     pub fn new(interval: Duration, count: u32, flags: Option<TimeoutFlags>) -> Self {
         Self {
             timespec: Timespec::from(interval),
             count,
-            flags: TimeoutFlags::MULTISHOT | flags.unwrap_or(TimeoutFlags::empty()),
+            flags: TimeoutFlags::MULTISHOT
+                | TimeoutFlags::ETIME_SUCCESS
+                | flags.unwrap_or(TimeoutFlags::empty()),
         }
     }
 }
@@ -101,6 +106,7 @@ impl MultishotPayload for TimeoutMultishot {
     ) -> Result<Self::Item, IoError> {
         match result {
             Ok(_) => Ok(()),
+            // Expired timeout is a success case.
             Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
             Err(e) => Err(e),
         }

@@ -96,7 +96,7 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send
                             // We were unable to register the waker, and submit our IO to local uring.
                             // Yield to scheduler so we can take corrective action and retry later.
                             with_scheduler!(|s| {
-                                s.yield_now(cx.waker(), e.as_yield_reason());
+                                s.yield_now(cx.waker(), e.as_yield_reason(), None);
                             });
 
                             return Poll::Pending;

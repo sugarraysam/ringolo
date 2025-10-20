@@ -14,6 +14,9 @@ pub enum OpcodeError {
     #[error("Ownership error: {0}")]
     Ownership(#[from] OwnershipError),
 
+    #[error("Sleeping zero is an anti-pattern, please use YieldNow instead.")]
+    SleepZeroDuration,
+
     #[error("IO error: {0}")]
     Io(#[from] io::Error),
 

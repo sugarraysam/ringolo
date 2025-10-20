@@ -117,7 +117,8 @@ fn test_local_scheduler_sq_ring_full_recovers() -> Result<()> {
         assert!(matches!(
             yield_calls[0],
             Call::YieldNow {
-                reason: YieldReason::SqRingFull
+                reason: YieldReason::SqRingFull,
+                mode: None,
             }
         ));
     });

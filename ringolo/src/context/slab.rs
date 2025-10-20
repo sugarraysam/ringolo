@@ -187,7 +187,7 @@ mod tests {
     use crate::sqe::raw::CompletionHandler;
     use crate::test_utils::*;
     use anyhow::Result;
-    use libc::CN_IDX_BB;
+    use io_uring::cqueue::CompletionFlags;
 
     #[test]
     fn test_new_and_capacity() {
@@ -257,7 +257,9 @@ mod tests {
 
             // Waking sqes decrement counter
             for idx in indices {
-                let effects = slab.get_mut(idx)?.on_completion(0, None)?;
+                let effects = slab
+                    .get_mut(idx)?
+                    .on_completion(0, CompletionFlags::empty())?;
                 assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
             }
 

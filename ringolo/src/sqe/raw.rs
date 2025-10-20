@@ -1,3 +1,4 @@
+use io_uring::cqueue::CompletionFlags;
 use smallvec::{SmallVec, smallvec};
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
@@ -72,7 +73,7 @@ impl RawSqe {
     pub(crate) fn on_completion(
         &mut self,
         cqe_res: i32,
-        cqe_flags: Option<u32>,
+        cqe_flags: CompletionFlags,
     ) -> Result<SmallVec<[CompletionEffect; 2]>> {
         if !matches!(self.state, RawSqeState::Pending | RawSqeState::Ready) {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
@@ -124,7 +125,7 @@ impl RawSqe {
                     StreamCompletion::ByFlag { done } => {
                         // If we have the `IORING_CQE_F_MORE` flags set, it means we are
                         // expecting more results, otherwise this was the final result.
-                        let has_more = cqe_flags.is_some_and(io_uring::cqueue::more);
+                        let has_more = io_uring::cqueue::more(cqe_flags);
                         *done = !has_more;
                         *done
                     }
@@ -330,6 +331,7 @@ mod tests {
     use crate::context::with_slab_mut;
     use crate::test_utils::*;
     use anyhow::Result;
+    use io_uring::cqueue::CompletionFlags;
     use rstest::rstest;
     use std::io::{self, ErrorKind};
     use std::sync::atomic::Ordering;
@@ -371,7 +373,7 @@ mod tests {
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
         assert_eq!(
-            *sqe.on_completion(res, None)?,
+            *sqe.on_completion(res, CompletionFlags::empty())?,
             [CompletionEffect::DecrementPendingIo]
         );
 
@@ -424,7 +426,7 @@ mod tests {
 
             for i in (0..n_sqes) {
                 let raw = slab.get_mut(indices[i])?;
-                let effects = raw.on_completion(res, None)?;
+                let effects = raw.on_completion(res, CompletionFlags::empty())?;
 
                 // Last SQE to complete triggers completion
                 if i == n_sqes - 1 {
@@ -443,10 +445,6 @@ mod tests {
     #[test]
     fn test_raw_sqe_stream_by_flag_completion() -> Result<()> {
         init_local_runtime_and_context(None)?;
-        // TODO: Hardcoded for now, need to expose all flags with `bitflags!` macro
-        //       from `tokio-rs/io_uring` crate.
-        const IORING_CQE_F_MORE: Option<u32> = Some(2);
-
         let n = 5;
 
         // count = 0 triggers ByFlag completion
@@ -457,7 +455,7 @@ mod tests {
         assert_eq!(sqe.state, RawSqeState::Pending);
 
         for i in 1..=n {
-            let effects = sqe.on_completion(123, IORING_CQE_F_MORE)?;
+            let effects = sqe.on_completion(123, CompletionFlags::MORE)?;
             assert!(effects.is_empty()); // NO DecrementPendingIo
             assert_eq!(waker_data.get_count(), i);
 
@@ -467,7 +465,7 @@ mod tests {
             assert!(matches!(sqe.pop_next_result()?, Some(123)));
         }
 
-        let effects = sqe.on_completion(789, None)?;
+        let effects = sqe.on_completion(789, CompletionFlags::empty())?;
         assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
         assert_eq!(waker_data.get_count(), n + 1);
         assert!(!sqe.has_waker(), "waker SHOULD be consumed now");
@@ -501,7 +499,7 @@ mod tests {
             assert_eq!(inserted.get_state(), RawSqeState::Pending);
 
             inserted.set_waker(&waker);
-            assert!(inserted.on_completion(0, None).is_ok());
+            assert!(inserted.on_completion(0, CompletionFlags::empty()).is_ok());
             assert_eq!(inserted.get_state(), RawSqeState::Ready);
 
             assert_eq!(waker_data.get_count(), 1);

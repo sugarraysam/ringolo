@@ -425,16 +425,14 @@ impl Timeout {
     /// - If `count` is `None`, it will be a single-shot timeout.
     /// - If `count` is `Some(n)`, the timeout will be multishot and complete `n` times.
     /// - If `count` is `Some(0)`, it will be an infinite multishot timeout.
-    pub fn new(when: Duration) -> Self {
+    ///
+    /// The `IORING_TIMEOUT_ETIME_SUCCESS` flag is added by default as we consider
+    /// an expired timeout as success.
+    pub fn new(when: Duration, flags: Option<TimeoutFlags>) -> Self {
         Self {
             timespec: Timespec::from(when),
-            flags: TimeoutFlags::empty(),
+            flags: TimeoutFlags::ETIME_SUCCESS | flags.unwrap_or(TimeoutFlags::empty()),
         }
-    }
-
-    pub fn flags(mut self, flags: TimeoutFlags) -> Self {
-        self.flags |= flags;
-        self
     }
 }
 
@@ -459,6 +457,7 @@ impl OpPayload for Timeout {
     ) -> Result<Self::Output, IoError> {
         match result {
             Ok(_) => Ok(()),
+            // Expired timeout yield -ETIME but this is a success case.
             Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
             Err(e) => Err(e),
         }

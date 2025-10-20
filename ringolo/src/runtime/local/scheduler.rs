@@ -102,12 +102,20 @@ impl Schedule for Handle {
         self.worker.add_task(task, AddMode::Lifo);
     }
 
-    /// Schedule a task to run soon but not next (i.e.: back of queue).
+    /// Schedule a task to run soon.
     #[track_caller]
-    fn yield_now(&self, waker: &Waker, reason: YieldReason) {
-        self.track(Method::YieldNow, Call::YieldNow { reason });
+    fn yield_now(&self, waker: &Waker, reason: YieldReason, mode: Option<AddMode>) {
+        self.track(Method::YieldNow, Call::YieldNow { reason, mode });
+
+        // Default to adding the task to the back of the queue.
+        let mut mode = mode.unwrap_or(AddMode::Fifo);
+
         match reason {
             YieldReason::SqRingFull | YieldReason::SlabFull => {
+                // Reduce scheduler latency, event outside control of task add to
+                // front of queue in this case.
+                mode = AddMode::Lifo;
+
                 if let Err(e) = with_slab_and_ring_mut(|slab, ring| -> Result<usize> {
                     ring.submit_and_wait(1, None)?;
                     ring.process_cqes(slab, None)
@@ -118,7 +126,9 @@ impl Schedule for Handle {
                     );
                 }
             }
-            YieldReason::NoTaskBudget | YieldReason::Unknown => { /* nothing to do */ }
+
+            // Nothing to do, keep FIFO order as task should run soon but not next.
+            YieldReason::NoTaskBudget | YieldReason::Unknown | YieldReason::SelfYielded => { /* */ }
         }
 
         // If the root_future is yielding, we need to handle it differently.
@@ -129,9 +139,7 @@ impl Schedule for Handle {
             // tasks and one for the root_future. We just checked that we are not
             // currently polling the root future.
             let task = unsafe { Notified::from_waker(waker) };
-
-            // Lifo to minimize scheduler latency.
-            self.worker.add_task(task, AddMode::Lifo);
+            self.worker.add_task(task, mode);
         }
     }
 

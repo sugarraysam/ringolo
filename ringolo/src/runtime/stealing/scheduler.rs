@@ -1,7 +1,7 @@
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
-use crate::runtime::{PanicReason, Schedule, SchedulerPanic, TaskOpts, YieldReason};
+use crate::runtime::{AddMode, PanicReason, Schedule, SchedulerPanic, TaskOpts, YieldReason};
 use crate::sqe::IoError;
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
@@ -108,7 +108,7 @@ impl Schedule for Handle {
         }
     }
 
-    fn yield_now(&self, waker: &Waker, reason: YieldReason) {
+    fn yield_now(&self, waker: &Waker, reason: YieldReason, mode: Option<AddMode>) {
         unimplemented!("todo");
     }
 
