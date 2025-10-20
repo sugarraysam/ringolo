@@ -1,7 +1,8 @@
 #![allow(dead_code)]
 
 use crate::future::lib::{
-    KernelFdMode, OpParams, OpPayload, OpcodeError, SetSockOptIf, UringFd, parse,
+    AsRawOrDirect, KernelFdMode, OpParams, OpPayload, OpcodeError, OwnedUringFd, SetSockOptIf,
+    parse,
 };
 use crate::sqe::IoError;
 use anyhow::{Context, Result};
@@ -20,8 +21,8 @@ use std::time::Duration;
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct Accept {
-    sockfd: UringFd,
+pub struct Accept<T: AsRawOrDirect> {
+    sockfd: T,
     flags: SockFlag,
     mode: KernelFdMode,
     with_addr: bool,
@@ -34,13 +35,8 @@ pub struct Accept {
     addrlen: MaybeUninit<libc::socklen_t>,
 }
 
-impl Accept {
-    pub fn new(
-        sockfd: UringFd,
-        mode: KernelFdMode,
-        with_addr: bool,
-        flags: Option<SockFlag>,
-    ) -> Self {
+impl<T: AsRawOrDirect> Accept<T> {
+    pub fn new(sockfd: T, mode: KernelFdMode, with_addr: bool, flags: Option<SockFlag>) -> Self {
         let mut addrlen = MaybeUninit::uninit();
         if with_addr {
             addrlen.write(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
@@ -57,8 +53,8 @@ impl Accept {
     }
 }
 
-impl OpPayload for Accept {
-    type Output = (UringFd, Option<SocketAddr>);
+impl<T: AsRawOrDirect> OpPayload for Accept<T> {
+    type Output = (OwnedUringFd, Option<SocketAddr>);
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
         let this = self.project();
@@ -105,7 +101,7 @@ impl OpPayload for Accept {
             None
         };
 
-        Ok((UringFd::from_result_into_owned(fd, *this.mode), addr_info))
+        Ok((OwnedUringFd::from_result(fd, *this.mode), addr_info))
     }
 }
 
@@ -146,16 +142,16 @@ impl OpPayload for AsyncCancel {
 ///
 // #[derive(Debug)]
 #[pin_project]
-pub struct Bind {
-    sockfd: UringFd,
+pub struct Bind<T: AsRawOrDirect> {
+    sockfd: T,
 
     #[pin]
     addr: parse::SocketAddrCRepr,
     addr_len: libc::socklen_t,
 }
 
-impl Bind {
-    pub fn try_new(sockfd: UringFd, addr: &impl ToSocketAddrs) -> Result<Self> {
+impl<T: AsRawOrDirect> Bind<T> {
+    pub fn try_new(sockfd: T, addr: &impl ToSocketAddrs) -> Result<Self> {
         let addr = addr
             .to_socket_addrs()?
             .next()
@@ -171,7 +167,7 @@ impl Bind {
     }
 }
 
-impl OpPayload for Bind {
+impl<T: AsRawOrDirect> OpPayload for Bind<T> {
     type Output = ();
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
@@ -202,7 +198,7 @@ pub struct Close {
 }
 
 impl Close {
-    /// Does not take an Owned UringFd as we intend to use this in Drop impls to
+    /// Does not take an OwnedUringFd as we intend to use this in Drop impls to
     /// perform async cleanup.
     pub fn new(fd: Either<Fd, Fixed>) -> Self {
         Self { fd }
@@ -241,16 +237,16 @@ impl OpPayload for Close {
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct Connect {
-    sockfd: UringFd,
+pub struct Connect<T: AsRawOrDirect> {
+    sockfd: T,
 
     #[pin]
     addr: parse::SocketAddrCRepr,
     addr_len: libc::socklen_t,
 }
 
-impl Connect {
-    pub fn try_new(sockfd: UringFd, addr: &impl ToSocketAddrs) -> Result<Self> {
+impl<T: AsRawOrDirect> Connect<T> {
+    pub fn try_new(sockfd: T, addr: &impl ToSocketAddrs) -> Result<Self> {
         let addr = addr
             .to_socket_addrs()?
             .next()
@@ -266,7 +262,7 @@ impl Connect {
     }
 }
 
-impl OpPayload for Connect {
+impl<T: AsRawOrDirect> OpPayload for Connect<T> {
     type Output = ();
 
     fn create_params(mut self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
@@ -292,18 +288,18 @@ impl OpPayload for Connect {
 /// === Listen ===
 ///
 #[derive(Debug)]
-pub struct Listen {
-    sockfd: UringFd,
+pub struct Listen<T: AsRawOrDirect> {
+    sockfd: T,
     backlog: i32,
 }
 
-impl Listen {
-    pub fn new(sockfd: UringFd, backlog: i32) -> Self {
+impl<T: AsRawOrDirect> Listen<T> {
+    pub fn new(sockfd: T, backlog: i32) -> Self {
         Self { sockfd, backlog }
     }
 }
 
-impl OpPayload for Listen {
+impl<T: AsRawOrDirect> OpPayload for Listen<T> {
     type Output = ();
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
@@ -351,7 +347,7 @@ impl Socket {
 }
 
 impl OpPayload for Socket {
-    type Output = UringFd;
+    type Output = OwnedUringFd;
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
         Ok(io_uring::opcode::Socket::new(
@@ -368,7 +364,7 @@ impl OpPayload for Socket {
         self: Pin<&mut Self>,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        Ok(UringFd::from_result_into_owned(result?, self.mode))
+        Ok(OwnedUringFd::from_result(result?, self.mode))
     }
 }
 
@@ -377,23 +373,23 @@ impl OpPayload for Socket {
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct SetSockOpt<T: SetSockOptIf> {
-    sockfd: UringFd,
+pub struct SetSockOpt<T: AsRawOrDirect, O: SetSockOptIf> {
+    sockfd: T,
 
     /// The opt is a self-contained struct that generates stable c ptrs when
     /// we unpack it on first poll. We use it as an entry generator and it's
     /// role is to inject the appropriate arguments in our SQE.
     #[pin]
-    opt: T,
+    opt: O,
 }
 
-impl<T: SetSockOptIf> SetSockOpt<T> {
-    pub fn new(sockfd: UringFd, opt: T) -> Self {
+impl<T: AsRawOrDirect, O: SetSockOptIf> SetSockOpt<T, O> {
+    pub fn new(sockfd: T, opt: O) -> Self {
         Self { sockfd, opt }
     }
 }
 
-impl<T: SetSockOptIf> OpPayload for SetSockOpt<T> {
+impl<T: AsRawOrDirect, O: SetSockOptIf> OpPayload for SetSockOpt<T, O> {
     type Output = ();
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
@@ -469,7 +465,7 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     use super::*;
-    use crate::future::lib::ReuseAddr;
+    use crate::future::lib::{BorrowedUringFd, ReuseAddr};
     use crate::{self as ringolo, future::lib::Op, task::JoinHandle};
     use anyhow::Result;
     use rstest::rstest;
@@ -481,7 +477,7 @@ mod tests {
     async fn test_accept_safe_unpacking() -> Result<()> {
         // (1) EBADF - test error does not trigger UB when reading addr
         let op = Op::new(Accept::new(
-            UringFd::new_raw_borrowed(42),
+            BorrowedUringFd::new_raw(42),
             KernelFdMode::Legacy,
             true,
             None,

@@ -1,7 +1,10 @@
-use crate::future::lib::{Close, OpcodeError, OwnershipError};
+#![allow(dead_code)]
+
+use crate::future::lib::{Close, OpcodeError};
 use crate::runtime::CleanupTaskBuilder;
 use either::Either;
 use io_uring::types::{DestinationSlot, Fd, Fixed};
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::fd::RawFd;
 use std::sync::Arc;
@@ -33,53 +36,6 @@ impl KernelFdMode {
     }
 }
 
-/// Reference-counted file descriptor that integrates with `io_uring` fixed descriptor.
-/// It spawns an asynchronous cleanup task when the last reference goes out-of-scope.
-#[derive(Debug, Clone)]
-pub struct UringFd {
-    inner: Arc<UringFdInner>,
-}
-
-#[derive(Debug)]
-enum UringFdInner {
-    Owned(UringFdKindInner),
-    Borrowed(UringFdKindInner),
-}
-
-impl Drop for UringFdInner {
-    fn drop(&mut self) {
-        match &self {
-            UringFdInner::Borrowed(_) => (),
-            UringFdInner::Owned(kind) => {
-                let task = CleanupTaskBuilder::new(Close::new(kind.as_either()));
-                crate::runtime::spawn_cleanup(task);
-            }
-        }
-    }
-}
-
-// We intentionally hide this UringFdKind to avoid making the RawFd/u32 accessible.
-// We need to force users to use the from/into methods provided to guarantee ownership
-// semantics safety.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
-enum UringFdKindInner {
-    // Regular unregistered linux file descriptor
-    Raw(RawFd),
-
-    // IoUring registered per-thread file descriptor
-    Fixed(u32),
-}
-
-impl UringFdKindInner {
-    // Seamless integration with `io_uring` crate.
-    fn as_either(&self) -> Either<Fd, Fixed> {
-        match &self {
-            UringFdKindInner::Raw(raw) => Either::Left(Fd(*raw)),
-            UringFdKindInner::Fixed(fixed) => Either::Right(Fixed(*fixed)),
-        }
-    }
-}
-
 /// Kind of fd owned by UringFd.
 ///
 /// This is the public version stripped of resources.
@@ -101,92 +57,123 @@ impl From<UringFdKindInner> for UringFdKind {
     }
 }
 
-impl UringFd {
-    /// Creates a new **owned** `UringFd` from a raw file descriptor.
-    /// The file descriptor will be closed when the last reference is dropped.
-    pub fn new_raw_owned(fd: RawFd) -> Self {
+// We intentionally hide this UringFdKind to avoid making the RawFd/u32 accessible.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+enum UringFdKindInner {
+    // Regular unregistered linux file descriptor
+    Raw(RawFd),
+
+    // IoUring registered per-thread file descriptor
+    Fixed(u32),
+}
+
+impl UringFdKindInner {
+    // Seamless integration with `io_uring` crate.
+    fn as_raw_or_direct(&self) -> Either<Fd, Fixed> {
+        match &self {
+            UringFdKindInner::Raw(raw) => Either::Left(Fd(*raw)),
+            UringFdKindInner::Fixed(fixed) => Either::Right(Fixed(*fixed)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnedUringFd {
+    state: Arc<SharedUringFdState>,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub struct BorrowedUringFd<'a> {
+    kind: UringFdKindInner,
+    _lifetime: PhantomData<&'a ()>,
+}
+
+/// The shared state for an owned descriptor, with drop logic for cleanup.
+#[derive(Debug)]
+struct SharedUringFdState {
+    kind: UringFdKindInner,
+}
+
+impl Drop for SharedUringFdState {
+    fn drop(&mut self) {
+        let task = CleanupTaskBuilder::new(Close::new(self.kind.as_raw_or_direct()));
+        crate::runtime::spawn_cleanup(task);
+    }
+}
+
+impl OwnedUringFd {
+    /// Creates a new `OwnedUringFd` from a raw file descriptor.
+    pub fn new_raw(fd: RawFd) -> Self {
         Self {
-            inner: Arc::new(UringFdInner::Owned(UringFdKindInner::Raw(fd))),
+            state: Arc::new(SharedUringFdState {
+                kind: UringFdKindInner::Raw(fd),
+            }),
         }
     }
 
-    /// Creates a new **owned** `UringFd` from a fixed slot index.
-    /// The file descriptor will be unregistered/closed when the last reference is dropped.
-    pub fn new_fixed_owned(slot: u32) -> Self {
+    /// Creates a new `OwnedUringFd` from a fixed slot index.
+    pub fn new_fixed(slot: u32) -> Self {
         Self {
-            inner: Arc::new(UringFdInner::Owned(UringFdKindInner::Fixed(slot))),
-        }
-    }
-
-    /// Creates a new **borrowed** `UringFd` from a raw file descriptor.
-    /// The file descriptor will NOT be closed when the last reference is dropped.
-    pub fn new_raw_borrowed(fd: RawFd) -> Self {
-        Self {
-            inner: Arc::new(UringFdInner::Borrowed(UringFdKindInner::Raw(fd))),
-        }
-    }
-
-    /// Creates a new **borrowed** `UringFd` from a fixed slot index.
-    /// The file descriptor will NOT be unregistered/closed when the last reference is dropped.
-    pub fn new_fixed_borrowed(slot: u32) -> Self {
-        Self {
-            inner: Arc::new(UringFdInner::Borrowed(UringFdKindInner::Fixed(slot))),
-        }
-    }
-
-    pub fn kind(&self) -> UringFdKind {
-        match &*self.inner {
-            UringFdInner::Owned(kind) => (*kind).into(),
-            UringFdInner::Borrowed(kind) => (*kind).into(),
+            state: Arc::new(SharedUringFdState {
+                kind: UringFdKindInner::Fixed(slot),
+            }),
         }
     }
 
     /// Take the result from an `io_uring` opcode, and convert it back to an **owned** `UringFd`.
     /// Results from opcodes that create new file descriptors are always owned by us.
-    pub fn from_result_into_owned(res: i32, mode: KernelFdMode) -> Self {
+    pub fn from_result(res: i32, mode: KernelFdMode) -> Self {
         match mode {
-            KernelFdMode::Legacy => UringFd::new_raw_owned(res),
+            KernelFdMode::Legacy => Self::new_raw(res),
             // Kernel generates 0 on success in this mode, we must re-use the
             // slot given by the user.
-            KernelFdMode::Direct(slot) => UringFd::new_fixed_owned(slot),
-            KernelFdMode::DirectAuto => UringFd::new_fixed_owned(res as u32),
+            KernelFdMode::Direct(slot) => Self::new_fixed(slot),
+            KernelFdMode::DirectAuto => Self::new_fixed(res as u32),
         }
     }
 
+    /// Returns a borrowed handle to the underlying file descriptor.
+    pub fn borrow<'a>(&'a self) -> BorrowedUringFd<'a> {
+        BorrowedUringFd {
+            // Does not increment refcount as we are not cloning the Arc.
+            kind: self.state.kind.clone(),
+            _lifetime: PhantomData,
+        }
+    }
+
+    pub fn kind(&self) -> UringFdKind {
+        self.state.kind.into()
+    }
+
     pub fn is_raw(&self) -> bool {
-        matches!(self.kind(), UringFdKind::Raw)
+        matches!(self.state.kind, UringFdKindInner::Raw(_))
     }
 
     pub fn is_fixed(&self) -> bool {
-        matches!(self.kind(), UringFdKind::Fixed)
+        matches!(self.state.kind, UringFdKindInner::Fixed(_))
     }
 
-    pub fn is_owned(&self) -> bool {
-        matches!(&*self.inner, UringFdInner::Owned(_))
-    }
-
-    pub fn is_borrowed(&self) -> bool {
-        matches!(&*self.inner, UringFdInner::Borrowed(_))
+    pub fn has_exclusive_ownership(&self) -> bool {
+        Arc::strong_count(&self.state) == 1
     }
 
     pub fn strong_count(&self) -> usize {
-        Arc::strong_count(&self.inner)
+        Arc::strong_count(&self.state)
     }
 
     /// Provides temporary access to the underlying raw file descriptor.
     ///
     /// This method allows you to run an operation on the raw file descriptor
-    /// without taking ownership. It will return an error if the `UringFd` is not
-    /// the `Raw` variant.
+    /// without taking ownership. It will return an error if the `OwnedUringFd`
+    /// is not the `Raw` variant.
     ///
     /// The file descriptor is only valid for the duration of the closure.
-    pub fn with_raw_fd<F, R>(&self, f: F) -> Result<R, OpcodeError>
+    pub fn with_raw<F, R>(&self, f: F) -> Result<R, OpcodeError>
     where
         F: FnOnce(RawFd) -> R,
     {
-        match &*self.inner {
-            UringFdInner::Owned(UringFdKindInner::Raw(fd))
-            | UringFdInner::Borrowed(UringFdKindInner::Raw(fd)) => Ok(f(*fd)),
+        match &self.state.kind {
+            UringFdKindInner::Raw(fd) => Ok(f(*fd)),
             _ => Err(OpcodeError::IncorrectFdVariant(self.kind())),
         }
     }
@@ -194,98 +181,78 @@ impl UringFd {
     /// Provides temporary access to the underlying fixed slot index.
     ///
     /// This method allows you to run an operation on the fixed slot index
-    /// without taking ownership. It will return an error if the `UringFd` is not
-    /// the `Fixed` variant.
+    /// without taking ownership. It will return an error if the `OwnedUringFd`
+    /// is not the `Fixed` variant.
     ///
     /// The slot index is only valid for the duration of the closure.
-    pub fn with_fixed_fd<F, R>(&self, f: F) -> Result<R, OpcodeError>
+    pub fn with_fixed<F, R>(&self, f: F) -> Result<R, OpcodeError>
     where
         F: FnOnce(u32) -> R,
     {
-        match &*self.inner {
-            UringFdInner::Owned(UringFdKindInner::Fixed(slot))
-            | UringFdInner::Borrowed(UringFdKindInner::Fixed(slot)) => Ok(f(*slot)),
+        match &self.state.kind {
+            UringFdKindInner::Fixed(slot) => Ok(f(*slot)),
             _ => Err(OpcodeError::IncorrectFdVariant(self.kind())),
         }
     }
 
-    /// Consumes the `UringFd` and returns the underlying raw file descriptor.
+    /// Consumes the `OwnedUringFd` and leaks the underlying raw file descriptor.
     ///
     /// This function will fail if:
     /// - The descriptor is shared (`strong_count > 1`).
     /// - The descriptor is a borrowed reference.
     /// - The descriptor is not the `Raw` variant.
     ///
-    /// On success, the `UringFd` is consumed and its drop logic is disabled,
+    /// On success, the `OwnedUringFd` is consumed and its drop logic is disabled,
     /// transferring ownership of the file descriptor to the caller.
-    pub unsafe fn into_raw(self) -> Result<RawFd, OpcodeError> {
+    pub unsafe fn leak_raw(self) -> Result<RawFd, OpcodeError> {
         if self.is_fixed() {
             return Err(OpcodeError::IncorrectFdVariant(self.kind()));
         }
 
-        if self.is_borrowed() {
-            // Safety: ok to ignore fixed checks and ownership checks.
-            return Ok(unsafe { self.get_raw_unchecked() });
-        }
-
-        let inner = match Arc::try_unwrap(self.inner) {
-            Ok(inner) => inner,
-            Err(arc) => return Err(OwnershipError::SharedFd(Arc::strong_count(&arc)).into()),
+        let state = match Arc::try_unwrap(self.state) {
+            Ok(state) => state,
+            Err(arc) => return Err(OpcodeError::SharedFd(Arc::strong_count(&arc)).into()),
         };
 
-        // Ensure the destructor for `UringFdInner` is not called.
-        let inner = ManuallyDrop::new(inner);
+        // Ensure the destructor for `SharedUringFdState` is not called.
+        let state = ManuallyDrop::new(state);
 
-        match &*inner {
-            UringFdInner::Owned(UringFdKindInner::Raw(fd)) => Ok(*fd),
+        match &state.kind {
+            UringFdKindInner::Raw(fd) => Ok(*fd),
             _ => unreachable!("can't be fixed or borrowed"),
         }
     }
 
-    /// Consumes the `UringFd` and returns the underlying fixed slot index.
+    /// Consumes the `OwnedUringFd` and leaks the underlying fixed slot index.
     ///
-    /// This is the `Fixed` variant of `into_raw_fd`.
-    pub unsafe fn into_fixed(self) -> Result<u32, OpcodeError> {
+    /// This is the `Fixed` variant of `into_raw`.
+    pub unsafe fn leak_fixed(self) -> Result<u32, OpcodeError> {
         if self.is_raw() {
             return Err(OpcodeError::IncorrectFdVariant(self.kind()));
         }
 
-        if self.is_borrowed() {
-            // Safety: ok to ignore raw checks and ownership checks.
-            return Ok(unsafe { self.get_fixed_unchecked() });
-        }
-
-        let inner = match Arc::try_unwrap(self.inner) {
-            Ok(inner) => inner,
-            Err(arc) => return Err(OwnershipError::SharedFd(Arc::strong_count(&arc)).into()),
+        let state = match Arc::try_unwrap(self.state) {
+            Ok(state) => state,
+            Err(arc) => return Err(OpcodeError::SharedFd(Arc::strong_count(&arc)).into()),
         };
 
-        let inner = ManuallyDrop::new(inner);
+        // Ensure the destructor for `SharedUringFdState` is not called.
+        let state = ManuallyDrop::new(state);
 
-        match &*inner {
-            UringFdInner::Owned(UringFdKindInner::Fixed(slot)) => Ok(*slot),
+        match &state.kind {
+            UringFdKindInner::Fixed(slot) => Ok(*slot),
             _ => unreachable!("can't be raw or borrowed"),
         }
     }
 
-    /// Resolves the file descriptor into an `Either<Fd, Fixed>` for use with
-    /// `io_uring` opcodes. This is the preferred way to get the underlying
-    /// descriptor for an operation.
-    pub(super) unsafe fn as_either(&self) -> Either<Fd, Fixed> {
-        // **Safety**:
-        // This API leaks either a slot or a rawFd without accounting for a reference.
-        // Only for internal use and it is `pub(super)` because we don't have a better
-        // way to resolve to Fd/Fixed right now then the `resolve_fd` macro below.
-        match &*self.inner {
-            UringFdInner::Owned(kind) | UringFdInner::Borrowed(kind) => kind.as_either(),
-        }
-    }
-
     /// Unsafe API, ignores all checks and ownership rules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `OwnedUringFd` variant is Fixed.
     unsafe fn get_raw_unchecked(&self) -> RawFd {
-        match &*self.inner {
-            UringFdInner::Owned(UringFdKindInner::Raw(fd))
-            | UringFdInner::Borrowed(UringFdKindInner::Raw(fd)) => *fd,
+        match &self.state.kind {
+            UringFdKindInner::Raw(fd) => *fd,
             _ => {
                 panic!("Unexpected UringFd variant");
             }
@@ -293,85 +260,183 @@ impl UringFd {
     }
 
     /// Unsafe API, ignores all checks and ownership rules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `OwnedUringFd` variant is a RawFd.
     unsafe fn get_fixed_unchecked(&self) -> u32 {
-        match &*self.inner {
-            UringFdInner::Owned(UringFdKindInner::Fixed(slot))
-            | UringFdInner::Borrowed(UringFdKindInner::Fixed(slot)) => *slot,
+        match &self.state.kind {
+            UringFdKindInner::Fixed(slot) => *slot,
             _ => {
-                panic!("Unexpected UringFd variant.")
+                panic!("Unexpected UringFd variant");
             }
         }
     }
 }
 
-impl PartialEq for UringFd {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.inner, &other.inner)
+impl<'a> BorrowedUringFd<'a> {
+    /// Creates a new `BorrowedUringFd` from a raw file descriptor.
+    pub fn new_raw(fd: RawFd) -> Self {
+        Self {
+            kind: UringFdKindInner::Raw(fd),
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Creates a new `BorrowedUringFd` from a fixed slot index.
+    pub fn new_fixed(slot: u32) -> Self {
+        Self {
+            kind: UringFdKindInner::Fixed(slot),
+            _lifetime: PhantomData,
+        }
+    }
+
+    pub fn kind(&self) -> UringFdKind {
+        self.kind.into()
+    }
+
+    pub fn is_raw(&self) -> bool {
+        matches!(self.kind, UringFdKindInner::Raw(_))
+    }
+
+    pub fn is_fixed(&self) -> bool {
+        matches!(self.kind, UringFdKindInner::Fixed(_))
+    }
+
+    /// Provides temporary access to the underlying raw file descriptor.
+    ///
+    /// This method allows you to run an operation on the raw file descriptor
+    /// without taking ownership. It will return an error if the `BorrowedUringFd`
+    /// is not the `Raw` variant.
+    ///
+    /// The file descriptor is only valid for the duration of the closure.
+    pub fn with_raw<F, R>(&self, f: F) -> Result<R, OpcodeError>
+    where
+        F: FnOnce(RawFd) -> R,
+    {
+        match &self.kind {
+            UringFdKindInner::Raw(fd) => Ok(f(*fd)),
+            _ => Err(OpcodeError::IncorrectFdVariant(self.kind())),
+        }
+    }
+
+    /// Provides temporary access to the underlying fixed slot index.
+    ///
+    /// This method allows you to run an operation on the fixed slot index
+    /// without taking ownership. It will return an error if the `BorrowedUringFd`
+    /// is not the `Fixed` variant.
+    ///
+    /// The slot index is only valid for the duration of the closure.
+    pub fn with_fixed<F, R>(&self, f: F) -> Result<R, OpcodeError>
+    where
+        F: FnOnce(u32) -> R,
+    {
+        match &self.kind {
+            UringFdKindInner::Fixed(slot) => Ok(f(*slot)),
+            _ => Err(OpcodeError::IncorrectFdVariant(self.kind())),
+        }
+    }
+
+    /// Unsafe API, ignores all checks and ownership rules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `OwnedUringFd` variant is Fixed.
+    unsafe fn get_raw_unchecked(&self) -> RawFd {
+        match &self.kind {
+            UringFdKindInner::Raw(fd) => *fd,
+            _ => {
+                panic!("Unexpected UringFd variant");
+            }
+        }
+    }
+
+    /// Unsafe API, ignores all checks and ownership rules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the `OwnedUringFd` variant is a RawFd.
+    unsafe fn get_fixed_unchecked(&self) -> u32 {
+        match &self.kind {
+            UringFdKindInner::Fixed(slot) => *slot,
+            _ => {
+                panic!("Unexpected UringFd variant");
+            }
+        }
     }
 }
 
-// Safety: we use `as_either()` API and leak a file descriptor because we need
+impl PartialEq for OwnedUringFd {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+}
+
+impl<'a> PartialEq for BorrowedUringFd<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        &self.kind == &other.kind
+    }
+}
+
+/// Trait for integration with the `io_uring` crate to easily create Entry from
+/// Owned or Borrowed uring fd. This API is *unsafe* as you have the possibility
+/// of leaking resources.
+//
+// TODO: this is really garbage, bothers me to no end but can't think of a better
+// way to be able to integrate with `io_uring` Entry builder methods...
+pub trait AsRawOrDirect {
+    unsafe fn as_raw_or_direct(&self) -> Either<Fd, Fixed>;
+}
+
+impl AsRawOrDirect for OwnedUringFd {
+    unsafe fn as_raw_or_direct(&self) -> Either<Fd, Fixed> {
+        self.state.kind.as_raw_or_direct()
+    }
+}
+
+impl<'a> AsRawOrDirect for BorrowedUringFd<'a> {
+    unsafe fn as_raw_or_direct(&self) -> Either<Fd, Fixed> {
+        self.kind.as_raw_or_direct()
+    }
+}
+
+// Safety: we use `as_raw_or_direct()` API and leak a file descriptor because we need
 // to unpack Entries in this module to create `io_uring` operations.
 macro_rules! resolve_fd {
     ($uring_fd:expr, |$fd_ident:ident| $body:expr) => {
-        match unsafe { $uring_fd.as_either() } {
-            either::Either::Left($fd_ident) => $body,
-            either::Either::Right($fd_ident) => $body,
+        unsafe {
+            match $uring_fd.as_raw_or_direct() {
+                either::Either::Left($fd_ident) => $body,
+                either::Either::Right($fd_ident) => $body,
+            }
         }
     };
 }
 
-impl From<Fd> for UringFd {
+impl From<Fd> for OwnedUringFd {
     fn from(fd: Fd) -> Self {
-        UringFd::new_raw_owned(fd.0)
+        OwnedUringFd::new_raw(fd.0)
     }
 }
 
-impl From<Fixed> for UringFd {
+impl From<Fixed> for OwnedUringFd {
     fn from(fd: Fixed) -> Self {
-        UringFd::new_fixed_owned(fd.0)
-    }
-}
-
-impl TryFrom<&UringFd> for Fixed {
-    type Error = OpcodeError;
-
-    fn try_from(value: &UringFd) -> Result<Self, Self::Error> {
-        match &*value.inner {
-            UringFdInner::Owned(UringFdKindInner::Fixed(f))
-            | UringFdInner::Borrowed(UringFdKindInner::Fixed(f)) => Ok(Fixed(*f)),
-            _ => Err(OpcodeError::IncorrectFdVariant(value.kind())),
-        }
-    }
-}
-
-impl TryFrom<&UringFd> for Fd {
-    type Error = OpcodeError;
-
-    fn try_from(value: &UringFd) -> Result<Self, Self::Error> {
-        match &*value.inner {
-            UringFdInner::Owned(UringFdKindInner::Raw(f))
-            | UringFdInner::Borrowed(UringFdKindInner::Raw(f)) => Ok(Fd(*f)),
-            _ => Err(OpcodeError::IncorrectFdVariant(value.kind())),
-        }
+        OwnedUringFd::new_fixed(fd.0)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Add;
     use std::{net::TcpListener, os::fd::AsRawFd};
 
     use super::*;
     use crate as ringolo;
     use crate::{
-        future::lib::{Op, single::Socket},
         runtime::{Builder, TaskOpts},
         test_utils::*,
         utils::scheduler::{Call, Method},
     };
     use anyhow::{Context, Result};
-    use nix::sys::socket::{AddressFamily, SockProtocol, SockType};
     use rstest::rstest;
 
     #[ringolo::test]
@@ -381,12 +446,12 @@ mod tests {
                 .await
                 .context("failed to create sockfd")?;
 
-            assert!(sockfd.is_owned() && sockfd.is_fixed());
+            assert!(sockfd.is_fixed());
             assert_eq!(sockfd.strong_count(), 1);
 
             // io_uring integration
             assert!(matches!(
-                unsafe { sockfd.as_either() },
+                unsafe { sockfd.as_raw_or_direct() },
                 either::Either::Right(Fixed(_))
             ));
             assert!(matches!(sockfd.kind(), UringFdKind::Fixed));
@@ -394,8 +459,7 @@ mod tests {
             // Clone a few times
             let sockfd1 = sockfd.clone();
             let sockfd2 = sockfd.clone();
-            assert!(sockfd1.is_owned() && sockfd1.is_fixed());
-            assert!(sockfd2.is_owned() && sockfd2.is_fixed());
+            assert!(sockfd1.is_fixed() && sockfd2.is_fixed());
             assert_eq!(sockfd.strong_count(), 3);
 
             // Drop 2 - no async cleanup
@@ -420,13 +484,12 @@ mod tests {
                 TcpListener::bind("127.0.0.1:0").context("could not create tcplistener")?;
             let listener_fd = listener.as_raw_fd();
 
-            let fd = UringFd::new_raw_borrowed(listener_fd);
-            assert!(fd.is_borrowed() && fd.is_raw());
-            assert_eq!(fd.strong_count(), 1);
+            let fd = BorrowedUringFd::new_raw(listener_fd);
+            assert!(fd.is_raw());
 
             // io_uring integration
             assert!(matches!(
-                unsafe { fd.as_either() },
+                unsafe { fd.as_raw_or_direct() },
                 either::Either::Left(Fd(_))
             ));
             assert!(matches!(fd.kind(), UringFdKind::Raw));
@@ -434,9 +497,7 @@ mod tests {
             // Clone a few times
             let fd1 = fd.clone();
             let fd2 = fd.clone();
-            assert!(fd1.is_borrowed() && fd1.is_raw());
-            assert!(fd2.is_borrowed() && fd2.is_raw());
-            assert_eq!(fd.strong_count(), 3);
+            assert!(fd1.is_raw() && fd2.is_raw());
         } // last ref dropped - does NOT trigger async close
 
         crate::with_scheduler!(|s| {
@@ -483,101 +544,49 @@ mod tests {
         Ok(())
     }
 
-    /// Cover all ownership transfer scenarios.
-    #[derive(Debug, Clone, Copy)]
-    enum Ownership {
-        OwnedUnique,
-        OwnedShared,
-        Borrowed,
-    }
-
-    // This test covers the ownership transfer logic of `into_raw` and `into_fixed`.
     #[rstest]
     // == Success Cases ==
-    #[case::owned_unique_legacy(KernelFdMode::Legacy, Ownership::OwnedUnique, true)]
-    #[case::owned_unique_fixed(KernelFdMode::DirectAuto, Ownership::OwnedUnique, true)]
+    #[case::owned_unique_legacy(KernelFdMode::Legacy, 0, Ok(()))]
+    #[case::owned_unique_fixed(KernelFdMode::DirectAuto, 0, Ok(()))]
     // == Failure Cases ==
-    #[case::owned_shared_legacy(KernelFdMode::Legacy, Ownership::OwnedShared, false)]
-    #[case::owned_shared_fixed(KernelFdMode::DirectAuto, Ownership::OwnedShared, false)]
-    #[case::borrowed_legacy(KernelFdMode::Legacy, Ownership::Borrowed, true)]
-    #[case::borrowed_fixed(KernelFdMode::DirectAuto, Ownership::Borrowed, true)]
+    #[case::owned_shared_legacy(KernelFdMode::Legacy, 1, Err(OpcodeError::SharedFd(2)))]
+    #[case::owned_shared_fixed(KernelFdMode::DirectAuto, 4, Err(OpcodeError::SharedFd(5)))]
     #[ringolo::test]
-    async fn test_uringfd_ownership_transfer(
+    async fn test_uringfd_leak_ownership(
         #[case] mode: KernelFdMode,
-        #[case] ownership: Ownership,
-        #[case] should_succeed: bool,
+        #[case] n_clones: usize,
+        #[case] expected: Result<(), OpcodeError>,
     ) -> Result<()> {
         {
-            let (sockfd, _clone, _listener) = match ownership {
-                Ownership::OwnedUnique => (tcp_socket4(mode).await?, None, None),
-                Ownership::OwnedShared => {
-                    let sock = tcp_socket4(mode).await?;
-                    let sock_clone = sock.clone();
-                    (sock, Some(sock_clone), None)
-                }
-                Ownership::Borrowed => {
-                    // We need a real FD to borrow from.
-                    let listener = TcpListener::bind("127.0.0.1:0")?;
-                    let raw_fd = listener.as_raw_fd();
-                    let sock = match mode {
-                        KernelFdMode::Legacy => UringFd::new_raw_borrowed(raw_fd),
-                        // This is incorrect, but for borrowing case it does not really
-                        // matter as we dont own this FD anyways.
-                        _ => UringFd::new_fixed_borrowed(raw_fd as u32),
-                    };
-                    (sock, None, Some(listener))
-                }
+            let (sockfd, _clones) = {
+                let sockfd = tcp_socket4(mode).await.context("failed to create socket")?;
+                let clones = std::iter::repeat(sockfd.clone())
+                    .take(n_clones)
+                    .collect::<Vec<_>>();
+
+                (sockfd, clones)
             };
 
             // Perform the ownership transfer and assert the expected outcome
-            let result = match sockfd.is_raw() {
-                true => unsafe { sockfd.into_raw() }.map(|_| ()),
-                false => unsafe { sockfd.into_fixed() }.map(|_| ()),
+            let result = match sockfd.kind() {
+                UringFdKind::Raw => unsafe { sockfd.leak_raw() }.map(|_| ()),
+                UringFdKind::Fixed => unsafe { sockfd.leak_fixed() }.map(|_| ()),
             };
 
-            if should_succeed {
-                assert!(result.is_ok(), "Expected ownership transfer to succeed");
-            } else {
-                assert!(result.is_err(), "Expected ownership transfer to fail");
-                // Verify the error type for shared/borrowed failures
-                match ownership {
-                    Ownership::OwnedShared => {
-                        assert!(matches!(
-                            result.unwrap_err(),
-                            OpcodeError::Ownership(OwnershipError::SharedFd(_))
-                        ));
-                    }
-                    Ownership::Borrowed => {
-                        assert!(matches!(
-                            result.unwrap_err(),
-                            OpcodeError::Ownership(OwnershipError::BorrowedFd)
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        } // All uring fds are dropped if they are owned
+            assert_eq!(result, expected);
+        }
 
-        // Check if the drop logic was correctly suppressed or triggered.
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            if should_succeed {
-                // If transfer succeeded, the UringFd was consumed without dropping,
-                // so no cleanup task should be spawned.
+        // If we successfully leaked the UringFd, expected async cleanup to have spawned.
+        if expected.is_ok() {
+            crate::with_scheduler!(|s| {
+                let spawn_calls = s.tracker.get_calls(&Method::Spawn);
                 assert_eq!(
                     spawn_calls.len(),
                     0,
                     "No cleanup task should be spawned on successful ownership transfer"
                 );
-            } else if matches!(ownership, Ownership::OwnedUnique | Ownership::OwnedShared) {
-                // If transfer failed on a shared FD, one FD was consumed by the failed `into_*` call,
-                // and the other (the clone) is dropped, triggering one cleanup.
-                assert_eq!(spawn_calls.len(), 1);
-            } else {
-                // For borrowed FDs or other failure modes, no cleanup is ever spawned.
-                assert_eq!(spawn_calls.len(), 0);
-            }
-        });
+            });
+        }
 
         Ok(())
     }

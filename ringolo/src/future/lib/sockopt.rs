@@ -1,10 +1,13 @@
 #![allow(dead_code)]
 
-use crate::future::lib::{OpcodeError, UringFd};
+//! Copied from `nix` crate and adapted for `io_uring` and async world.
+//! Omitted many of the platform dependent options and focused on Linux.
+
+use crate::future::lib::{AsRawOrDirect, OpcodeError};
 use io_uring::squeue::Entry;
 
 pub trait SetSockOptIf {
-    fn create_entry(&self, fd: &UringFd) -> Result<Entry, OpcodeError>;
+    fn create_entry(&self, fd: &impl AsRawOrDirect) -> Result<Entry, OpcodeError>;
 }
 
 /// Helper trait that describes what is expected from a `SetSockOptIf` setter.
@@ -147,7 +150,7 @@ macro_rules! setsockopt_impl {
         impl $crate::future::lib::sockopt::SetSockOptIf for $name {
             fn create_entry(
                 &self,
-                fd: &$crate::future::lib::fd::UringFd,
+                fd: &impl $crate::future::lib::fd::AsRawOrDirect,
             ) -> Result<io_uring::squeue::Entry, $crate::future::lib::OpcodeError> {
                 let entry = resolve_fd!(fd, |fd| {
                     io_uring::opcode::SetSockOpt::new(
@@ -325,12 +328,21 @@ mod tests {
     use std::os::fd::BorrowedFd;
 
     use super::*;
-    use crate::future::lib::{Op, SetSockOpt};
+    use crate::future::lib::{Op, OwnedUringFd, SetSockOpt};
     use crate::test_utils::*;
     use crate::{self as ringolo, future::lib::KernelFdMode};
     use anyhow::{Context, Result};
     use nix::sys::socket as nix;
     use rstest::rstest;
+
+    fn getsockopt<O: nix::GetSockOpt>(fd: &OwnedUringFd, opt: O) -> O::Val {
+        fd.with_raw(|fd| {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            nix::getsockopt(&borrowed, opt)
+        })
+        .expect("failed to raw fd")
+        .expect("failed to get sockopt")
+    }
 
     #[rstest]
     #[case::reuse_addr(ReuseAddr::new(true), nix::sockopt::ReuseAddr)]
@@ -353,26 +365,14 @@ mod tests {
             .await
             .context("failed to create sockfd")?;
 
-        let before = sockfd
-            .with_raw_fd(|fd| {
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                nix::getsockopt(&borrowed, nix_opt)
-            })
-            .context("failed to getsockopt")??;
-
+        let before = getsockopt(&sockfd, nix_opt);
         assert_eq!(before, false);
 
         Op::new(SetSockOpt::new(sockfd.clone(), ringolo_opt))
             .await
             .context("failed to set opt")?;
 
-        let after = sockfd
-            .with_raw_fd(|fd| {
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                nix::getsockopt(&borrowed, nix_opt)
-            })
-            .context("failed to getsockopt")??;
-
+        let after = getsockopt(&sockfd, nix_opt);
         assert_eq!(after, true);
 
         Ok(())
@@ -390,13 +390,7 @@ mod tests {
             .await
             .context("failed to create sockfd")?;
 
-        let before = sockfd
-            .with_raw_fd(|fd| {
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                nix::getsockopt(&borrowed, nix_opt)
-            })
-            .context("failed to getsockopt")??;
-
+        let before = getsockopt(&sockfd, nix_opt);
         if recv_buf {
             Op::new(SetSockOpt::new(sockfd.clone(), RcvBuf::new(before * 2))).await
         } else {
@@ -404,14 +398,8 @@ mod tests {
         }
         .context("failed to setopt")?;
 
-        let after = sockfd
-            .with_raw_fd(|fd| {
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                nix::getsockopt(&borrowed, nix_opt)
-            })
-            .context("failed to getsockopt")??;
-
         // Kernel only uses the value as a *hint*
+        let after = getsockopt(&sockfd, nix_opt);
         assert!(after > before);
 
         Ok(())
@@ -423,13 +411,7 @@ mod tests {
             .await
             .context("failed to create sockfd")?;
 
-        let before = sockfd
-            .with_raw_fd(|fd| {
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                nix::getsockopt(&borrowed, nix::sockopt::Linger)
-            })
-            .context("failed to getsockopt")??;
-
+        let before = getsockopt(&sockfd, nix::sockopt::Linger);
         assert_eq!(
             before,
             libc::linger {
@@ -448,13 +430,7 @@ mod tests {
         .await
         .context("failed to set opt")?;
 
-        let after = sockfd
-            .with_raw_fd(|fd| {
-                let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                nix::getsockopt(&borrowed, nix::sockopt::Linger)
-            })
-            .context("failed to getsockopt")??;
-
+        let after = getsockopt(&sockfd, nix::sockopt::Linger);
         assert_eq!(
             after,
             libc::linger {

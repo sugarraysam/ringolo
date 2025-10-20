@@ -1,4 +1,6 @@
-use crate::future::lib::{KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, UringFd};
+use crate::future::lib::{
+    AsRawOrDirect, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, OwnedUringFd,
+};
 use crate::sqe::IoError;
 use anyhow::Result;
 use anyhow::anyhow;
@@ -9,17 +11,17 @@ use std::pin::Pin;
 use std::time::Duration;
 
 #[derive(Debug)]
-pub struct AcceptMultishot {
-    sockfd: UringFd,
+pub struct AcceptMultishot<T: AsRawOrDirect> {
+    sockfd: T,
     mode: KernelFdMode,
     flags: SockFlag,
 }
 
-impl AcceptMultishot {
+impl<T: AsRawOrDirect> AcceptMultishot<T> {
     /// The `allocate_file_index` flag maps to the `IORING_FILE_INDEX_ALLOC` from the docs.
     /// The kernel will dynamically choose a direct descriptor index if this option is true.
     /// You need to have registered direct descriptors prior for this to work.
-    pub fn try_new(sockfd: UringFd, mode: KernelFdMode, flags: Option<SockFlag>) -> Result<Self> {
+    pub fn try_new(sockfd: T, mode: KernelFdMode, flags: Option<SockFlag>) -> Result<Self> {
         if matches!(mode, KernelFdMode::Direct(_)) {
             Err(anyhow!("AcceptMultishot does not support fixed slots"))
         } else {
@@ -32,8 +34,8 @@ impl AcceptMultishot {
     }
 }
 
-impl MultishotPayload for AcceptMultishot {
-    type Item = UringFd;
+impl<T: AsRawOrDirect> MultishotPayload for AcceptMultishot<T> {
+    type Item = OwnedUringFd;
 
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError> {
         let mut entry = resolve_fd!(self.sockfd, |fd| io_uring::opcode::AcceptMulti::new(fd));
@@ -53,7 +55,7 @@ impl MultishotPayload for AcceptMultishot {
         result: Result<i32, IoError>,
     ) -> Result<Self::Item, IoError> {
         let fd = result?;
-        Ok(UringFd::from_result_into_owned(fd, self.mode))
+        Ok(OwnedUringFd::from_result(fd, self.mode))
     }
 }
 
@@ -122,7 +124,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::future::lib::fd::UringFdKind;
+    use crate::future::lib::{BorrowedUringFd, UringFdKind};
     use crate::utils::scheduler::Method;
     use crate::{self as ringolo, future::lib::Multishot};
     use anyhow::{Context, Result};
@@ -158,7 +160,7 @@ mod tests {
 
         {
             let mut stream = Multishot::new(AcceptMultishot::try_new(
-                UringFd::new_raw_borrowed(listener.as_raw_fd()),
+                BorrowedUringFd::new_raw(listener.as_raw_fd()),
                 KernelFdMode::Legacy,
                 None,
             )?)
@@ -173,7 +175,7 @@ mod tests {
                     UringFdKind::Raw => unsafe {
                         TcpStream::from_raw_fd(
                             // We pass ownership of the Fd to TcpStream to avoid double free.
-                            new_sockfd.into_raw().context("cant pass ownership")?,
+                            new_sockfd.leak_raw().context("cant leak raw fd")?,
                         )
                     },
                     UringFdKind::Fixed => panic!("should not be fixed"),

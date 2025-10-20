@@ -38,11 +38,11 @@ use std::task::{Context, Poll, ready};
 pub(crate) mod builder;
 
 pub(crate) mod errors;
-pub(crate) use errors::{OpcodeError, OwnershipError};
+pub(crate) use errors::OpcodeError;
 
 #[macro_use]
 pub mod fd;
-pub use fd::{KernelFdMode, UringFd};
+pub use fd::{AsRawOrDirect, BorrowedUringFd, KernelFdMode, OwnedUringFd, UringFdKind};
 
 pub mod multishot;
 pub use multishot::TimeoutMultishot;
@@ -54,22 +54,6 @@ pub use single::*;
 
 pub mod sockopt;
 pub use sockopt::*;
-
-// TODO:
-// - single :: impl Nop
-// - start with stream + single, ponder on List because few issues, builder + try_build
-//   is a bit weird since we insert in Slab. Also, we would want to create a combination of N
-//   self-referential structs, not re-invent the wheel. This is where the crazy recursive macro
-//   could be useful, and then SqeList is only a constructor that accepts a Vec<Entry>, and try_build
-//   still used. But need to change logic, how we set head idx and all.
-// - remove old `opcodes.rs` /w macro
-
-// <--- CHAINED OPCODES --->
-// - Idea: chained stream? N single op followed by 1 stream?
-//   - Socket + SetSocketOpt + Bind + AcceptMulti
-// - Chains to create:
-//   - Socket + SetSocketOpt + Bind -> RawFd
-//   - Socket + SetSocketOpt + Connect -> RawFd
 
 /// Traits and structs for one-shot `io_uring` operation (i.e.: SqeSingle).
 pub(crate) trait OpPayload {

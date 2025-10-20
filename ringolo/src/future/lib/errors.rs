@@ -11,8 +11,8 @@ pub enum OpcodeError {
     #[error("Invalid fixed `io_uring` fd. Should be between 0 and u32::MAX - 2.")]
     InvalidFixedFd(u32),
 
-    #[error("Ownership error: {0}")]
-    Ownership(#[from] OwnershipError),
+    #[error("cannot take ownership of a shared OwnedUringFd (strong_count: {0})")]
+    SharedFd(usize),
 
     #[error("Sleeping zero is an anti-pattern, please use YieldNow instead.")]
     SleepZeroDuration,
@@ -39,17 +39,10 @@ impl PartialEq for OpcodeError {
         match (self, other) {
             (Self::IncorrectFdVariant(a), Self::IncorrectFdVariant(b)) => a == b,
             (Self::InvalidFixedFd(a), Self::InvalidFixedFd(b)) => a == b,
+            (Self::SharedFd(a), Self::SharedFd(b)) => a == b,
+            (Self::SleepZeroDuration, Self::SleepZeroDuration) => true,
             (Self::Io(a), Self::Io(b)) => a.kind() == b.kind(),
             _ => false,
         }
     }
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum OwnershipError {
-    #[error("cannot take ownership of a shared UringFd (strong_count: {0})")]
-    SharedFd(usize),
-
-    #[error("cannot take ownership of a borrowed UringFd")]
-    BorrowedFd,
 }
