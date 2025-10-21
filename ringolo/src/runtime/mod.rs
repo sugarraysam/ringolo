@@ -135,8 +135,7 @@ bitflags! {
 
 /// Boundary value to prevent stack overflow caused by a large-sized
 /// Future being placed in the stack.
-pub(crate) const BOX_ROOT_FUTURE_THRESHOLD: usize =
-    if cfg!(debug_assertions) { 2048 } else { 16384 };
+pub(crate) const BOX_ROOT_FUTURE_THRESHOLD: usize = 16384;
 
 /// We `block_on` on a special future that we refer to as the `root_future`. It
 /// is guaranteed to be polled on the current thread, and is central in deciding

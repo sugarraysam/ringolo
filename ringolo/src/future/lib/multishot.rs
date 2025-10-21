@@ -18,19 +18,24 @@ pub struct AcceptMultishot<T: AsRawOrDirect> {
 }
 
 impl<T: AsRawOrDirect> AcceptMultishot<T> {
-    /// The `allocate_file_index` flag maps to the `IORING_FILE_INDEX_ALLOC` from the docs.
-    /// The kernel will dynamically choose a direct descriptor index if this option is true.
-    /// You need to have registered direct descriptors prior for this to work.
     pub fn try_new(sockfd: T, mode: KernelFdMode, flags: Option<SockFlag>) -> Result<Self> {
-        if matches!(mode, KernelFdMode::Direct(_)) {
-            Err(anyhow!("AcceptMultishot does not support fixed slots"))
-        } else {
-            Ok(Self {
-                sockfd,
-                mode,
-                flags: SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
-            })
-        }
+        let flags = match mode {
+            KernelFdMode::Direct(_) => {
+                return Err(anyhow!(
+                    "AcceptMultishot only supports dynamically allocated fixed descriptors."
+                ));
+            }
+            KernelFdMode::Legacy => SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
+            // The ring itself is CLOEXEC, no need to set for direct descriptor. In fact it
+            // triggers -EINVAL (22) invalid argument if you do.
+            KernelFdMode::DirectAuto => flags.unwrap_or(SockFlag::empty()),
+        };
+
+        Ok(Self {
+            sockfd,
+            mode,
+            flags,
+        })
     }
 }
 

@@ -15,7 +15,7 @@ pub(crate) use errors::IoError;
 
 pub(crate) mod list;
 #[allow(unused)]
-pub(crate) use list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
+pub(crate) use list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListBuilder, SqeListKind};
 
 pub(crate) mod raw;
 pub(crate) use self::raw::RawSqe;

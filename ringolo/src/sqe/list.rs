@@ -2,14 +2,14 @@ use crate::context::slab::SlabReservedBatch;
 use crate::context::{with_slab_and_ring_mut, with_slab_mut};
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
-use crate::sqe::{increment_pending_io, Completable, CompletionHandler, RawSqe, Sqe, Submittable};
+use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
 use anyhow::anyhow;
 use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
 use std::io::{self, Error};
 use std::iter;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 
 // Batch and Chain APIs resolve to this type
@@ -21,7 +21,7 @@ pub struct SqeList {
 
 pub(crate) enum SqeListState {
     Unsubmitted {
-        builder: SqeListBuilder,
+        builder: SqeListBuilderInner,
     },
     Submitted {
         indices: SmallVec<[usize; SPILL_TO_HEAP_THRESHOLD]>,
@@ -45,7 +45,7 @@ pub enum SqeListKind {
 }
 
 impl SqeList {
-    fn new(builder: SqeListBuilder) -> Self {
+    fn new(builder: SqeListBuilderInner) -> Self {
         Self {
             state: SqeListState::Unsubmitted { builder },
         }
@@ -161,12 +161,20 @@ impl From<SqeList> for Sqe<SqeList> {
     }
 }
 
+// Trait so we can use either SqeBatchBuilder or SqeChainBuilder in future lib.
+pub trait SqeListBuilder {
+    fn add_entry(self, entry: Entry, flags: Option<Flags>) -> Self;
+
+    fn build(self) -> SqeList;
+}
+
 // Contract on SqeBatch is:
 // - all SQEs submitted in `io_uring` as part of the same `io_uring_enter` syscall
 // - SQEs can complete in any order BUT result return will respect order of insertion
 // - will only wake up Future when all SQEs have completed
+#[derive(Debug)]
 pub struct SqeBatchBuilder {
-    inner: SqeListBuilder,
+    inner: SqeListBuilderInner,
 }
 
 impl Default for SqeBatchBuilder {
@@ -178,16 +186,18 @@ impl Default for SqeBatchBuilder {
 impl SqeBatchBuilder {
     pub fn new() -> Self {
         Self {
-            inner: SqeListBuilder::new(SqeListKind::Batch),
+            inner: SqeListBuilderInner::new(SqeListKind::Batch),
         }
     }
+}
 
-    pub fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
+impl SqeListBuilder for SqeBatchBuilder {
+    fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
         self.inner = self.inner.add_entry(entry, flags);
         self
     }
 
-    pub fn build(self) -> SqeList {
+    fn build(self) -> SqeList {
         SqeList::new(self.inner)
     }
 }
@@ -199,9 +209,10 @@ impl SqeBatchBuilder {
 // - The tail of the chain is denoted by the first SQE that does not have this flag set.
 // - If one of the SQE fails, all of the remaining SQEs will complete with an error.
 // - The returned results respect the order of insertion in the builder.
-// - We only wake up the Future after all SQEs have completed
+// - We only wake up the Future after all SQEs have complete
+#[derive(Debug)]
 pub struct SqeChainBuilder {
-    inner: SqeListBuilder,
+    inner: SqeListBuilderInner,
 }
 
 impl Default for SqeChainBuilder {
@@ -213,27 +224,34 @@ impl Default for SqeChainBuilder {
 impl SqeChainBuilder {
     pub fn new() -> Self {
         Self {
-            inner: SqeListBuilder::new(SqeListKind::Chain),
+            inner: SqeListBuilderInner::new(SqeListKind::Chain),
         }
     }
+}
 
-    pub fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
+impl SqeListBuilder for SqeChainBuilder {
+    fn add_entry(mut self, entry: Entry, flags: Option<Flags>) -> Self {
         self.inner = self.inner.add_entry(entry, flags);
         self
     }
 
-    pub fn build(self) -> SqeList {
+    fn build(self) -> SqeList {
         SqeList::new(self.inner.into_chain())
     }
 }
 
+// This builder has to be private for a few reasons:
+// - try_build is *repeatable* and it is safe to call it more than once, enabling
+//   retries when submitting entries in SQ ring
+// - `try_build` interacts with thread-local RawSqe which has to happen when a
+//   task is being polled.
 #[derive(Debug, Clone)]
-pub(crate) struct SqeListBuilder {
+pub(super) struct SqeListBuilderInner {
     list: SmallVec<[Entry; SPILL_TO_HEAP_THRESHOLD]>,
     kind: SqeListKind,
 }
 
-impl SqeListBuilder {
+impl SqeListBuilderInner {
     fn new(kind: SqeListKind) -> Self {
         Self {
             list: SmallVec::with_capacity(SPILL_TO_HEAP_THRESHOLD),

@@ -1,4 +1,4 @@
-use crate::sqe::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListKind};
+use crate::sqe::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListBuilder, SqeListKind};
 use anyhow::Result;
 use io_uring::opcode::{Fsync, Nop, OpenAt, Read, Write};
 use io_uring::squeue::Entry;

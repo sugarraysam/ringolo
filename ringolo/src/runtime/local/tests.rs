@@ -1,6 +1,6 @@
 use super::*;
 use crate as ringolo;
-use crate::future::lib::builder::NopBuilder;
+use crate::future::lib::{Nop, Op};
 use crate::runtime::waker::Wake;
 use crate::runtime::{Builder, Schedule, YieldReason};
 use crate::sqe::{IoError, Sqe, SqeCollection};
@@ -17,11 +17,7 @@ assert_impl_all!(Handle: Send, Sync, Schedule);
 fn test_local_scheduler_single_nop() -> Result<()> {
     let runtime = Builder::new_local().try_build()?;
     runtime.block_on(async {
-        let fut = NopBuilder::new().build();
-        let res = fut.await;
-
-        assert!(res.is_ok());
-        assert_eq!(res.unwrap(), 0);
+        assert!(matches!(Op::new(Nop).await, Ok(_)));
         Ok(())
     })
 }
@@ -138,12 +134,9 @@ fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
         batch.await
     });
 
-    let res = runtime.block_on(async move {
-        let sqe = NopBuilder::new().build();
-        sqe.await
-    });
+    let res = runtime.block_on(async move { Op::new(Nop).await });
 
-    assert!(matches!(res, Ok(0)));
+    assert!(matches!(res, Ok(_)));
     assert!(handle.is_finished());
 
     for res in handle.get_result()? {

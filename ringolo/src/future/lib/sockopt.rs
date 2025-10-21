@@ -10,91 +10,52 @@ pub trait SetSockOptIf {
     fn create_entry(&self, fd: &impl AsRawOrDirect) -> Result<Entry, OpcodeError>;
 }
 
-/// Helper trait that describes what is expected from a `SetSockOptIf` setter.
-#[doc(hidden)]
-trait Set<T> {
-    /// Initialize the setter with a given value.
-    fn new(val: T) -> Self;
-
-    /// Returns a pointer to the stored value. This pointer will be passed to the system's
-    /// `setsockopt` call (`man 3p setsockopt`, argument `option_value`).
-    fn ffi_ptr(&self) -> *const libc::c_void;
-
-    /// Returns length of the stored value. This pointer will be passed to the system's
-    /// `setsockopt` call (`man 3p setsockopt`, argument `option_len`).
-    fn ffi_len(&self) -> libc::socklen_t;
-}
-
-/// Setter for a boolean value.
-// Hide the docs, because it's an implementation detail of `sockopt_impl!`
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SetBool {
-    val: libc::c_int,
-}
-
-impl Set<bool> for SetBool {
-    fn new(val: bool) -> SetBool {
-        SetBool {
-            val: i32::from(val),
-        }
-    }
-
-    fn ffi_ptr(&self) -> *const libc::c_void {
-        std::ptr::from_ref(&self.val).cast()
-    }
-
-    fn ffi_len(&self) -> libc::socklen_t {
-        std::mem::size_of_val(&self.val) as libc::socklen_t
-    }
-}
-
-/// Setter for an `usize` value.
-// Hide the docs, because it's an implementation detail of `sockopt_impl!`
-#[doc(hidden)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SetUsize {
-    val: libc::c_int,
-}
-
-impl Set<usize> for SetUsize {
-    fn new(val: usize) -> SetUsize {
-        SetUsize {
-            val: val as libc::c_int,
-        }
-    }
-
-    fn ffi_ptr(&self) -> *const libc::c_void {
-        std::ptr::from_ref(&self.val).cast()
-    }
-
-    fn ffi_len(&self) -> libc::socklen_t {
-        std::mem::size_of_val(&self.val) as libc::socklen_t
-    }
-}
-
-/// Setter for an arbitrary `struct`.
-// Hide the docs, because it's an implementation detail of `sockopt_impl!`
-#[doc(hidden)]
+/// Static dispatch enum for all concrete `SetSockOptIf` implementors.
+/// This allows us to store any socket option in a concrete struct like OpList,
+/// to create heterogenous chains and batches with static dispatch and no heap
+/// allocations.
 #[derive(Debug, Copy, Clone)]
-pub struct SetStruct<T> {
-    ptr: T,
+pub enum AnySockOpt {
+    ReuseAddr(ReuseAddr),
+    ReusePort(ReusePort),
+    TcpNoDelay(TcpNoDelay),
+    Linger(Linger),
+    ReceiveTimeout(ReceiveTimeout),
+    SendTimeout(SendTimeout),
+    Broadcast(Broadcast),
+    OobInline(OobInline),
+    DontRoute(DontRoute),
+    KeepAlive(KeepAlive),
+    RcvBuf(RcvBuf),
+    SndBuf(SndBuf),
+    ReceiveTimestamp(ReceiveTimestamp),
+    Mark(Mark),
+    TxTime(TxTime),
+    Ipv6V6Only(Ipv6V6Only),
+    AttachReusePortCbpf(AttachReusePortCbpf),
 }
 
-impl<T> Set<T> for SetStruct<T>
-where
-    T: Copy + Clone,
-{
-    fn new(ptr: T) -> SetStruct<T> {
-        SetStruct { ptr }
-    }
-
-    fn ffi_ptr(&self) -> *const libc::c_void {
-        std::ptr::from_ref(&self.ptr).cast()
-    }
-
-    fn ffi_len(&self) -> libc::socklen_t {
-        std::mem::size_of::<T>() as libc::socklen_t
+impl SetSockOptIf for AnySockOpt {
+    fn create_entry(&self, fd: &impl AsRawOrDirect) -> Result<Entry, OpcodeError> {
+        match self {
+            AnySockOpt::ReuseAddr(op) => op.create_entry(fd),
+            AnySockOpt::ReusePort(op) => op.create_entry(fd),
+            AnySockOpt::TcpNoDelay(op) => op.create_entry(fd),
+            AnySockOpt::Linger(op) => op.create_entry(fd),
+            AnySockOpt::ReceiveTimeout(op) => op.create_entry(fd),
+            AnySockOpt::SendTimeout(op) => op.create_entry(fd),
+            AnySockOpt::Broadcast(op) => op.create_entry(fd),
+            AnySockOpt::OobInline(op) => op.create_entry(fd),
+            AnySockOpt::DontRoute(op) => op.create_entry(fd),
+            AnySockOpt::KeepAlive(op) => op.create_entry(fd),
+            AnySockOpt::RcvBuf(op) => op.create_entry(fd),
+            AnySockOpt::SndBuf(op) => op.create_entry(fd),
+            AnySockOpt::ReceiveTimestamp(op) => op.create_entry(fd),
+            AnySockOpt::Mark(op) => op.create_entry(fd),
+            AnySockOpt::TxTime(op) => op.create_entry(fd),
+            AnySockOpt::Ipv6V6Only(op) => op.create_entry(fd),
+            AnySockOpt::AttachReusePortCbpf(op) => op.create_entry(fd),
+        }
     }
 }
 
@@ -134,7 +95,7 @@ macro_rules! setsockopt_impl {
 
     ($(#[$attr:meta])* $name:ident, $level:expr, $flag:path, $ty:ty, $setter:ty) => {
         $(#[$attr])*
-        #[derive(Debug)]
+        #[derive(Debug, Copy, Clone)]
         pub struct $name {
             setter: $setter,
         }
@@ -147,6 +108,7 @@ macro_rules! setsockopt_impl {
             }
         }
 
+        // Impl SetSockOptIf for Op.
         impl $crate::future::lib::sockopt::SetSockOptIf for $name {
             fn create_entry(
                 &self,
@@ -163,6 +125,13 @@ macro_rules! setsockopt_impl {
                 });
 
                 Ok(entry.build())
+            }
+        }
+
+        // Impl static dispatch enum for OpList.
+        impl From<$name> for AnySockOpt {
+            fn from(op: $name) -> Self {
+                AnySockOpt::$name(op)
             }
         }
     };
@@ -323,6 +292,94 @@ setsockopt_impl!(
     libc::sock_fprog
 );
 
+/// Helper trait that describes what is expected from a `SetSockOptIf` setter.
+#[doc(hidden)]
+trait Set<T> {
+    /// Initialize the setter with a given value.
+    fn new(val: T) -> Self;
+
+    /// Returns a pointer to the stored value. This pointer will be passed to the system's
+    /// `setsockopt` call (`man 3p setsockopt`, argument `option_value`).
+    fn ffi_ptr(&self) -> *const libc::c_void;
+
+    /// Returns length of the stored value. This pointer will be passed to the system's
+    /// `setsockopt` call (`man 3p setsockopt`, argument `option_len`).
+    fn ffi_len(&self) -> libc::socklen_t;
+}
+
+/// Setter for a boolean value.
+// Hide the docs, because it's an implementation detail of `sockopt_impl!`
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SetBool {
+    val: libc::c_int,
+}
+
+impl Set<bool> for SetBool {
+    fn new(val: bool) -> SetBool {
+        SetBool {
+            val: i32::from(val),
+        }
+    }
+
+    fn ffi_ptr(&self) -> *const libc::c_void {
+        std::ptr::from_ref(&self.val).cast()
+    }
+
+    fn ffi_len(&self) -> libc::socklen_t {
+        std::mem::size_of_val(&self.val) as libc::socklen_t
+    }
+}
+
+/// Setter for an `usize` value.
+// Hide the docs, because it's an implementation detail of `sockopt_impl!`
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetUsize {
+    val: libc::c_int,
+}
+
+impl Set<usize> for SetUsize {
+    fn new(val: usize) -> SetUsize {
+        SetUsize {
+            val: val as libc::c_int,
+        }
+    }
+
+    fn ffi_ptr(&self) -> *const libc::c_void {
+        std::ptr::from_ref(&self.val).cast()
+    }
+
+    fn ffi_len(&self) -> libc::socklen_t {
+        std::mem::size_of_val(&self.val) as libc::socklen_t
+    }
+}
+
+/// Setter for an arbitrary `struct`.
+// Hide the docs, because it's an implementation detail of `sockopt_impl!`
+#[doc(hidden)]
+#[derive(Debug, Copy, Clone)]
+pub struct SetStruct<T> {
+    ptr: T,
+}
+
+impl<T> Set<T> for SetStruct<T>
+where
+    T: Copy + Clone,
+{
+    fn new(ptr: T) -> SetStruct<T> {
+        SetStruct { ptr }
+    }
+
+    fn ffi_ptr(&self) -> *const libc::c_void {
+        std::ptr::from_ref(&self.ptr).cast()
+    }
+
+    fn ffi_len(&self) -> libc::socklen_t {
+        std::mem::size_of::<T>() as libc::socklen_t
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::BorrowedFd;
@@ -358,7 +415,7 @@ mod tests {
         #[case] nix_opt: N,
     ) -> Result<()>
     where
-        O: SetSockOptIf,
+        O: Into<AnySockOpt>,
         N: nix::GetSockOpt<Val = bool>,
     {
         let sockfd = tcp_socket4(KernelFdMode::Legacy)

@@ -35,17 +35,20 @@ use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
-pub(crate) mod builder;
-
 pub(crate) mod errors;
 pub(crate) use errors::OpcodeError;
 
 #[macro_use]
 pub mod fd;
+#[allow(unused)]
 pub use fd::{AsRawOrDirect, BorrowedUringFd, KernelFdMode, OwnedUringFd, UringFdKind};
 
+#[macro_use]
+pub mod list_macros;
+pub mod list;
+
 pub mod multishot;
-pub use multishot::TimeoutMultishot;
+pub use multishot::*;
 
 pub(super) mod parse;
 
@@ -141,8 +144,8 @@ impl<T: OpPayload> PinnedDrop for Op<T> {
         let mut this = self.project();
         let dropped = std::mem::replace(this.dropped, true);
 
-        // We must manually drop the Sqe if it was initialized. Make sure we invoke
-        // the backend destructor only once with the dropped flag.
+        // We must manually drop the Sqe<SqeSingle> if it was initialized. Make
+        // sure we invoke the backend destructor only once with the dropped flag.
         if *this.initialized && !dropped {
             // SAFETY: We know the backend was initialized and has not been dropped.
             unsafe { this.backend.assume_init_drop() };

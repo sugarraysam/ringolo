@@ -136,7 +136,7 @@ impl OwnedUringFd {
     pub fn borrow<'a>(&'a self) -> BorrowedUringFd<'a> {
         BorrowedUringFd {
             // Does not increment refcount as we are not cloning the Arc.
-            kind: self.state.kind.clone(),
+            kind: self.state.kind,
             _lifetime: PhantomData,
         }
     }
@@ -211,7 +211,7 @@ impl OwnedUringFd {
 
         let state = match Arc::try_unwrap(self.state) {
             Ok(state) => state,
-            Err(arc) => return Err(OpcodeError::SharedFd(Arc::strong_count(&arc)).into()),
+            Err(arc) => return Err(OpcodeError::SharedFd(Arc::strong_count(&arc))),
         };
 
         // Ensure the destructor for `SharedUringFdState` is not called.
@@ -233,7 +233,7 @@ impl OwnedUringFd {
 
         let state = match Arc::try_unwrap(self.state) {
             Ok(state) => state,
-            Err(arc) => return Err(OpcodeError::SharedFd(Arc::strong_count(&arc)).into()),
+            Err(arc) => return Err(OpcodeError::SharedFd(Arc::strong_count(&arc))),
         };
 
         // Ensure the destructor for `SharedUringFdState` is not called.
@@ -374,7 +374,7 @@ impl PartialEq for OwnedUringFd {
 
 impl<'a> PartialEq for BorrowedUringFd<'a> {
     fn eq(&self, other: &Self) -> bool {
-        &self.kind == &other.kind
+        self.kind == other.kind
     }
 }
 

@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::future::lib::{
-    AsRawOrDirect, KernelFdMode, OpParams, OpPayload, OpcodeError, OwnedUringFd, SetSockOptIf,
-    parse,
+    AnySockOpt, AsRawOrDirect, KernelFdMode, OpParams, OpPayload, OpcodeError, OwnedUringFd,
+    SetSockOptIf, parse,
 };
 use crate::sqe::IoError;
 use anyhow::{Context, Result};
@@ -42,9 +42,16 @@ impl<T: AsRawOrDirect> Accept<T> {
             addrlen.write(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
         }
 
+        let flags = match mode {
+            KernelFdMode::Legacy => SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
+            // The ring itself is CLOEXEC, no need to set for direct descriptor. In fact it
+            // triggers -EINVAL (22) invalid argument if you do.
+            _ => flags.unwrap_or(SockFlag::empty()),
+        };
+
         Self {
             sockfd,
-            flags: SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
+            flags,
             with_addr,
             mode,
             addr: MaybeUninit::uninit(),
@@ -73,6 +80,7 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
                 .file_index(this.mode.try_into_slot()?)
                 .flags(this.flags.bits())
         });
+        // dbg!("accept sqe: {:?}", entry);
 
         Ok(entry.build().into())
     }
@@ -140,7 +148,7 @@ impl OpPayload for AsyncCancel {
 ///
 /// === Bind ===
 ///
-// #[derive(Debug)]
+#[derive(Debug)]
 #[pin_project]
 pub struct Bind<T: AsRawOrDirect> {
     sockfd: T,
@@ -210,14 +218,8 @@ impl OpPayload for Close {
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
         let entry = match self.fd {
-            Either::Left(raw) => {
-                dbg!("Creating Close for raw fd {}", raw);
-                io_uring::opcode::Close::new(raw)
-            }
-            Either::Right(fixed) => {
-                dbg!("Creating Close for fixed fd {}", fixed);
-                io_uring::opcode::Close::new(fixed)
-            }
+            Either::Left(raw) => io_uring::opcode::Close::new(raw),
+            Either::Right(fixed) => io_uring::opcode::Close::new(fixed),
         };
 
         Ok(entry.build().into())
@@ -320,6 +322,28 @@ impl<T: AsRawOrDirect> OpPayload for Listen<T> {
 }
 
 ///
+/// === Nop ===
+///
+#[derive(Debug)]
+pub struct Nop;
+
+impl OpPayload for Nop {
+    type Output = ();
+
+    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+        Ok(io_uring::opcode::Nop::new().build().into())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let _ = result?;
+        Ok(())
+    }
+}
+
+///
 /// === Socket ===
 ///
 #[derive(Debug)]
@@ -373,23 +397,26 @@ impl OpPayload for Socket {
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct SetSockOpt<T: AsRawOrDirect, O: SetSockOptIf> {
+pub struct SetSockOpt<T: AsRawOrDirect> {
     sockfd: T,
 
     /// The opt is a self-contained struct that generates stable c ptrs when
     /// we unpack it on first poll. We use it as an entry generator and it's
     /// role is to inject the appropriate arguments in our SQE.
     #[pin]
-    opt: O,
+    opt: AnySockOpt,
 }
 
-impl<T: AsRawOrDirect, O: SetSockOptIf> SetSockOpt<T, O> {
-    pub fn new(sockfd: T, opt: O) -> Self {
-        Self { sockfd, opt }
+impl<T: AsRawOrDirect> SetSockOpt<T> {
+    pub fn new<O: Into<AnySockOpt>>(sockfd: T, opt: O) -> Self {
+        Self {
+            sockfd,
+            opt: opt.into(),
+        }
     }
 }
 
-impl<T: AsRawOrDirect, O: SetSockOptIf> OpPayload for SetSockOpt<T, O> {
+impl<T: AsRawOrDirect> OpPayload for SetSockOpt<T> {
     type Output = ();
 
     fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
@@ -409,6 +436,7 @@ impl<T: AsRawOrDirect, O: SetSockOptIf> OpPayload for SetSockOpt<T, O> {
 ///
 /// === Timeout ===
 ///
+#[derive(Debug)]
 #[pin_project]
 pub struct Timeout {
     #[pin]
@@ -462,16 +490,14 @@ impl OpPayload for Timeout {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::net::IpAddr;
 
     use super::*;
     use crate::future::lib::{BorrowedUringFd, ReuseAddr};
+    use crate::test_utils::*;
     use crate::{self as ringolo, future::lib::Op, task::JoinHandle};
     use anyhow::Result;
     use rstest::rstest;
-
-    const LOCALHOST4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    const LOCALHOST6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);
 
     #[ringolo::test]
     async fn test_accept_safe_unpacking() -> Result<()> {
@@ -506,36 +532,29 @@ mod tests {
         let sock_addr = SocketAddr::new(ip_addr, port);
 
         // (1) Create listening socket + set SO_REUSEADDR
-        let socket_op = Op::new(Socket::new(
-            mode,
-            addr_family,
-            SockType::Stream,
-            SockProtocol::Tcp,
-        ));
-        let listener_fd = socket_op.await.expect("server socket creation failed");
+        let listener_fd = tcp_socket(mode, addr_family)
+            .await
+            .expect("server socket creation failed");
+        let listener_ref = listener_fd.borrow();
 
-        Op::new(SetSockOpt::new(listener_fd.clone(), ReuseAddr::new(true)))
+        Op::new(SetSockOpt::new(listener_ref, ReuseAddr::new(true)))
             .await
             .context("failed to set SO_REUSEADDR")?;
 
         // (2) Bind to address
-        let bind_op = Op::new(Bind::try_new(listener_fd.clone(), &sock_addr)?);
+        let bind_op = Op::new(Bind::try_new(listener_ref, &sock_addr)?);
         bind_op.await.context("bind failed")?;
 
         // (3) Listen
-        let listen_op = Op::new(Listen::new(listener_fd.clone(), 128));
+        let listen_op = Op::new(Listen::new(listener_ref, 128));
         listen_op.await.context("listen failed")?;
 
         // (4) Spawn Connect
         let handle: JoinHandle<Result<()>> = ringolo::spawn(async move {
-            let socket_op = Op::new(Socket::new(
-                mode,
-                addr_family,
-                SockType::Stream,
-                SockProtocol::Tcp,
-            ));
+            let sockfd = tcp_socket(mode, addr_family)
+                .await
+                .expect("client socket creation failed");
 
-            let sockfd = socket_op.await.expect("client socket creation failed");
             let connect_op = Op::new(Connect::try_new(sockfd, &sock_addr)?);
             connect_op.await.context("connect failed")?;
 
@@ -543,9 +562,11 @@ mod tests {
         });
 
         // (5) Accept
-        let op = Op::new(Accept::new(listener_fd, KernelFdMode::Legacy, true, None));
+        let op = Op::new(Accept::new(listener_ref, mode, true, None));
         let (_fd, got_addr) = op.await.context("accept failed")?;
-        assert_eq!(got_addr.context("missing address")?.ip(), sock_addr.ip());
+
+        assert!(got_addr.is_some());
+        assert_eq!(got_addr.unwrap().ip(), ip_addr);
 
         handle.await.context("client task failed")??;
 
