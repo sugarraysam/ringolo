@@ -1,4 +1,4 @@
-use crate::future::lib::{AsRawOrDirect, OpParams, OpcodeError, OwnedUringFd};
+use crate::future::lib::{AsRawOrDirect, OpcodeError, OwnedUringFd};
 use crate::future::lib::{OpPayload, single::*};
 use crate::sqe::list::{SqeBatchBuilder, SqeChainBuilder, SqeListBuilder};
 use crate::sqe::{IoError, Sqe, SqeList, SqeListKind};
@@ -65,11 +65,11 @@ macro_rules! define_any_op {
             impl<T: AsRawOrDirect> OpPayload for $OpEnum<T> {
                 type Output = $OutputEnum;
 
-                fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+                fn create_entry(self: Pin<&mut Self>) -> Result<io_uring::squeue::Entry, OpcodeError> {
                     match self.project() {
                         $(
                             // Use the generated projection name
-                            [<$OpEnum Proj>]::$Variant(op) => op.create_params(),
+                            [<$OpEnum Proj>]::$Variant(op) => op.create_entry(),
                         )*
                     }
                 }
@@ -179,8 +179,8 @@ impl<T: AsRawOrDirect + Unpin> OpList<T> {
             // lives at a stable memory location. It is safe to unpack every
             // self-referential `op` struct as long as we don't reallocate
             // `this.ops`'s Vec.
-            let entry = Pin::new(op).create_params()?;
-            Ok(b.add_entry(entry.0, None))
+            let entry = Pin::new(op).create_entry()?;
+            Ok(b.add_entry(entry, None))
         });
 
         builder.map(|b| b.build())
@@ -280,11 +280,9 @@ mod tests {
 
             // We have to loop as we will get ECONNREFUSED until Listen
             loop {
-                dbg!("trying to connect..");
-                match Op::new(Connect::try_new(sockfd_ref, &sock_addr)?).await {
+                match Op::new(Connect::new(sockfd_ref, &sock_addr)).await {
                     Ok(()) => break,
                     Err(e) => {
-                        dbg!("error: {:?}", &e);
                         if e.raw_os_error() == Some(libc::ECONNREFUSED) {
                             max_retries -= 1;
                             if max_retries == 0 {
@@ -307,19 +305,17 @@ mod tests {
         let listener_ref = listener.borrow();
 
         let results = OpList::new_chain(any_vec![
-            Nop,
             SetSockOpt::new(listener_ref, ReuseAddr::new(true)),
-            Bind::try_new(listener_ref, &sock_addr)?,
+            Bind::new(listener_ref, &sock_addr),
             Listen::new(listener_ref, 128),
             Accept::new(listener_ref, mode, true, None),
         ])
         .await
         .context("failed to await chain")?;
 
-        let (nop_res, sockopt_res, bind_res, listen_res, accept_res) =
-            any_extract_all!(results, Nop, SetSockOpt, Bind, Listen, Accept);
+        let (sockopt_res, bind_res, listen_res, accept_res) =
+            any_extract_all!(results, SetSockOpt, Bind, Listen, Accept);
 
-        let _ = nop_res.context("nop res")?;
         let _ = sockopt_res.context("setsockopt res")?;
         let _ = bind_res.context("bind res")?;
         let _ = listen_res.context("listen res")?;

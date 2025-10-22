@@ -6,7 +6,7 @@
 use crate::future::lib::{AsRawOrDirect, OpcodeError};
 use io_uring::squeue::Entry;
 
-pub trait SetSockOptIf {
+pub trait SetSockOptIf: Into<AnySockOpt> {
     fn create_entry(&self, fd: &impl AsRawOrDirect) -> Result<Entry, OpcodeError>;
 }
 

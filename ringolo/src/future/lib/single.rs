@@ -1,15 +1,15 @@
 #![allow(dead_code)]
-
 use crate::future::lib::{
-    AnySockOpt, AsRawOrDirect, KernelFdMode, OpParams, OpPayload, OpcodeError, OwnedUringFd,
-    SetSockOptIf, parse,
+    AnySockOpt, AsRawOrDirect, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, SetSockOptIf,
+    parse,
 };
 use crate::sqe::IoError;
-use anyhow::{Context, Result};
 use either::Either;
+use io_uring::squeue::Entry;
 use io_uring::types::{Fd, Fixed, TimeoutFlags, Timespec};
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
 use pin_project::pin_project;
+use std::io;
 use std::mem::MaybeUninit;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::os::fd::AsRawFd;
@@ -63,7 +63,7 @@ impl<T: AsRawOrDirect> Accept<T> {
 impl<T: AsRawOrDirect> OpPayload for Accept<T> {
     type Output = (OwnedUringFd, Option<SocketAddr>);
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
 
         let (addr_ptr, addrlen_ptr) = if *this.with_addr {
@@ -80,7 +80,6 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
                 .file_index(this.mode.try_into_slot()?)
                 .flags(this.flags.bits())
         });
-        // dbg!("accept sqe: {:?}", entry);
 
         Ok(entry.build().into())
     }
@@ -132,7 +131,7 @@ impl AsyncCancel {
 impl OpPayload for AsyncCancel {
     type Output = i32;
 
-    fn create_params(mut self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         Ok(self.entry.take().expect("only called once").into())
     }
 
@@ -159,26 +158,21 @@ pub struct Bind<T: AsRawOrDirect> {
 }
 
 impl<T: AsRawOrDirect> Bind<T> {
-    pub fn try_new(sockfd: T, addr: &impl ToSocketAddrs) -> Result<Self> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .context("could not resolve to socket address")?;
-
+    pub fn new(sockfd: T, addr: &SocketAddr) -> Self {
         let (addr, addr_len) = parse::socket_addr_to_c(&addr);
 
-        Ok(Self {
+        Self {
             sockfd,
             addr,
             addr_len,
-        })
+        }
     }
 }
 
 impl<T: AsRawOrDirect> OpPayload for Bind<T> {
     type Output = ();
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
 
         let entry = resolve_fd!(this.sockfd, |fd| {
@@ -216,7 +210,7 @@ impl Close {
 impl OpPayload for Close {
     type Output = i32;
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let entry = match self.fd {
             Either::Left(raw) => io_uring::opcode::Close::new(raw),
             Either::Right(fixed) => io_uring::opcode::Close::new(fixed),
@@ -248,26 +242,21 @@ pub struct Connect<T: AsRawOrDirect> {
 }
 
 impl<T: AsRawOrDirect> Connect<T> {
-    pub fn try_new(sockfd: T, addr: &impl ToSocketAddrs) -> Result<Self> {
-        let addr = addr
-            .to_socket_addrs()?
-            .next()
-            .context("could not resolve to socket address")?;
-
+    pub fn new(sockfd: T, addr: &SocketAddr) -> Self {
         let (addr, addr_len) = parse::socket_addr_to_c(&addr);
 
-        Ok(Self {
+        Self {
             sockfd,
             addr,
             addr_len,
-        })
+        }
     }
 }
 
 impl<T: AsRawOrDirect> OpPayload for Connect<T> {
     type Output = ();
 
-    fn create_params(mut self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.as_mut().project();
 
         let entry = resolve_fd!(this.sockfd, |fd| {
@@ -304,7 +293,7 @@ impl<T: AsRawOrDirect> Listen<T> {
 impl<T: AsRawOrDirect> OpPayload for Listen<T> {
     type Output = ();
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let entry = resolve_fd!(self.sockfd, |fd| {
             io_uring::opcode::Listen::new(fd, self.backlog)
         });
@@ -330,7 +319,7 @@ pub struct Nop;
 impl OpPayload for Nop {
     type Output = ();
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         Ok(io_uring::opcode::Nop::new().build().into())
     }
 
@@ -373,7 +362,7 @@ impl Socket {
 impl OpPayload for Socket {
     type Output = OwnedUringFd;
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         Ok(io_uring::opcode::Socket::new(
             self.addr_family as i32,
             self.sock_type as i32,
@@ -419,9 +408,9 @@ impl<T: AsRawOrDirect> SetSockOpt<T> {
 impl<T: AsRawOrDirect> OpPayload for SetSockOpt<T> {
     type Output = ();
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
-        this.opt.create_entry(this.sockfd).map(OpParams::from)
+        this.opt.create_entry(this.sockfd)
     }
 
     fn into_output(
@@ -463,7 +452,7 @@ impl Timeout {
 impl OpPayload for Timeout {
     type Output = ();
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError> {
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
 
         let timespec_addr = std::ptr::from_ref(&*this.timespec).cast();
@@ -496,7 +485,7 @@ mod tests {
     use crate::future::lib::{BorrowedUringFd, ReuseAddr};
     use crate::test_utils::*;
     use crate::{self as ringolo, future::lib::Op, task::JoinHandle};
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use rstest::rstest;
 
     #[ringolo::test]
@@ -542,7 +531,7 @@ mod tests {
             .context("failed to set SO_REUSEADDR")?;
 
         // (2) Bind to address
-        let bind_op = Op::new(Bind::try_new(listener_ref, &sock_addr)?);
+        let bind_op = Op::new(Bind::new(listener_ref, &sock_addr));
         bind_op.await.context("bind failed")?;
 
         // (3) Listen
@@ -555,7 +544,7 @@ mod tests {
                 .await
                 .expect("client socket creation failed");
 
-            let connect_op = Op::new(Connect::try_new(sockfd, &sock_addr)?);
+            let connect_op = Op::new(Connect::new(sockfd, &sock_addr));
             connect_op.await.context("connect failed")?;
 
             Ok(())

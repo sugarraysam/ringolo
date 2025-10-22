@@ -62,7 +62,7 @@ pub use sockopt::*;
 pub(crate) trait OpPayload {
     type Output;
 
-    fn create_params(self: Pin<&mut Self>) -> Result<OpParams, OpcodeError>;
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError>;
 
     // Safety: This method should only be called once, when the operation is complete.
     // It is allowed to "consume the pin" so we can return owned data without copies.
@@ -70,15 +70,6 @@ pub(crate) trait OpPayload {
         self: Pin<&mut Self>,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError>;
-}
-
-#[derive(Debug)]
-pub(crate) struct OpParams(Entry);
-
-impl From<Entry> for OpParams {
-    fn from(entry: Entry) -> Self {
-        Self(entry)
-    }
 }
 
 #[pin_project(PinnedDrop)]
@@ -123,8 +114,8 @@ impl<T: OpPayload> Future for Op<T> {
         let mut this = self.project();
 
         if !*this.initialized {
-            let params = this.data.as_mut().create_params()?;
-            let backend = Sqe::new(SqeSingle::new(params.0));
+            let entry = this.data.as_mut().create_entry()?;
+            let backend = Sqe::new(SqeSingle::new(entry));
             this.backend.write(backend);
             *this.initialized = true;
         }

@@ -2,11 +2,10 @@ use crate::future::lib::{
     AsRawOrDirect, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, OwnedUringFd,
 };
 use crate::sqe::IoError;
-use anyhow::Result;
-use anyhow::anyhow;
 use io_uring::types::{TimeoutFlags, Timespec};
 use nix::sys::socket::SockFlag;
 use pin_project::pin_project;
+use std::io;
 use std::pin::Pin;
 use std::time::Duration;
 
@@ -18,11 +17,12 @@ pub struct AcceptMultishot<T: AsRawOrDirect> {
 }
 
 impl<T: AsRawOrDirect> AcceptMultishot<T> {
-    pub fn try_new(sockfd: T, mode: KernelFdMode, flags: Option<SockFlag>) -> Result<Self> {
+    pub fn try_new(sockfd: T, mode: KernelFdMode, flags: Option<SockFlag>) -> io::Result<Self> {
         let flags = match mode {
             KernelFdMode::Direct(_) => {
-                return Err(anyhow!(
-                    "AcceptMultishot only supports dynamically allocated fixed descriptors."
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "AcceptMultishot only supports dynamically allocated fixed descriptors.",
                 ));
             }
             KernelFdMode::Legacy => SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
