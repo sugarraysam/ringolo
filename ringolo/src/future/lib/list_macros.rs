@@ -5,7 +5,7 @@
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// // Create a chained list of operations
 /// let ops = OpList::new_chain(any_vec![
 ///     Bind::try_new(listener_ref, &sock_addr)?,
@@ -30,7 +30,7 @@ macro_rules! any_vec{
 ///
 /// # Examples
 ///
-/// ```rust
+/// ```ignore
 /// let mut iter = results.into_iter();
 /// let bind_res = any_extract!(iter.next().unwrap(), Bind);
 /// let listen_res = any_extract!(iter.next().unwrap(), Listen);
@@ -66,7 +66,8 @@ macro_rules! any_extract {
 ///
 /// # Examples
 ///
-///```rust
+///```ignore
+/// use ringolo::any_extract_all;
 /// let (bind_res, listen_res) = any_extract_all!(results, Bind, Listen);
 ///```
 ///

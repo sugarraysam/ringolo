@@ -22,10 +22,8 @@ impl<'a, F: FnOnce()> ScopeGuard<'a, F> {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// // We need to bring the struct into scope to use it.
-    /// use scopeguard_example::ScopeGuard;
-    ///
     /// let mut message = String::from("unchanged");
     /// {
     ///     // The guard takes ownership of a closure.
@@ -48,9 +46,7 @@ impl<'a, F: FnOnce()> ScopeGuard<'a, F> {
     ///
     /// # Examples
     ///
-    /// ```
-    /// use scopeguard_example::ScopeGuard;
-    ///
+    /// ```ignore
     /// let mut message = String::from("unchanged");
     /// {
     ///     let mut guard = ScopeGuard::new(|| message = String::from("changed!"));

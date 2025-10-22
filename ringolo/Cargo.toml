@@ -1,16 +1,22 @@
 [package]
 name = "ringolo"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
+rust-version = "1.89"
+authors = ["Samuel Blais-Dowdy <samuel.blaisddowdy@protonmail.com>"]
+license = "Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/sugarraysam/ringolo"
+description = "An asynchronous runtime built on top of io-uring."
+categories = ["asynchronous", "network-programming"]
+keywords = ["io-uring", "io", "async", "non-blocking", "futures"]
 
 [features]
-# TODO: figure out why rust-analyzer doesnt pickup experimental override
-# Include nothing by default
 default = []
 experimental = []
 
 [lib]
-doctest = false # TODO: fix doctest and enable
+doctest = true
 
 [dependencies]
 anyhow = "~1.0.99"
@@ -19,13 +25,12 @@ crossbeam-deque = "~0.8.6"
 dashmap = "~6.1.0"
 either = "~1.15.0"
 futures = "~0.3.31"
-# io-uring = "^0.7.10"
-io-uring = { version = "0.7.10", path = "../../io-uring" }
+io-uring = "^0.7.10"
 libc = { version = "~0.2.98", default-features = false }
 nix = { version = "~0.30.1", features = ["socket"] }
 paste = "~1.0.15"
 pin-project = "~1.1.10"
-ringolo-macros = { version = "0.1.0", path = "../ringolo-macros" }
+ringolo-macros = "~0.1.0-alpha.1"
 slab = "~0.4.11"
 smallvec = "~1.15.1"
 thiserror = "~2.0.17"

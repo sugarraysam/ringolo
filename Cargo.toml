@@ -4,3 +4,8 @@ members = [
   "ringolo",
   "ringolo-macros",
 ]
+
+[patch.crates-io]
+io-uring = { path = "../io-uring" }
+ringolo = { path = "ringolo" }
+ringolo-macros = { path = "ringolo-macros" }

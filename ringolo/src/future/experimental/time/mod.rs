@@ -1,5 +1,8 @@
-mod sleep;
+pub mod sleep;
+pub use sleep::Sleep;
 
-mod tick;
+pub mod tick;
+pub use tick::Tick;
 
-mod yield_now;
+pub mod yield_now;
+pub use yield_now::YieldNow;

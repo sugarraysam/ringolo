@@ -30,11 +30,11 @@ use std::task::{Context, Poll, Waker};
 ///
 /// Creation from [`task::spawn`]:
 ///
-/// ```
-/// use ringolo::task;
+/// ```no_run
+/// use ringolo::task::JoinHandle;
 ///
 /// # async fn doc() {
-/// let join_handle: task::JoinHandle<_> = task::spawn(async {
+/// let join_handle: JoinHandle<_> = ringolo::spawn(async {
 ///     // some work here
 /// });
 /// # }
@@ -43,11 +43,11 @@ use std::task::{Context, Poll, Waker};
 /// The generic parameter `T` in `JoinHandle<T>` is the return type of the spawned task.
 /// If the return value is an `i32`, the join handle has type `JoinHandle<i32>`:
 ///
-/// ```
-/// use ringolo::task;
+/// ```no_run
+/// use ringolo::task::JoinHandle;
 ///
 /// # async fn doc() {
-/// let join_handle: task::JoinHandle<i32> = task::spawn(async {
+/// let join_handle: JoinHandle<i32> = ringolo::spawn(async {
 ///     5 + 3
 /// });
 /// # }
@@ -56,11 +56,11 @@ use std::task::{Context, Poll, Waker};
 ///
 /// If the task does not have a return value, the join handle has type `JoinHandle<()>`:
 ///
-/// ```
-/// use ringolo::task;
+/// ```no_run
+/// use ringolo::task::JoinHandle;
 ///
 /// # async fn doc() {
-/// let join_handle: task::JoinHandle<()> = task::spawn(async {
+/// let join_handle: JoinHandle<()> = ringolo::spawn(async {
 ///     println!("I return nothing.");
 /// });
 /// # }
@@ -71,12 +71,12 @@ use std::task::{Context, Poll, Waker};
 /// to be double chained to extract the returned value:
 ///
 /// ```
-/// use ringolo::task;
+/// use ringolo::task::JoinHandle;
 /// use std::io;
 ///
-/// # #[ringolo::main(flavor = "current_thread")]
+/// # #[ringolo::main(flavor = "local")]
 /// # async fn main() -> io::Result<()> {
-/// let join_handle: task::JoinHandle<Result<i32, io::Error>> = ringolo::spawn(async {
+/// let join_handle: JoinHandle<Result<i32, io::Error>> = ringolo::spawn(async {
 ///     Ok(5 + 3)
 /// });
 ///
@@ -90,13 +90,13 @@ use std::task::{Context, Poll, Waker};
 ///
 /// ```
 /// # {
-/// use ringolo::task;
+/// use ringolo::task::JoinHandle;
 /// use std::io;
 /// use std::panic;
 ///
 /// #[ringolo::main]
 /// async fn main() -> io::Result<()> {
-///     let join_handle: task::JoinHandle<Result<i32, io::Error>> = ringolo::spawn(async {
+///     let join_handle: JoinHandle<Result<i32, io::Error>> = ringolo::spawn(async {
 ///         panic!("boom");
 ///     });
 ///
@@ -109,16 +109,15 @@ use std::task::{Context, Poll, Waker};
 /// Child being detached and outliving its parent:
 ///
 /// ```no_run
-/// use ringolo::task;
-/// use ringolo::time;
+/// use ringolo::time::Sleep;
 /// use std::time::Duration;
 ///
-/// # #[ringolo::main(flavor = "current_thread")]
+/// # #[ringolo::main(flavor = "local")]
 /// # async fn main() {
-/// let original_task = task::spawn(async {
-///     let _detached_task = task::spawn(async {
+/// let original_task = ringolo::spawn(async {
+///     let _detached_task = ringolo::spawn(async {
 ///         // Here we sleep to make sure that the first task returns before.
-///         time::sleep(Duration::from_millis(10)).await;
+///         Sleep::try_new(Duration::from_millis(10)).expect("failed to sleep").await;
 ///         // This will be called, even though the JoinHandle is dropped.
 ///         println!("♫ Still alive ♫");
 ///     });
@@ -130,7 +129,7 @@ use std::task::{Context, Poll, Waker};
 /// // We make sure that the new task has time to run, before the main
 /// // task returns.
 ///
-/// time::sleep(Duration::from_millis(1000)).await;
+/// Sleep::try_new(Duration::from_millis(1000)).expect("failed to sleep").await;
 /// # }
 /// ```
 ///
@@ -168,21 +167,24 @@ impl<T> JoinHandle<T> {
     /// running normally. The exception is if the task has not started running
     /// yet; in that case, calling `abort` may prevent the task from starting.
     ///
-    /// ```rust
-    /// use ringolo::time;
+    /// ```
+    /// use ringolo::task::JoinHandle;
+    /// use ringolo::time::Sleep;
+    /// use std::time::Duration;
+    /// use anyhow::Result;
     ///
-    /// # #[ringolo::main(flavor = "current_thread", start_paused = true)]
-    /// # async fn main() {
-    /// let mut handles = Vec::new();
+    /// # #[ringolo::main(flavor = "local")]
+    /// # async fn main() -> Result<()> {
+    /// let mut handles: Vec<JoinHandle<Result<bool>>> = Vec::new();
     ///
     /// handles.push(ringolo::spawn(async {
-    ///    time::sleep(time::Duration::from_secs(10)).await;
-    ///    true
+    ///    Sleep::try_new(Duration::from_secs(10))?.await;
+    ///    Ok(true)
     /// }));
     ///
     /// handles.push(ringolo::spawn(async {
-    ///    time::sleep(time::Duration::from_secs(10)).await;
-    ///    false
+    ///    Sleep::try_new(Duration::from_secs(10))?.await;
+    ///    Ok(false)
     /// }));
     ///
     /// for handle in &handles {
@@ -192,6 +194,8 @@ impl<T> JoinHandle<T> {
     /// for handle in handles {
     ///     assert!(handle.await.unwrap_err().is_cancelled());
     /// }
+    ///
+    /// Ok(())
     /// # }
     /// ```
     ///
@@ -207,23 +211,29 @@ impl<T> JoinHandle<T> {
     /// some time, and this method does not return `true` until it has
     /// completed.
     ///
-    /// ```rust
-    /// use ringolo::time;
+    /// ```
+    /// use ringolo::task::JoinHandle;
+    /// use ringolo::time::Sleep;
+    /// use std::time::Duration;
+    /// use anyhow::Result;
     ///
-    /// # #[ringolo::main(flavor = "current_thread", start_paused = true)]
-    /// # async fn main() {
+    /// # #[ringolo::main(flavor = "local")]
+    /// # async fn main() -> Result<()> {
     /// let handle1 = ringolo::spawn(async {
     ///     // do some stuff here
     /// });
-    /// let handle2 = ringolo::spawn(async {
+    /// let handle2: JoinHandle<Result<()>> = ringolo::spawn(async {
     ///     // do some other stuff here
-    ///     time::sleep(time::Duration::from_secs(10)).await;
+    ///     Sleep::try_new(Duration::from_secs(10))?.await;
+    ///     Ok(())
     /// });
     /// // Wait for the task to finish
     /// handle2.abort();
-    /// time::sleep(time::Duration::from_secs(1)).await;
+    /// Sleep::try_new(Duration::from_secs(1))?.await;
     /// assert!(handle1.is_finished());
     /// assert!(handle2.is_finished());
+    ///
+    /// Ok(())
     /// # }
     /// ```
     /// [`abort`]: method@JoinHandle::abort
@@ -247,23 +257,26 @@ impl<T> JoinHandle<T> {
     /// will fail with a [cancelled] `JoinError`.
     ///
     /// ```rust
-    /// use ringolo::{time, task};
+    /// use ringolo::task::{AbortHandle, JoinHandle};
+    /// use std::time::Duration;
+    /// use ringolo::time::Sleep;
+    /// use anyhow::Result;
     ///
-    /// # #[ringolo::main(flavor = "current_thread", start_paused = true)]
-    /// # async fn main() {
-    /// let mut handles = Vec::new();
+    /// # #[ringolo::main(flavor = "local")]
+    /// # async fn main() -> Result<()> {
+    /// let mut handles: Vec<JoinHandle<Result<bool>>> = Vec::new();
     ///
     /// handles.push(ringolo::spawn(async {
-    ///    time::sleep(time::Duration::from_secs(10)).await;
-    ///    true
+    ///    Sleep::try_new(Duration::from_secs(10))?.await;
+    ///    Ok(true)
     /// }));
     ///
     /// handles.push(ringolo::spawn(async {
-    ///    time::sleep(time::Duration::from_secs(10)).await;
-    ///    false
+    ///    Sleep::try_new(Duration::from_secs(10))?.await;
+    ///    Ok(false)
     /// }));
     ///
-    /// let abort_handles: Vec<task::AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
+    /// let abort_handles: Vec<AbortHandle> = handles.iter().map(|h| h.abort_handle()).collect();
     ///
     /// for handle in abort_handles {
     ///     handle.abort();
@@ -272,6 +285,8 @@ impl<T> JoinHandle<T> {
     /// for handle in handles {
     ///     assert!(handle.await.unwrap_err().is_cancelled());
     /// }
+    ///
+    /// Ok(())
     /// # }
     /// ```
     /// [cancelled]: method@super::error::JoinError::is_cancelled
