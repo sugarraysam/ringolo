@@ -1,5 +1,5 @@
 use crate as ringolo;
-use crate::context::init_local_context;
+use crate::context;
 use crate::runtime::Scheduler;
 use crate::runtime::cleanup::OnCleanupError;
 use crate::runtime::local;
@@ -42,7 +42,7 @@ const DIRECT_FDS_PER_RING: u32 = 1024;
 const PROCESS_CQES_INTERVAL: u32 = 61;
 
 #[cfg(test)]
-const PROCESS_CQES_INTERVAL: u32 = 4; // make tests tick faster
+const PROCESS_CQES_INTERVAL: u32 = 8; // make tests tick faster
 
 /// Submit 4 times as frequently as we complete to keep kernel busy.
 const SUBMIT_INTERVAL: u32 = PROCESS_CQES_INTERVAL / 4;
@@ -316,7 +316,7 @@ impl Builder {
         let cfg = self.try_into()?;
         let scheduler = local::Scheduler::new(&cfg).into_handle();
 
-        if let Err(e) = init_local_context(&cfg, scheduler.clone()) {
+        if let Err(e) = context::init_local_context(&cfg, scheduler.clone()) {
             panic!("Failed to initialize local context: {:?}", e);
         }
 

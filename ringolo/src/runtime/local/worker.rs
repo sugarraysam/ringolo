@@ -1,18 +1,22 @@
-use crate::context::{expect_local_scheduler, with_slab, with_slab_and_ring_mut};
+use crate::context;
 use crate::runtime::local;
 use crate::runtime::local::scheduler::LocalTask;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
+use crate::task::ThreadId;
 use anyhow::{Result, anyhow};
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::pin::pin;
 use std::task::Poll;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
+    /// ThreadId associated with this worker.
+    thread_id: OnceCell<ThreadId>,
+
     /// Handle to single local queue.
     pollable: RefCell<VecDeque<LocalTask>>,
 
@@ -26,6 +30,7 @@ pub(crate) struct Worker {
 impl Worker {
     pub(super) fn new(cfg: &RuntimeConfig) -> Self {
         Self {
+            thread_id: OnceCell::new(),
             pollable: RefCell::new(VecDeque::new()),
             cfg: RefCell::new(cfg.into()),
             ticker: RefCell::new(Ticker::new()),
@@ -117,6 +122,8 @@ impl EventLoop for Worker {
     type Task = LocalTask;
 
     fn add_task(&self, task: Self::Task, mode: AddMode) {
+        task.set_owner_id(*self.thread_id.get_or_init(context::current_thread_id));
+
         let mut q = self.pollable.borrow_mut();
 
         // We always pop from the back, so the start of the q is the back, and
@@ -133,7 +140,9 @@ impl EventLoop for Worker {
 
     fn event_loop<F: Future>(&self, root_fut: Option<F>) -> Result<F::Output> {
         if let Some(root_fut) = root_fut {
-            expect_local_scheduler(|ctx, scheduler| self.event_loop_inner(ctx, scheduler, root_fut))
+            context::expect_local_scheduler(|ctx, scheduler| {
+                self.event_loop_inner(ctx, scheduler, root_fut)
+            })
         } else {
             Err(anyhow!("Unexpected empty root_future"))
         }
@@ -175,16 +184,16 @@ impl Worker {
             self.process_ticker_events(ctx, events)?;
 
             if let Some(task) = self.find_task() {
+                dbg!("polling task...");
                 task.run();
             } else {
                 // No more work to do. This means it is time to poll the root future.
-                if with_slab(|s| s.pending_ios == 0) {
+                if ctx.with_core(|core| core.get_pending_ios() == 0) {
                     // By definition if there are no pending IOs, then we should have no `ready_cqes`
                     // and no `unsubmitted_sqes` because we have a 1:1 mapping between RawSqe <-> SQE.
                     debug_assert!(!data.has_ready_cqes);
                     debug_assert!(data.unsubmitted_sqes == 0);
 
-                    // TODO: do we have to check scheduler.tasks.is_empty() be false?
                     match root_result.is_some() {
                         true => return Ok(root_result.unwrap()),
                         false => scheduler.set_root_woken(),
@@ -192,7 +201,7 @@ impl Worker {
                 } else {
                     dbg!("parking thread waiting for completions");
                     // "Park" the thread waiting for next completion.
-                    with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+                    context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
                         ring.submit_and_wait(1, None)?;
                         ring.process_cqes(slab, None)?;
                         Ok(())

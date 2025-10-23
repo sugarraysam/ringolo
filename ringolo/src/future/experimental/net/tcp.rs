@@ -9,7 +9,6 @@ use std::{
 use crate::{
     any_extract, any_extract_all, any_vec,
     future::lib::{Bind, KernelFdMode, Listen, ReuseAddr, ReusePort, SetSockOpt, list::OpList},
-    sqe::IoError,
 };
 
 // TODO:

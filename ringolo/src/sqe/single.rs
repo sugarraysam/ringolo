@@ -1,7 +1,5 @@
-use crate::context::{with_slab_and_ring_mut, with_slab_mut};
-use crate::sqe::{
-    Completable, CompletionHandler, IoError, RawSqe, Sqe, Submittable, increment_pending_io,
-};
+use crate::context;
+use crate::sqe::{Completable, CompletionHandler, IoError, RawSqe, Sqe, Submittable};
 use anyhow::anyhow;
 use io_uring::squeue::Entry;
 use std::io::{self, Error};
@@ -43,23 +41,25 @@ impl Submittable for SqeSingle {
             SqeSingleState::Submitted { .. } => {
                 return Err(anyhow!("SqeSingle already submitted").into());
             }
-            SqeSingleState::Unsubmitted { entry } => with_slab_and_ring_mut(|slab, ring| {
-                let reserved = slab.reserve_entry()?;
-                let idx = reserved.key();
+            SqeSingleState::Unsubmitted { entry } => {
+                context::with_slab_and_ring_mut(|slab, ring| {
+                    let reserved = slab.reserve_entry()?;
+                    let idx = reserved.key();
 
-                entry.set_user_data(idx as u64);
-                ring.push(entry)?;
+                    entry.set_user_data(idx as u64);
+                    ring.push(entry)?;
 
-                reserved.commit(RawSqe::new(CompletionHandler::new_single()));
+                    reserved.commit(RawSqe::new(CompletionHandler::new_single()));
 
-                Ok(idx)
-            }),
+                    Ok(idx)
+                })
+            }
         }
         // On successful push, we can transition the state and increment the
         // number of local pending IOs for this task.
         .map(|idx| {
             self.state = SqeSingleState::Submitted { idx };
-            increment_pending_io(waker);
+            context::with_core(|core| core.increment_pending_ios(waker));
         })
     }
 }
@@ -70,7 +70,7 @@ impl Completable for SqeSingle {
     fn poll_complete(&mut self, waker: &Waker) -> Poll<Self::Output> {
         let idx = self.get_idx()?;
 
-        with_slab_mut(|slab| -> Poll<Self::Output> {
+        context::with_slab_mut(|slab| -> Poll<Self::Output> {
             let raw = slab.get_mut(idx)?;
 
             if raw.is_ready() {
@@ -87,7 +87,7 @@ impl Completable for SqeSingle {
 impl Drop for SqeSingle {
     fn drop(&mut self) {
         if let Err(e) = self.get_idx().map(|idx| {
-            with_slab_mut(|slab| {
+            context::with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);
                 }
@@ -110,7 +110,6 @@ mod tests {
     use crate::context::with_slab_and_ring_mut;
     use crate::test_utils::*;
     use anyhow::Result;
-    use static_assertions::assert_impl_one;
     use std::pin::pin;
     use std::task::{Context, Poll};
 
@@ -131,7 +130,7 @@ mod tests {
             let idx = sqe_fut.get().get_idx()?;
 
             assert_eq!(waker_data.get_count(), 0);
-            assert_eq!(waker_data.get_pending_io(), 1);
+            assert_eq!(waker_data.get_pending_ios(), 1);
 
             with_slab_and_ring_mut(|slab, ring| {
                 assert_eq!(ring.sq().len(), 1);
@@ -154,7 +153,7 @@ mod tests {
             // Process CQEs :: wakes up Waker
             assert!(matches!(ring.process_cqes(slab, None), Ok(1)));
             assert_eq!(waker_data.get_count(), 1);
-            assert_eq!(waker_data.get_pending_io(), 0);
+            assert_eq!(waker_data.get_pending_ios(), 0);
         });
 
         assert!(matches!(

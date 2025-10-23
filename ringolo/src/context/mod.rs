@@ -1,18 +1,22 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(dead_code)]
 
-use crate::runtime::{local, stealing, RuntimeConfig, Scheduler};
-use crate::task::Id;
+use crate::runtime::{RuntimeConfig, Scheduler, local, stealing};
+use crate::task::{Id, ThreadId};
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
+use std::sync::Arc;
 use std::thread_local;
 
 // Exports
 mod core;
-pub(crate) use core::{Core, ThreadId};
+pub(crate) use core::Core;
 
 pub(crate) mod ring;
 pub(crate) use ring::SingleIssuerRing;
+
+pub(crate) mod shared;
+pub(crate) use shared::Shared;
 
 pub(crate) mod slab;
 pub(crate) use slab::RawSqeSlab;
@@ -108,13 +112,13 @@ where
 }
 
 #[inline(always)]
-pub(crate) fn with_core_mut<F, R>(f: F) -> R
+pub(crate) fn with_shared<F, R>(f: F) -> R
 where
-    F: FnOnce(&mut Core) -> R,
+    F: FnOnce(&Arc<Shared>) -> R,
 {
     with_context(|outer| match outer {
-        Context::Local(c) => c.with_core_mut(f),
-        Context::Stealing(c) => c.with_core_mut(f),
+        Context::Local(c) => c.with_shared(f),
+        Context::Stealing(c) => c.with_shared(f),
     })
 }
 
@@ -131,7 +135,7 @@ pub(crate) fn with_slab_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut RawSqeSlab) -> R,
 {
-    with_core_mut(|core| f(&mut core.slab.borrow_mut()))
+    with_core(|core| f(&mut core.slab.borrow_mut()))
 }
 
 #[inline(always)]
@@ -147,7 +151,7 @@ pub(crate) fn with_ring_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut SingleIssuerRing) -> R,
 {
-    with_core_mut(|core| f(&mut core.ring.borrow_mut()))
+    with_core(|core| f(&mut core.ring.borrow_mut()))
 }
 
 #[inline(always)]
@@ -163,7 +167,7 @@ pub(crate) fn with_slab_and_ring_mut<F, R>(f: F) -> R
 where
     F: FnOnce(&mut RawSqeSlab, &mut SingleIssuerRing) -> R,
 {
-    with_core_mut(|core| {
+    with_core(|core| {
         let mut slab = core.slab.borrow_mut();
         let mut ring = core.ring.borrow_mut();
         f(&mut slab, &mut ring)
@@ -237,6 +241,12 @@ macro_rules! with_scheduler {
             }
         })
     };
+}
+
+#[derive(Debug)]
+pub(crate) enum PendingIoOp {
+    Increment,
+    Decrement,
 }
 
 #[cfg(test)]

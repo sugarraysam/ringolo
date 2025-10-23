@@ -1,4 +1,4 @@
-use crate::context::with_slab_mut;
+use crate::context;
 use crate::future::lib::{Op, OpPayload};
 use crate::runtime::{PanicReason, SchedulerPanic};
 use std::pin::pin;
@@ -110,7 +110,7 @@ impl<T: OpCleanupPayload> CleanupTask<T> {
             // The cleanup task is now responsible for removing the RawSqe from the slab.
             // We do this at the very end to avoid race condition on the slab, because as soon
             // as we release the entry, it can be reused by another async operation.
-            with_slab_mut(|slab| {
+            context::with_slab_mut(|slab| {
                 if slab.try_remove(user_data).is_none()
                     && !matches!(self.on_error, OnCleanupError::Ignore)
                 {
@@ -136,7 +136,7 @@ mod tests {
         self as ringolo,
         future::lib::{Multishot, TimeoutMultishot},
     };
-    use anyhow::Result;
+    use anyhow::{Context, Result};
     use futures::StreamExt;
     use std::pin::pin;
     use std::time::Duration;
@@ -157,7 +157,7 @@ mod tests {
         // Cleanup once
         let cancel_handle = timeout.as_mut().cancel();
         assert!(cancel_handle.is_some());
-        assert!(cancel_handle.unwrap().await.is_ok());
+        cancel_handle.unwrap().await.context("cancel failed")?;
 
         crate::with_scheduler!(|s| {
             let spawn_calls = s.tracker.get_calls(&Method::Spawn);

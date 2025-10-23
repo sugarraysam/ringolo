@@ -1,8 +1,6 @@
-use crate::context::{with_slab_and_ring_mut, with_slab_mut};
+use crate::context;
 use crate::runtime::{Schedule, SchedulerPanic};
-use crate::sqe::{
-    CompletionHandler, IoError, RawSqe, RawSqeState, Submittable, increment_pending_io,
-};
+use crate::sqe::{CompletionHandler, IoError, RawSqe, RawSqeState, Submittable};
 use crate::with_scheduler;
 use anyhow::anyhow;
 use futures::Stream;
@@ -61,17 +59,19 @@ impl Submittable for SqeStream {
     /// and avoids corrupted state.
     fn submit(&mut self, waker: &Waker) -> Result<(), IoError> {
         match &mut self.state {
-            SqeStreamState::Unsubmitted { entry, count } => with_slab_and_ring_mut(|slab, ring| {
-                let reserved = slab.reserve_entry()?;
-                let idx = reserved.key();
+            SqeStreamState::Unsubmitted { entry, count } => {
+                context::with_slab_and_ring_mut(|slab, ring| {
+                    let reserved = slab.reserve_entry()?;
+                    let idx = reserved.key();
 
-                entry.set_user_data(idx as u64);
-                ring.push(entry)?;
+                    entry.set_user_data(idx as u64);
+                    ring.push(entry)?;
 
-                reserved.commit(RawSqe::new(CompletionHandler::new_stream(*count)));
+                    reserved.commit(RawSqe::new(CompletionHandler::new_stream(*count)));
 
-                Ok(idx)
-            }),
+                    Ok(idx)
+                })
+            }
             _ => {
                 return Err(anyhow!("SqeStream already submitted").into());
             }
@@ -80,7 +80,7 @@ impl Submittable for SqeStream {
         // number of local pending IOs for this task.
         .map(|idx| {
             self.state = SqeStreamState::Submitted { idx };
-            increment_pending_io(waker);
+            context::with_core(|core| core.increment_pending_ios(waker));
         })
     }
 }
@@ -129,7 +129,7 @@ impl Stream for SqeStream {
                     }
                 }
                 SqeStreamState::Submitted { idx } => {
-                    return with_slab_mut(|slab| -> Poll<Option<Self::Item>> {
+                    return context::with_slab_mut(|slab| -> Poll<Option<Self::Item>> {
                         let raw_sqe = slab.get_mut(idx)?;
 
                         // It is the responsibility of the caller to cancel the
@@ -167,7 +167,7 @@ impl Drop for SqeStream {
         }
 
         if let Err(e) = self.get_idx().map(|idx| {
-            with_slab_mut(|slab| {
+            context::with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
                     eprintln!("Warning: SQE {} not found in slab during drop", idx);
                 }
@@ -181,7 +181,7 @@ impl Drop for SqeStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::with_slab_and_ring_mut;
+    use crate::context;
     use crate::test_utils::*;
     use anyhow::Result;
     use io_uring::opcode::Timeout;
@@ -217,12 +217,12 @@ mod tests {
 
             assert!(matches!(stream.as_mut().poll_next(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
-            assert_eq!(waker_data.get_pending_io(), 1);
+            assert_eq!(waker_data.get_pending_ios(), 1);
         }
 
         let idx = stream.get_idx()?;
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             assert_eq!(ring.sq().len(), 1);
 
             let res = slab.get(idx).and_then(|sqe| {
@@ -256,7 +256,7 @@ mod tests {
             // We wake the task N time, and let scheduler handle the Notified
             // state and set the bit appropriately.
             assert_eq!(waker_data.get_count(), count as usize);
-            assert_eq!(waker_data.get_pending_io(), 0);
+            assert_eq!(waker_data.get_pending_ios(), 0);
 
             if let CompletionHandler::Stream {
                 results,

@@ -66,7 +66,7 @@ impl UringSocket {
         .await?;
 
         for (pos, res) in results.into_iter().enumerate() {
-            let _ = any_extract!(res, SetSockOpt).map_err(|e| {
+            any_extract!(res, SetSockOpt).map_err(|e| {
                 let ioerr: io::Error = e.into();
                 io::Error::new(
                     ioerr.kind(),

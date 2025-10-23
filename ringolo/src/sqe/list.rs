@@ -1,8 +1,8 @@
+use crate::context;
 use crate::context::slab::SlabReservedBatch;
-use crate::context::{with_slab_and_ring_mut, with_slab_mut};
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
-use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable, increment_pending_io};
+use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
 use anyhow::anyhow;
 use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
@@ -66,7 +66,7 @@ impl SqeList {
     // We set the waker on the head of the list.
     pub fn set_waker(&self, waker: &Waker) -> io::Result<()> {
         self.with_submitted(|indices, _| {
-            with_slab_mut(|slab| slab.get_mut(indices[0]).map(|sqe| sqe.set_waker(waker)))
+            context::with_slab_mut(|slab| slab.get_mut(indices[0]).map(|sqe| sqe.set_waker(waker)))
         })?
     }
 
@@ -88,21 +88,23 @@ impl Submittable for SqeList {
             SqeListState::Submitted { .. } => {
                 return Err(anyhow!("SqeList already submitted").into());
             }
-            SqeListState::Unsubmitted { builder } => with_slab_and_ring_mut(|slab, ring| {
-                let reserved_batch = slab.reserve_batch(builder.len())?;
+            SqeListState::Unsubmitted { builder } => {
+                context::with_slab_and_ring_mut(|slab, ring| {
+                    let reserved_batch = slab.reserve_batch(builder.len())?;
 
-                let (raws, next_state) = builder.try_build(&reserved_batch)?;
-                ring.push_batch(builder.entries())?;
+                    let (raws, next_state) = builder.try_build(&reserved_batch)?;
+                    ring.push_batch(builder.entries())?;
 
-                reserved_batch.commit(raws)?;
-                Ok(next_state)
-            }),
+                    reserved_batch.commit(raws)?;
+                    Ok(next_state)
+                })
+            }
         }
         // On successful push, we can transition the state and increment the
         // number of local pending IOs for this task.
         .map(|next_state| {
             self.state = next_state;
-            increment_pending_io(waker);
+            context::with_core(|core| core.increment_pending_ios(waker));
         })
     }
 }
@@ -122,7 +124,7 @@ impl Completable for SqeList {
         }
 
         self.with_submitted(|indices, _| {
-            let res = with_slab_mut(|slab| -> Self::Output {
+            let res = context::with_slab_mut(|slab| -> Self::Output {
                 indices
                     .iter()
                     .map(|idx| -> Result<io::Result<i32>, IoError> {
@@ -142,7 +144,7 @@ impl Completable for SqeList {
 impl Drop for SqeList {
     fn drop(&mut self) {
         if let Err(e) = self.with_submitted(|indices, _| {
-            with_slab_mut(|slab| {
+            context::with_slab_mut(|slab| {
                 indices.iter().for_each(|idx| {
                     if slab.try_remove(*idx).is_none() {
                         eprintln!("Warning: SQE {} not found in slab during drop", idx);
@@ -346,7 +348,7 @@ impl SqeListBuilderInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{with_slab, with_slab_and_ring_mut};
+    use crate::context;
     use crate::runtime::Builder;
     use crate::sqe::RawSqeState;
     use crate::test_utils::*;
@@ -376,7 +378,7 @@ mod tests {
 
         let mut num_heads = 0;
 
-        with_slab(|slab| -> Result<()> {
+        context::with_slab(|slab| -> Result<()> {
             list.with_submitted(|indices, _| -> Result<()> {
                 for idx in indices {
                     let sqe = slab.get(*idx)?;
@@ -432,12 +434,12 @@ mod tests {
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
-            assert_eq!(waker_data.get_pending_io(), 1);
+            assert_eq!(waker_data.get_pending_ios(), 1);
         }
 
         let head_idx = sqe_fut.get().with_submitted(|indices, _| indices[0])?;
 
-        with_slab_and_ring_mut(|slab, ring| {
+        context::with_slab_and_ring_mut(|slab, ring| {
             assert_eq!(ring.sq().len(), size);
 
             // Waker only set on head in batch/chain setup
@@ -451,7 +453,7 @@ mod tests {
             assert!(res.is_ok());
         });
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
             assert_eq!(ring.submit_and_wait(size, None)?, size);
             assert_eq!(waker_data.get_count(), 0);
@@ -459,7 +461,7 @@ mod tests {
             // Process CQEs :: wakes up Waker
             assert_eq!(ring.process_cqes(slab, None)?, size);
             assert_eq!(waker_data.get_count(), 1);
-            assert_eq!(waker_data.get_pending_io(), 0);
+            assert_eq!(waker_data.get_pending_ios(), 0);
             Ok(())
         })?;
 
@@ -529,13 +531,13 @@ mod tests {
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
-            assert_eq!(waker_data.get_pending_io(), 1);
+            assert_eq!(waker_data.get_pending_ios(), 1);
         }
 
         let expected_user_data = sqe_fut.get().with_submitted(|indices, _| indices.clone())?;
         let head_idx = expected_user_data[0];
 
-        with_slab_and_ring_mut(|slab, ring| {
+        context::with_slab_and_ring_mut(|slab, ring| {
             assert_eq!(ring.sq().len(), size);
 
             // Waker only set on head in batch/chain setup
@@ -548,7 +550,7 @@ mod tests {
             assert!(res.is_ok());
         });
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
             assert_eq!(ring.submit_and_wait(size, None)?, size);
             assert_eq!(waker_data.get_count(), 0);
@@ -556,7 +558,7 @@ mod tests {
             // Process CQEs :: wakes up Waker
             assert_eq!(ring.process_cqes(slab, None)?, size);
             assert_eq!(waker_data.get_count(), 1);
-            assert_eq!(waker_data.get_pending_io(), 0);
+            assert_eq!(waker_data.get_pending_ios(), 0);
             Ok(())
         })?;
 

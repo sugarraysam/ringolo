@@ -1,5 +1,6 @@
 use crate::{
-    runtime::cleanup::OpCleanupPayload,
+    context,
+    runtime::{cleanup::OpCleanupPayload, registry::CancellationStats},
     task::{JoinHandle, Notified, Task},
     with_scheduler,
 };
@@ -31,7 +32,7 @@ use ticker::{Ticker, TickerData, TickerEvents};
 mod waker;
 
 /// Scheduler trait
-pub(crate) trait Schedule: Sync + Sized + 'static {
+pub(crate) trait Schedule: Sync + Sized + 'static + std::fmt::Debug {
     /// Schedule a task to run soon.
     fn schedule(&self, is_new: bool, task: Notified<Self>);
 
@@ -103,7 +104,7 @@ impl SchedulerPanic {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum AddMode {
+pub enum AddMode {
     Fifo,
     Lifo,
 }
@@ -127,7 +128,7 @@ pub(crate) trait EventLoop {
 
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub(crate) struct TaskOpts: u32 {
+    pub(crate) struct TaskOpts: u16 {
         /// Task will stick to the thread onto which it is created.
         const STICKY = 1;
     }
@@ -162,11 +163,16 @@ where
     F: Future + Send + 'static,
     F::Output: Send + 'static,
 {
-    with_scheduler!(|s| { s.spawn(future, None) })
+    with_scheduler!(|s| {
+        // TODO: check shutdown
+        s.spawn(future, None)
+    })
 }
 
 pub(crate) fn spawn_cleanup<T: OpCleanupPayload>(builder: CleanupTaskBuilder<T>) -> JoinHandle<()> {
     with_scheduler!(|s| {
+        // TODO: check shutdown
+
         // Copy the runtime OnCleanupError policy into the builder.
         let task = builder.on_error(s.cfg.on_cleanup_error).build();
 
@@ -174,4 +180,20 @@ pub(crate) fn spawn_cleanup<T: OpCleanupPayload>(builder: CleanupTaskBuilder<T>)
         // to cancel an io_uring operation from another thread.
         s.spawn(task.into_future(), Some(TaskOpts::STICKY))
     })
+}
+
+pub fn cancel_all_children() -> CancellationStats {
+    let Some(parent_id) = context::current_task_id() else {
+        return CancellationStats::default();
+    };
+
+    with_scheduler!(|s| { s.tasks.cancel_all_children(parent_id) })
+}
+
+pub fn cancel_all_leaf_children() -> CancellationStats {
+    let Some(parent_id) = context::current_task_id() else {
+        return CancellationStats::default();
+    };
+
+    with_scheduler!(|s| { s.tasks.cancel_all_leaf_children(parent_id) })
 }

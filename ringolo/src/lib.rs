@@ -10,7 +10,7 @@ mod future;
 pub use future::experimental::time;
 
 pub mod runtime;
-pub use runtime::{block_on, spawn};
+pub use runtime::{block_on, cancel_all_children, cancel_all_leaf_children, spawn};
 
 mod sqe;
 

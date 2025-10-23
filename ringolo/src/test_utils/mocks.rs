@@ -56,17 +56,10 @@ impl WakerData {
         self.wake_count.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn get_pending_io(&self) -> i32 {
+    pub(crate) fn get_pending_ios(&self) -> u16 {
         unsafe {
             let ptr = ptr::addr_of!(self.header) as *mut Header;
-            Header::get_pending_io(NonNull::new_unchecked(ptr))
-        }
-    }
-
-    pub(crate) fn decrement_pending_io(&self) {
-        unsafe {
-            let ptr = ptr::addr_of!(self.header) as *mut Header;
-            Header::decrement_pending_io(NonNull::new_unchecked(ptr));
+            Header::get_pending_ios(NonNull::new_unchecked(ptr))
         }
     }
 }
@@ -75,11 +68,6 @@ unsafe fn mock_wake(data: *const ()) {
     // Need to consume 1 Arc reference
     let data = Arc::<WakerData>::from_raw(data.cast());
     data.wake_count.fetch_add(1, Ordering::Relaxed);
-
-    // We mock decrementing pending_io on consuming wake. This is how we hook
-    // the real CompletionHandler for every `io_uring` resource. This allows
-    // making sure we handle the reference counted IO registration properly.
-    data.decrement_pending_io();
 }
 
 unsafe fn mock_wake_by_ref(data: *const ()) {
@@ -118,11 +106,16 @@ pub(crate) fn mock_waker() -> (Waker, Arc<WakerData>) {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::init_local_runtime_and_context;
+
     use super::*;
+    use anyhow::Result;
     use std::ptr::NonNull;
 
     #[test]
-    fn test_mock_raw_waker() {
+    fn test_mock_raw_waker() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
         let (waker1, waker_data) = mock_waker();
         waker1.wake_by_ref();
         assert_eq!(waker_data.get_count(), 1);
@@ -133,17 +126,21 @@ mod tests {
 
         drop(waker1);
         assert_eq!(waker_data.get_count(), 2);
+        Ok(())
     }
 
     #[test]
-    fn test_mock_raw_waker_data_ptr_is_header() {
+    fn test_mock_raw_waker_data_ptr_is_header() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
         let (waker, _) = mock_waker();
 
         unsafe {
             let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
-            Header::increment_pending_io(ptr);
-            Header::decrement_pending_io(ptr);
+            assert_eq!(Header::get_pending_ios(ptr), 0);
             assert!(Header::is_stealable(ptr));
         }
+
+        Ok(())
     }
 }

@@ -59,14 +59,6 @@ unsafe fn drop_waker(ptr: *const ()) {
 // Wake by consuming the waker.
 unsafe fn wake_by_val(ptr: *const ()) {
     let ptr = NonNull::new_unchecked(ptr as *mut Header);
-
-    // Waking by val is a signal that one pending IO resource has successfully
-    // completed on the local iouring. This contract is enforced by all of the SQE
-    // primitives, i.e.: SqeSingle, SqeStream, SqeList, etc. We need to decrement
-    // the refcount so the scheduler knows where to schedule this task if it has
-    // become stealable.
-    Header::decrement_pending_io(ptr);
-
     let raw = RawTask::from_raw(ptr);
     raw.wake_by_val();
 }

@@ -1,8 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::runtime::Schedule;
-use crate::task::Header;
-use crate::task::RawTask;
+use crate::task::{Header, RawTask, ThreadId};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
@@ -130,12 +129,19 @@ impl<S: 'static> Notified<S> {
         self.0.header()
     }
 
+    #[inline(always)]
     pub(crate) fn id(&self) -> crate::task::Id {
         self.0.id()
     }
 
+    #[inline(always)]
     pub(crate) fn is_stealable(&self) -> bool {
         self.0.is_stealable()
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_owner_id(&self, thread_id: ThreadId) {
+        self.header().owner_id.set(thread_id);
     }
 }
 

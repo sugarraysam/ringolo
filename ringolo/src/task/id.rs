@@ -1,7 +1,7 @@
-use crate::context::{current_task_id, set_current_task_id};
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::context;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use std::{fmt, num::NonZeroU64};
+use std::{fmt, num::NonZeroU32, num::NonZeroU64};
 
 /// An opaque ID that uniquely identifies a task relative to all other currently
 /// running tasks.
@@ -24,6 +24,9 @@ use std::{fmt, num::NonZeroU64};
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct Id(pub(crate) NonZeroU64);
 
+const ROOT_FUTURE_ID_VAL: u64 = 1;
+pub static ROOT_FUTURE_ID: Id = Id(NonZeroU64::new(ROOT_FUTURE_ID_VAL).unwrap());
+
 /// Returns the [`Id`] of the currently running task.
 ///
 /// # Panics
@@ -35,7 +38,7 @@ pub struct Id(pub(crate) NonZeroU64);
 ///
 /// [task ID]: crate::task::Id
 pub fn id() -> Id {
-    current_task_id().expect("Can't get a task id when not inside a task")
+    context::current_task_id().expect("Can't get a task id when not inside a task")
 }
 
 /// Returns the [`Id`] of the currently running task, or `None` if called outside
@@ -47,7 +50,7 @@ pub fn id() -> Id {
 ///
 /// [task ID]: crate::task::Id
 pub fn try_id() -> Option<Id> {
-    current_task_id()
+    context::current_task_id()
 }
 
 impl fmt::Display for Id {
@@ -58,16 +61,23 @@ impl fmt::Display for Id {
 
 impl Id {
     pub(crate) fn next() -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        // Reserve ID == 1 for the root future.
+        static COUNTER: AtomicU64 = AtomicU64::new(ROOT_FUTURE_ID_VAL + 1);
+
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
 
         // Safety: this number is unimaginably large, even if the runtime was
         // creating 1 billion task/sec, it would take 584 years to wrap around.
-        loop {
-            let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-            if let Some(id) = NonZeroU64::new(id) {
-                return Self(id);
-            }
-        }
+        let Some(id) = NonZeroU64::new(id) else {
+            Self::exhausted();
+        };
+
+        Self(id)
+    }
+
+    #[cold]
+    fn exhausted() -> ! {
+        panic!("failed to generate unique task ID: bitspace exhausted")
     }
 
     pub(crate) fn as_u64(&self) -> u64 {
@@ -89,24 +99,52 @@ pub(super) struct TaskIdGuard {
 impl TaskIdGuard {
     pub(super) fn enter(id: Id) -> Self {
         TaskIdGuard {
-            parent_task_id: set_current_task_id(Some(id)),
+            parent_task_id: context::set_current_task_id(Some(id)),
         }
     }
 }
 
 impl Drop for TaskIdGuard {
     fn drop(&mut self) {
-        set_current_task_id(self.parent_task_id);
+        context::set_current_task_id(self.parent_task_id);
+    }
+}
+
+#[derive(Eq, PartialEq, Clone, Copy, Hash, Debug)]
+pub(crate) struct ThreadId(NonZeroU32);
+
+impl ThreadId {
+    pub(crate) fn next() -> ThreadId {
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+
+        let id = COUNTER.load(Ordering::Relaxed);
+
+        // Safety: We use U32 which means we can create 4 Billion threads, which
+        // should be more than enough. The reason why we don't use `std::thread::ThreadId`
+        // is explained in `task::header::Header`.
+        let Some(id) = NonZeroU32::new(id) else {
+            Self::exhausted();
+        };
+
+        ThreadId(id)
+    }
+
+    #[cold]
+    fn exhausted() -> ! {
+        panic!("failed to generate unique thread ID: bitspace exhausted")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use crate::test_utils::*;
+    use anyhow::Result;
     use std::collections::HashSet;
 
     #[test]
-    fn test_new_task_id_unique() {
+    fn test_new_task_id_unique() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
         let n = 13;
         let scheduler = DummyScheduler::default();
 
@@ -122,5 +160,6 @@ mod tests {
         }
 
         assert_eq!(all_ids.len(), n);
+        Ok(())
     }
 }

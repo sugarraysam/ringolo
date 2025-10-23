@@ -1,7 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::context;
 use crate::runtime::TaskOpts;
-use crate::task::id::Id;
+use crate::task::id::{Id, ThreadId};
 use crate::task::layout::Vtable;
 use crate::task::state::State;
 use crate::task::trailer::Trailer;
@@ -14,8 +15,9 @@ use std::ptr::NonNull;
 /// - 8 bytes :: state (atomic_usize)
 /// - 8 bytes :: vtable (ptr)
 /// - 8 bytes :: id (u64)
-/// - 4 bytes :: pending_io (i32)
-/// - 4 bytes :: task_opts (u32)
+/// - 4 bytes :: thread_id (u32)
+/// - 2 bytes :: pending_io (u16)
+/// - 2 bytes :: task_opts (u16)
 #[repr(C)]
 pub(crate) struct Header {
     /// Task state.
@@ -24,17 +26,19 @@ pub(crate) struct Header {
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
 
+    pub(super) owner_id: Cell<ThreadId>,
+
     /// Task id which can also used as the tracing::Id. Tight integration with
     /// tracing library to save few bytes in Header field. We store it in hot
     /// data as we update the thread local context before polling any task, and
     /// leverage the field constantly for task tracing.
     pub(super) id: Id,
 
-    /// We keep track of all locally scheduled IOs on iouring as a signal to
+    /// We keep track of all locally scheduled IOs on io_uring as a signal to
     /// determine if a task can safely be stolen by another thread. This is
     /// because completion will arrive on the thread that registered the
     /// submissions.
-    pub(super) pending_io: Cell<i32>,
+    pub(super) pending_ios: Cell<u16>,
 
     /// Special task options to modify scheduling behaviour.
     pub(super) opts: Cell<TaskOpts>,
@@ -53,8 +57,9 @@ impl Header {
         Header {
             state,
             vtable,
+            owner_id: Cell::new(context::current_thread_id()),
             id,
-            pending_io: Cell::new(0),
+            pending_ios: Cell::new(0),
             opts: Cell::new(task_opts.unwrap_or_default()),
         }
     }
@@ -84,6 +89,15 @@ impl Header {
         NonNull::new_unchecked(scheduler)
     }
 
+    /// Gets the owner_id of the task containing this `Header`.
+    ///
+    /// # Safety
+    ///
+    /// The provided raw pointer must point at the header of a task.
+    pub(crate) unsafe fn get_owner_id(me: NonNull<Header>) -> ThreadId {
+        me.as_ref().owner_id.get()
+    }
+
     /// Gets the id of the task containing this `Header`.
     ///
     /// # Safety
@@ -93,19 +107,16 @@ impl Header {
         me.as_ref().id
     }
 
-    /// Increment pending io on local thread.
-    pub(crate) unsafe fn get_pending_io(me: NonNull<Header>) -> i32 {
-        me.as_ref().pending_io.get()
+    /// Get pending ios on local thread.
+    pub(crate) unsafe fn get_pending_ios(me: NonNull<Header>) -> u16 {
+        me.as_ref().pending_ios.get()
     }
 
-    /// Increment pending io on local thread.
-    pub(crate) unsafe fn increment_pending_io(me: NonNull<Header>) {
-        me.as_ref().pending_io.update(|x| x + 1);
-    }
-
-    /// Decrement pending io on local thread.
-    pub(crate) unsafe fn decrement_pending_io(me: NonNull<Header>) {
-        me.as_ref().pending_io.update(|x| x - 1);
+    /// Modify pending ios.
+    pub(crate) unsafe fn modify_pending_ios(me: NonNull<Header>, delta: i16) {
+        me.as_ref()
+            .pending_ios
+            .update(|x| x.checked_add_signed(delta).expect("underflow"));
     }
 
     /// Determines if the task is safe to be stolen by another worker thread.
@@ -119,8 +130,8 @@ impl Header {
         let ptr = me.as_ref();
 
         let is_sticky = ptr.opts.get().contains(TaskOpts::STICKY);
-        let has_pending_io = ptr.pending_io.get() > 0;
+        let has_pending_ios = ptr.pending_ios.get() > 0;
 
-        !is_sticky && !has_pending_io
+        !is_sticky && !has_pending_ios
     }
 }

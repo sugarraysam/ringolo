@@ -171,11 +171,10 @@ impl SingleIssuerRing {
 
                 num_completed += 1;
 
-                for effect in raw_sqe.on_completion(cqe.result(), cqe.flags())? {
-                    match effect {
-                        CompletionEffect::DecrementPendingIo => slab.pending_ios -= 1,
-                        CompletionEffect::WakeHead { head } => slab.get_mut(head)?.wake()?,
-                    }
+                if let Some(CompletionEffect::WakeHead { head }) =
+                    raw_sqe.on_completion(cqe.result(), cqe.flags())?
+                {
+                    slab.get_mut(head)?.wake()?;
                 }
             }
 
@@ -189,7 +188,7 @@ impl SingleIssuerRing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::with_slab_and_ring_mut;
+    use crate::context;
     use crate::future::lib::{Op, Timeout};
     use crate::runtime::Builder;
     use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
@@ -210,7 +209,7 @@ mod tests {
         let mut ctx = Context::from_waker(&waker);
         assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             assert!(!ring.has_ready_cqes());
 
             // Submit without GETEVENTS flag.
@@ -243,7 +242,7 @@ mod tests {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
         init_local_runtime_and_context(Some(builder))?;
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {
                 let sq = ring.sq();
                 assert_eq!(sq.len(), 0);
@@ -293,7 +292,7 @@ mod tests {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
         init_local_runtime_and_context(Some(builder))?;
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {
                 let cq = ring.cq();
                 assert_eq!(cq.len(), 0);
@@ -317,6 +316,10 @@ mod tests {
 
                     nops.push(nop);
                     raws.push(raw);
+
+                    // We use single SQE even though we use batch API on slab,
+                    // anyways a bit messed up but need to count N pending ios.
+                    context::with_core(|core| core.increment_pending_ios(&waker));
                 });
 
                 let _ = batch.commit(raws)?;

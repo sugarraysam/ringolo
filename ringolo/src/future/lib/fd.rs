@@ -431,6 +431,7 @@ mod tests {
 
     use super::*;
     use crate as ringolo;
+    use crate::sqe::IoError;
     use crate::{
         runtime::{Builder, TaskOpts},
         test_utils::*,
@@ -518,8 +519,6 @@ mod tests {
         init_local_runtime_and_context(Some(builder))?;
 
         crate::block_on(async {
-            use crate::sqe::IoError;
-
             let mut sockets = Vec::with_capacity(n as usize);
 
             for _ in 0..n {

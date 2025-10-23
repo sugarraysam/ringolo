@@ -1,12 +1,9 @@
 #![allow(dead_code)]
 
-use crate::context::with_core;
 use crate::runtime::{Schedule, SchedulerPanic};
-use crate::task::Header;
 use crate::with_scheduler;
 use std::future::Future;
 use std::pin::Pin;
-use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
 
 // Re-exports
@@ -111,6 +108,7 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send
                                 ));
                             }
 
+                            dbg!("submit error: {:?}", &e);
                             return Poll::Ready(Err(e));
                         }
                     }
@@ -189,28 +187,11 @@ impl<E: Unpin, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin
     }
 }
 
-// In our submit implementation, we keep track of each task's pending IO. This is
-// our signal to determine if a task can be safely stolen by another thread. It
-// will also influence the scheduling logic (e.g.: place on a stealable queue).
-//
-// BUT, the root future is different. It gets a Waker implementation where the
-// data ptr is actually the Scheduler, and not a task Header. We use `thread_local`
-// trick to detect if we are polling the root future, and avoid accessing invalid
-// memory location.
-pub(super) fn increment_pending_io(waker: &Waker) {
-    unsafe {
-        if !with_core(|core| core.is_polling_root()) {
-            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
-            Header::increment_pending_io(ptr);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::list::{SqeList, SqeListKind};
     use super::*;
-    use crate::context::{with_ring_mut, with_slab_and_ring_mut};
+    use crate::context;
     use crate::test_utils::*;
     use anyhow::Result;
     use either::Either;
@@ -335,14 +316,14 @@ mod tests {
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
-            assert_eq!(waker_data.get_pending_io(), num_lists as i32);
+            assert_eq!(waker_data.get_pending_ios(), num_lists as u16);
 
-            with_ring_mut(|ring| {
+            context::with_ring_mut(|ring| {
                 assert_eq!(ring.sq().len(), n_sqes);
             });
         }
 
-        with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             // Submit SQEs and wait for CQEs :: `io_uring_enter`
             assert_eq!(ring.submit_and_wait(n_sqes, None)?, n_sqes);
             assert_eq!(waker_data.get_count(), 0);
@@ -350,7 +331,7 @@ mod tests {
             // Process CQEs :: wakes up Waker
             assert_eq!(ring.process_cqes(slab, None)?, n_sqes);
             assert_eq!(waker_data.get_count(), num_lists);
-            assert_eq!(waker_data.get_pending_io(), 0);
+            assert_eq!(waker_data.get_pending_ios(), 0);
             Ok(())
         })?;
 

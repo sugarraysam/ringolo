@@ -12,7 +12,7 @@ pub use self::join::JoinHandle;
 
 // Re-exports
 pub mod id;
-pub(crate) use self::id::Id;
+pub(crate) use self::id::{Id, ThreadId};
 
 mod harness;
 

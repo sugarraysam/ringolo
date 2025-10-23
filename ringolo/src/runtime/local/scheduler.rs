@@ -1,4 +1,4 @@
-use crate::context::{with_core, with_slab_and_ring_mut};
+use crate::context;
 use crate::runtime::local::worker::Worker;
 use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
@@ -21,9 +21,9 @@ pub struct Scheduler {
     #[allow(unused)]
     pub(crate) cfg: RuntimeConfig,
 
-    pub(crate) worker: Worker,
-
     pub(crate) tasks: OwnedTasks<Handle>,
+
+    pub(crate) worker: Worker,
 
     pub(crate) root_woken: RefCell<bool>,
 
@@ -35,8 +35,8 @@ impl Scheduler {
     pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
         Self {
             cfg: cfg.clone(),
-            worker: Worker::new(cfg),
             tasks: OwnedTasks::new(cfg.sq_ring_size),
+            worker: Worker::new(cfg),
             root_woken: RefCell::new(true),
 
             #[cfg(test)]
@@ -99,6 +99,10 @@ impl Schedule for Handle {
                 id: task.id(),
             },
         );
+
+        // We use LIFO because most of the time schedule is called when a task
+        // is woken up as part of the scheduler completion/polling routine. We
+        // want these *hot tasks* to run next.
         self.worker.add_task(task, AddMode::Lifo);
     }
 
@@ -116,7 +120,7 @@ impl Schedule for Handle {
                 // front of queue in this case.
                 mode = AddMode::Lifo;
 
-                if let Err(e) = with_slab_and_ring_mut(|slab, ring| -> Result<usize> {
+                if let Err(e) = context::with_slab_and_ring_mut(|slab, ring| -> Result<usize> {
                     ring.submit_and_wait(1, None)?;
                     ring.process_cqes(slab, None)
                 }) {
@@ -132,7 +136,7 @@ impl Schedule for Handle {
         }
 
         // If the root_future is yielding, we need to handle it differently.
-        if with_core(|c| c.is_polling_root()) {
+        if context::with_core(|c| c.is_polling_root()) {
             self.set_root_woken();
         } else {
             // Safety: there is two flavors of Waker in the codebase, one for
@@ -157,6 +161,7 @@ impl Schedule for Handle {
         );
 
         // TODO:
+        // - tokio uses Panic handlers
         // - cleanup? drain? clean shutdown?
 
         panic!(
@@ -192,8 +197,8 @@ impl Handle {
 
         let (task, notified, join_handle) = crate::task::new_task(future, task_opts, self.clone());
 
-        let existed = self.tasks.insert(task);
-        debug_assert!(existed.is_none());
+        let existed = self.tasks.insert(task, context::current_task_id());
+        debug_assert!(!existed);
 
         self.schedule(true, notified);
         join_handle

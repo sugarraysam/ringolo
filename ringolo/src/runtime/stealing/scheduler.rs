@@ -1,10 +1,11 @@
+use crate::context::Shared;
 use crate::runtime::runtime::RuntimeConfig;
-use crate::runtime::stealing::context::Shared;
 use crate::runtime::stealing::worker::Worker;
-use crate::runtime::{AddMode, PanicReason, Schedule, SchedulerPanic, TaskOpts, YieldReason};
+use crate::runtime::{
+    AddMode, OwnedTasks, PanicReason, Schedule, SchedulerPanic, TaskOpts, YieldReason,
+};
 use crate::sqe::IoError;
 use crate::task::{JoinHandle, Notified, Task};
-#[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
 use crossbeam_deque::{Injector, Worker as CbWorker};
 use std::ops::Deref;
@@ -18,6 +19,8 @@ pub struct Scheduler {
     /// Runtime confguration to be injected in context and worker
     pub(crate) cfg: RuntimeConfig,
 
+    pub(crate) tasks: OwnedTasks<Handle>,
+
     /// The global injector queue for new tasks.
     pub(crate) injector: Arc<Injector<StealableTask>>,
 
@@ -30,7 +33,7 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub(crate) fn new(cfg: RuntimeConfig) -> Self {
-        let shared = Arc::new(Shared::new());
+        let shared = Arc::new(Shared::new(&cfg));
 
         let injector = Arc::new(Injector::new());
         let mut local_queues = Vec::with_capacity(cfg.worker_threads);
@@ -74,7 +77,8 @@ impl Scheduler {
             .collect::<Vec<_>>();
 
         Self {
-            cfg,
+            cfg: cfg.clone(),
+            tasks: OwnedTasks::new(cfg.sq_ring_size),
             injector,
             shared,
 

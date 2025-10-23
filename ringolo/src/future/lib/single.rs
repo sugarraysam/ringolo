@@ -9,9 +9,8 @@ use io_uring::squeue::Entry;
 use io_uring::types::{Fd, Fixed, TimeoutFlags, Timespec};
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
 use pin_project::pin_project;
-use std::io;
 use std::mem::MaybeUninit;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
 use std::pin::Pin;
 use std::time::Duration;
@@ -81,7 +80,7 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
                 .flags(this.flags.bits())
         });
 
-        Ok(entry.build().into())
+        Ok(entry.build())
     }
 
     fn into_output(
@@ -132,7 +131,7 @@ impl OpPayload for AsyncCancel {
     type Output = i32;
 
     fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
-        Ok(self.entry.take().expect("only called once").into())
+        Ok(self.entry.take().expect("only called once"))
     }
 
     fn into_output(
@@ -159,7 +158,7 @@ pub struct Bind<T: AsRawOrDirect> {
 
 impl<T: AsRawOrDirect> Bind<T> {
     pub fn new(sockfd: T, addr: &SocketAddr) -> Self {
-        let (addr, addr_len) = parse::socket_addr_to_c(&addr);
+        let (addr, addr_len) = parse::socket_addr_to_c(addr);
 
         Self {
             sockfd,
@@ -179,7 +178,7 @@ impl<T: AsRawOrDirect> OpPayload for Bind<T> {
             io_uring::opcode::Bind::new(fd, this.addr.as_ptr(), *this.addr_len)
         });
 
-        Ok(entry.build().into())
+        Ok(entry.build())
     }
 
     fn into_output(
@@ -216,7 +215,7 @@ impl OpPayload for Close {
             Either::Right(fixed) => io_uring::opcode::Close::new(fixed),
         };
 
-        Ok(entry.build().into())
+        Ok(entry.build())
     }
 
     fn into_output(
@@ -243,7 +242,7 @@ pub struct Connect<T: AsRawOrDirect> {
 
 impl<T: AsRawOrDirect> Connect<T> {
     pub fn new(sockfd: T, addr: &SocketAddr) -> Self {
-        let (addr, addr_len) = parse::socket_addr_to_c(&addr);
+        let (addr, addr_len) = parse::socket_addr_to_c(addr);
 
         Self {
             sockfd,
@@ -263,7 +262,7 @@ impl<T: AsRawOrDirect> OpPayload for Connect<T> {
             io_uring::opcode::Connect::new(fd, this.addr.as_ptr(), *this.addr_len)
         });
 
-        Ok(entry.build().into())
+        Ok(entry.build())
     }
 
     fn into_output(
@@ -298,7 +297,7 @@ impl<T: AsRawOrDirect> OpPayload for Listen<T> {
             io_uring::opcode::Listen::new(fd, self.backlog)
         });
 
-        Ok(entry.build().into())
+        Ok(entry.build())
     }
 
     fn into_output(
@@ -320,7 +319,7 @@ impl OpPayload for Nop {
     type Output = ();
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
-        Ok(io_uring::opcode::Nop::new().build().into())
+        Ok(io_uring::opcode::Nop::new().build())
     }
 
     fn into_output(
@@ -369,8 +368,7 @@ impl OpPayload for Socket {
             self.protocol as i32,
         )
         .file_index(self.mode.try_into_slot()?)
-        .build()
-        .into())
+        .build())
     }
 
     fn into_output(
@@ -460,8 +458,7 @@ impl OpPayload for Timeout {
         Ok(io_uring::opcode::Timeout::new(timespec_addr)
             .count(1)
             .flags(*this.flags)
-            .build()
-            .into())
+            .build())
     }
 
     fn into_output(

@@ -9,22 +9,12 @@ use std::ops::{Deref, DerefMut};
 
 pub(crate) struct RawSqeSlab {
     slab: slab::Slab<RawSqe>,
-
-    // Keep track of number of pending IO operations. We can't rely on slab size
-    // as RawSqe's are kept alive *after completion* so we can consume result in
-    // after waking up the future.
-    pub(crate) pending_ios: usize,
 }
 
 impl RawSqeSlab {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
             slab: Slab::with_capacity(capacity),
-
-            // Pending ios is used by local worker as a signal of "is there more work to do". If
-            // there are no pending ios, then we are NOT expecting any more CQE, and we can decide
-            // to park the thread or poll the root future.
-            pending_ios: 0,
         }
     }
 
@@ -36,7 +26,7 @@ impl RawSqeSlab {
         }
 
         let v = self.slab.vacant_entry();
-        Ok(SlabReservedEntry::new(v, &mut self.pending_ios))
+        Ok(SlabReservedEntry::new(v))
     }
 
     /// Reserve a batch of N slab entries for insertion. Insertion is a 2-step process
@@ -95,13 +85,12 @@ impl DerefMut for RawSqeSlab {
 /// A wrapper around slab::VacantEntry that increments a counter upon insertion.
 pub(crate) struct SlabReservedEntry<'a> {
     entry: VacantEntry<'a, RawSqe>,
-    counter: &'a mut usize,
 }
 
 impl<'a> SlabReservedEntry<'a> {
     /// Creates a new SlabReservedEntry.
-    fn new(entry: slab::VacantEntry<'a, RawSqe>, counter: &'a mut usize) -> Self {
-        Self { entry, counter }
+    fn new(entry: slab::VacantEntry<'a, RawSqe>) -> Self {
+        Self { entry }
     }
 
     /// Gets the key that will be used for the next insertion.
@@ -109,10 +98,9 @@ impl<'a> SlabReservedEntry<'a> {
         self.entry.key()
     }
 
-    /// Inserts a value into the slab, incrementing the `pending_io` counter.
-    /// This consumes the entry, just like the original `insert` method.
+    /// Inserts a value into the slab. This consumes the entry, just like the
+    /// original `insert` method.
     pub(crate) fn commit(self, value: RawSqe) -> &'a mut RawSqe {
-        *self.counter += 1;
         self.entry.insert(value)
     }
 }
@@ -161,8 +149,6 @@ impl<'a> SlabReservedBatch<'a> {
         }
 
         self.committed = true;
-        self.slab.pending_ios += self.indices.len();
-
         Ok(())
     }
 }
@@ -182,12 +168,10 @@ impl Drop for SlabReservedBatch<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::with_slab_mut;
-    use crate::sqe::CompletionEffect;
+    use crate::context;
     use crate::sqe::raw::CompletionHandler;
     use crate::test_utils::*;
     use anyhow::Result;
-    use io_uring::cqueue::CompletionFlags;
 
     #[test]
     fn test_new_and_capacity() {
@@ -199,6 +183,8 @@ mod tests {
 
     #[test]
     fn test_insert_and_len() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes);
 
@@ -215,7 +201,9 @@ mod tests {
     }
 
     #[test]
-    fn test_slab_full() {
+    fn test_slab_full() -> Result<()> {
+        init_local_runtime_and_context(None)?;
+
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes - 1);
 
@@ -230,72 +218,32 @@ mod tests {
                 assert!(res.is_ok());
             }
         }
-    }
 
-    #[test]
-    fn test_pending_io_tracking() -> Result<()> {
-        init_local_runtime_and_context(None)?;
-
-        with_slab_mut(|slab| -> Result<()> {
-            let n_sqes = 16;
-            let (waker, waker_data) = mock_waker();
-
-            let indices = (0..n_sqes)
-                .map(|_| {
-                    let reserved = slab.reserve_entry()?;
-                    let idx = reserved.key();
-
-                    let mut raw = RawSqe::new(CompletionHandler::new_single());
-                    raw.set_waker(&waker);
-
-                    reserved.commit(raw);
-                    Ok(idx)
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            assert_eq!(slab.pending_ios, n_sqes);
-
-            // Waking sqes decrement counter
-            for idx in indices {
-                let effects = slab
-                    .get_mut(idx)?
-                    .on_completion(0, CompletionFlags::empty())?;
-                assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
-            }
-
-            // Nothing has actually decremented the slab, we need a handler on the effects.
-            assert_eq!(slab.pending_ios, n_sqes);
-            assert_eq!(waker_data.get_count(), n_sqes);
-
-            Ok(())
-        })
+        Ok(())
     }
 
     #[test]
     fn test_reserve_batch() -> Result<()> {
         init_local_runtime_and_context(None)?;
 
-        with_slab_mut(|slab| -> Result<()> {
+        context::with_slab_mut(|slab| -> Result<()> {
             let n_sqes = 16;
 
             {
                 let batch = slab.reserve_batch(n_sqes)?;
 
                 // Slab entries are reserved but *not committed*
-                assert_eq!(batch.slab.pending_ios, 0);
                 assert_eq!(batch.slab.len(), n_sqes);
                 assert_eq!(batch.keys().len(), n_sqes);
             }
 
             // Batch was not committed, so slab entries are released.
-            assert_eq!(slab.pending_ios, 0);
             assert_eq!(slab.len(), 0);
 
             {
                 let batch = slab.reserve_batch(n_sqes)?;
 
                 // Slab entries are reserved but *not committed*
-                assert_eq!(batch.slab.pending_ios, 0);
                 assert_eq!(batch.slab.len(), n_sqes);
                 assert_eq!(batch.keys().len(), n_sqes);
 
@@ -307,7 +255,6 @@ mod tests {
                 batch.commit(entries)?;
             } // Batch was committed, nothing happens.
 
-            assert_eq!(slab.pending_ios, n_sqes);
             assert_eq!(slab.len(), n_sqes);
 
             Ok(())

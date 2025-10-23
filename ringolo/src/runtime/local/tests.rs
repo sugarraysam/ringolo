@@ -129,6 +129,11 @@ fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
         .sq_ring_size(sq_ring_size)
         .try_build()?;
 
+    // Default current task ID is ROOT_FUTURE instead of None?
+    // Set default current task ID when starting worker
+    // - stealing creating thread == ROOT_FUTURE
+    // - stealing not creating == None
+    // - local == ROOT_FUTURE
     let handle = runtime.spawn(async move {
         let batch = SqeCollection::new(vec![build_batch(2), build_batch(2)]);
         batch.await

@@ -1,15 +1,19 @@
 use io_uring::cqueue::CompletionFlags;
-use smallvec::{SmallVec, smallvec};
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::Waker;
 
+use crate::context;
 use crate::sqe::IoError;
 
 #[derive(Debug)]
 pub(crate) struct RawSqe {
+    // Indicates if this RawSqe is owned by the root future. See note on
+    // pending_io tracking on `context::core::Core::modify_pending_ios`.
+    pub(crate) owned_by_root: bool,
+
     pub(crate) waker: Option<Waker>,
 
     pub(crate) state: RawSqeState,
@@ -20,6 +24,7 @@ pub(crate) struct RawSqe {
 impl Default for RawSqe {
     fn default() -> Self {
         Self {
+            owned_by_root: false,
             waker: None,
             state: RawSqeState::Pending,
             handler: CompletionHandler::new_single(),
@@ -30,6 +35,7 @@ impl Default for RawSqe {
 impl RawSqe {
     pub(crate) fn new(handler: CompletionHandler) -> Self {
         Self {
+            owned_by_root: context::with_core(|core| core.is_polling_root()),
             handler,
             waker: None,
             state: RawSqeState::Pending,
@@ -74,7 +80,7 @@ impl RawSqe {
         &mut self,
         cqe_res: i32,
         cqe_flags: CompletionFlags,
-    ) -> Result<SmallVec<[CompletionEffect; 2]>> {
+    ) -> Result<Option<CompletionEffect>> {
         if !matches!(self.state, RawSqeState::Pending | RawSqeState::Ready) {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
@@ -92,7 +98,7 @@ impl RawSqe {
                 *result = Some(cqe_res);
                 self.wake()?;
 
-                Ok(smallvec![CompletionEffect::DecrementPendingIo])
+                Ok(None)
             }
             CompletionHandler::BatchOrChain {
                 result,
@@ -103,12 +109,9 @@ impl RawSqe {
                 let count = remaining.fetch_sub(1, Ordering::Relaxed) - 1;
 
                 if count == 0 {
-                    Ok(smallvec![
-                        CompletionEffect::DecrementPendingIo,
-                        CompletionEffect::WakeHead { head: *head },
-                    ])
+                    Ok(Some(CompletionEffect::WakeHead { head: *head }))
                 } else {
-                    Ok(smallvec![CompletionEffect::DecrementPendingIo])
+                    Ok(None)
                 }
             }
             CompletionHandler::Stream {
@@ -136,10 +139,10 @@ impl RawSqe {
                 // task when invoking the consuming wake() call.
                 if done {
                     self.wake()?;
-                    Ok(smallvec![CompletionEffect::DecrementPendingIo])
+                    Ok(None)
                 } else {
                     self.wake_by_ref()?;
-                    Ok(smallvec![])
+                    Ok(None)
                 }
             }
         }
@@ -208,7 +211,14 @@ impl RawSqe {
     }
 
     pub(crate) fn wake(&mut self) -> Result<()> {
-        self.take_waker()?.wake();
+        let waker = self.take_waker()?;
+
+        // Waking by val is a signal that one pending IO resource has successfully
+        // completed on the local io_uring. This contract is enforced by all of the SQE
+        // primitives, i.e.: SqeSingle, SqeStream, SqeList, etc.
+        context::with_core(|core| core.decrement_pending_ios(self.owned_by_root, &waker));
+
+        waker.wake();
         Ok(())
     }
 
@@ -303,10 +313,6 @@ impl CompletionHandler {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CompletionEffect {
-    // We use this fancy way to decrement pending IO on the slab mostly because
-    // of MULTISHOT, where 1 SQE can generate N CQEs. We are only allowed to decrement
-    // the pending IO counter after receiving the *last CQE* for this stream.
-    DecrementPendingIo,
     WakeHead { head: usize },
 }
 
@@ -328,16 +334,18 @@ pub(crate) enum RawSqeState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::with_slab_mut;
+    use crate::context;
     use crate::test_utils::*;
     use anyhow::Result;
     use io_uring::cqueue::CompletionFlags;
     use rstest::rstest;
+    use smallvec::SmallVec;
     use std::io::{self, ErrorKind};
     use std::sync::atomic::Ordering;
 
     #[test]
     fn test_raw_sqe_set_waker_logic() -> Result<()> {
+        init_local_runtime_and_context(None)?;
         let mut sqe = RawSqe::new(CompletionHandler::new_single());
 
         let (waker1, waker1_data) = mock_waker();
@@ -372,10 +380,9 @@ mod tests {
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
-        assert_eq!(
-            *sqe.on_completion(res, CompletionFlags::empty())?,
-            [CompletionEffect::DecrementPendingIo]
-        );
+        context::with_core(|core| core.increment_pending_ios(&waker));
+
+        assert!(sqe.on_completion(res, CompletionFlags::empty())?.is_none());
 
         assert!(sqe.is_ready());
         let got = sqe.take_final_result();
@@ -393,6 +400,10 @@ mod tests {
         // The waker was consumed and called
         assert_eq!(waker_data.get_count(), 1);
         assert!(sqe.waker.is_none());
+        assert_eq!(
+            context::with_core(|core| core.pending_ios.load(Ordering::Relaxed)),
+            0
+        );
 
         Ok(())
     }
@@ -407,7 +418,7 @@ mod tests {
         init_local_runtime_and_context(None)?;
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
 
-        with_slab_mut(|slab| -> Result<()> {
+        context::with_slab_mut(|slab| -> Result<()> {
             let batch = slab.reserve_batch(n_sqes)?;
             let indices = batch.keys();
             let head_idx = indices[0];
@@ -424,16 +435,15 @@ mod tests {
 
             let _ = batch.commit(entries)?;
 
-            for i in (0..n_sqes) {
+            for i in 0..n_sqes {
                 let raw = slab.get_mut(indices[i])?;
-                let effects = raw.on_completion(res, CompletionFlags::empty())?;
+                let effect = raw.on_completion(res, CompletionFlags::empty())?;
 
                 // Last SQE to complete triggers completion
                 if i == n_sqes - 1 {
-                    assert!(matches!(effects[0], CompletionEffect::DecrementPendingIo));
-                    assert!(matches!(effects[1], CompletionEffect::WakeHead { .. }));
+                    assert!(matches!(effect, Some(CompletionEffect::WakeHead { .. })));
                 } else {
-                    assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
+                    assert!(effect.is_none());
                 }
             }
 
@@ -452,11 +462,11 @@ mod tests {
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
+        context::with_core(|core| core.increment_pending_ios(&waker));
         assert_eq!(sqe.state, RawSqeState::Pending);
 
         for i in 1..=n {
-            let effects = sqe.on_completion(123, CompletionFlags::MORE)?;
-            assert!(effects.is_empty()); // NO DecrementPendingIo
+            assert!(sqe.on_completion(123, CompletionFlags::MORE)?.is_none());
             assert_eq!(waker_data.get_count(), i);
 
             assert!(sqe.has_waker(), "waker should NOT be consumed");
@@ -465,8 +475,7 @@ mod tests {
             assert!(matches!(sqe.pop_next_result()?, Some(123)));
         }
 
-        let effects = sqe.on_completion(789, CompletionFlags::empty())?;
-        assert_eq!(*effects, [CompletionEffect::DecrementPendingIo]);
+        assert!(sqe.on_completion(789, CompletionFlags::empty())?.is_none());
         assert_eq!(waker_data.get_count(), n + 1);
         assert!(!sqe.has_waker(), "waker SHOULD be consumed now");
 
@@ -485,7 +494,7 @@ mod tests {
         let raw = RawSqe::new(CompletionHandler::new_single());
         assert_eq!(raw.get_state(), RawSqeState::Pending);
 
-        with_slab_mut(|slab| -> Result<()> {
+        context::with_slab_mut(|slab| -> Result<()> {
             let (waker, waker_data) = mock_waker();
 
             let idx = {
@@ -498,13 +507,20 @@ mod tests {
             let inserted = slab.get_mut(idx).unwrap();
             assert_eq!(inserted.get_state(), RawSqeState::Pending);
 
+            // Mimick incrementing pending_io API after submit.
             inserted.set_waker(&waker);
+            context::with_core(|core| core.increment_pending_ios(&waker));
+
             assert!(inserted.on_completion(0, CompletionFlags::empty()).is_ok());
             assert_eq!(inserted.get_state(), RawSqeState::Ready);
 
             assert_eq!(waker_data.get_count(), 1);
             assert!(slab.try_remove(idx).is_some());
 
+            assert_eq!(
+                context::with_core(|core| core.pending_ios.load(Ordering::Relaxed)),
+                0
+            );
             Ok(())
         })
     }

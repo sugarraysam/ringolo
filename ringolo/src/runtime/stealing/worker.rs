@@ -56,7 +56,7 @@ impl EventLoop for Worker {
     /// from the head of the queue (LIFO).
     ///
     /// Another reason why this is a good choice is that it gives more time for
-    /// other threads ot find tasks in our stealable queue and try to load balance.
+    /// other threads to find tasks in our stealable queue and try to load balance.
     ///
     /// Always steal from back and pop from front to reduce contention.
     fn find_task(&self) -> Option<Self::Task> {

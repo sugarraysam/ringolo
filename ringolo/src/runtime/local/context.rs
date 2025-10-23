@@ -1,31 +1,47 @@
 // Expose rich API for developers even if unused.
 #![allow(dead_code)]
 
-use crate::context::Core;
 use crate::context::RawSqeSlab;
 use crate::context::SingleIssuerRing;
+use crate::context::{Core, Shared};
 use crate::runtime::RuntimeConfig;
+use crate::task::id::ROOT_FUTURE_ID;
 use crate::utils::ScopeGuard;
 use anyhow::Result;
 use std::cell::RefCell;
+use std::sync::Arc;
 
 pub(crate) struct Context {
     pub(crate) core: RefCell<Core>,
+
+    pub(crate) shared: Arc<Shared>,
 }
 
 impl Context {
     pub(crate) fn try_new(cfg: &RuntimeConfig) -> Result<Self> {
-        let core = Core::try_new(cfg)?;
+        let shared = Arc::new(Shared::new(cfg));
+        let core = Core::try_new(cfg, &shared)?;
 
         Ok(Self {
             core: RefCell::new(core),
+            shared,
         })
     }
 
     pub(crate) fn set_polling_root(&self) -> ScopeGuard<'_, impl FnOnce()> {
-        self.with_core(|c| c.polling_root_future.replace(true));
-        ScopeGuard::new(|| {
-            self.with_core(|c| c.polling_root_future.replace(false));
+        let prev_task_id = self.with_core(|c| {
+            c.polling_root_future.replace(true);
+            c.current_task_id.replace(Some(ROOT_FUTURE_ID))
+        });
+
+        // Should be None because by definition the root future has no parent.
+        debug_assert!(prev_task_id.is_none());
+
+        ScopeGuard::new(move || {
+            self.with_core(|c| {
+                c.polling_root_future.replace(false);
+                c.current_task_id.replace(prev_task_id);
+            })
         })
     }
 
@@ -38,11 +54,11 @@ impl Context {
     }
 
     #[inline(always)]
-    pub(crate) fn with_core_mut<F, R>(&self, f: F) -> R
+    pub(crate) fn with_shared<F, R>(&self, f: F) -> R
     where
-        F: FnOnce(&mut Core) -> R,
+        F: FnOnce(&Arc<Shared>) -> R,
     {
-        f(&mut self.core.borrow_mut())
+        f(&self.shared)
     }
 
     #[inline(always)]

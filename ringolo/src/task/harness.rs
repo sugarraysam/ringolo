@@ -1,3 +1,4 @@
+use crate::context::PendingIoOp;
 use crate::runtime::{PanicReason, Schedule, SchedulerPanic};
 use crate::task::error::panic_payload_as_str;
 use crate::task::layout::{Core, TaskLayout};
@@ -6,16 +7,16 @@ use crate::task::state::{State, TransitionToIdle, TransitionToRunning};
 use crate::task::trailer::Trailer;
 use crate::task::waker::waker_ref;
 use crate::task::{Header, Id, JoinError, Notified, Task};
-use crate::with_scheduler;
+use crate::{context, with_scheduler};
 
 use std::future::Future;
 
 use std::any::Any;
+use std::mem;
 use std::mem::ManuallyDrop;
 use std::panic;
 use std::ptr::NonNull;
 use std::task::{Context, Poll, Waker};
-use std::mem;
 
 /// Typed raw task handle.
 pub(super) struct Harness<T: Future, S: 'static> {
@@ -130,6 +131,9 @@ impl<T: Future, S: Schedule> Harness<T, S> {
             }
             PollFuture::Done => (),
             PollFuture::Panicked(payload) => {
+                // TODO: we might need to decrement pending IO if we implement
+                // panic handlers on the scheduler that ignore panics somehow.
+                // For now we always panic so we dont care.
                 self.complete();
                 with_scheduler!(|s| {
                     s.unhandled_panic(payload);
@@ -182,12 +186,12 @@ impl<T: Future, S: Schedule> Harness<T, S> {
                 if let TransitionToIdle::Cancelled = transition_res {
                     // The transition to idle failed because the task was
                     // cancelled during the poll.
-                    cancel_task(self.core());
+                    self.cancel_task();
                 }
                 transition_result_to_poll_future(transition_res)
             }
             TransitionToRunning::Cancelled => {
-                cancel_task(self.core());
+                self.cancel_task();
                 PollFuture::Complete
             }
             TransitionToRunning::Failed => PollFuture::Done,
@@ -210,7 +214,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
 
         // By transitioning the lifecycle to `Running`, we have permission to
         // drop the future.
-        cancel_task(self.core());
+        self.cancel_task();
         self.complete();
     }
 
@@ -265,6 +269,44 @@ impl<T: Future, S: Schedule> Harness<T, S> {
     }
 
     // ====== internal ======
+
+    /// Cancels the task and store the appropriate error in the stage field.
+    fn cancel_task(&self) {
+        let header_ptr = self.header_ptr();
+        let core = self.core();
+
+        // Since we are cancelling the task, we need to manually decrement
+        // pending IO to prevent scheduler from hanging. Normally this counter is
+        // decremented when a waker for a given task is woken up by value, but when
+        // we forcibly cancel a task, the following sequence of events happens:
+        // (1) `mem::forget(task)` is called after releasing the task from the
+        //     scheduler, dropping the future state machine.
+        // (2) SQE backends associated with the task are dropped.
+        // (3) RawSqe's associated with these SQE backends are dropped.
+        //
+        // This means the next time we call `process_cqes`, any CQEs that would have
+        // been associated with these RawSqe will be dropped without decrementing
+        // pending_ios.
+        //
+        // Also, we use the cold path to decrement pending IOs through the shared
+        // context because cancellation might have been initiated by the parent
+        // task on a separate thread, and we need to make sure we decrement pending
+        // IOs on the thread that owns this task.
+        context::with_shared(|shared| unsafe {
+            shared.modify_pending_ios(
+                Header::get_owner_id(header_ptr),
+                PendingIoOp::Decrement,
+                Header::get_pending_ios(header_ptr) as usize,
+            );
+        });
+
+        // Drop the future from a panic guard.
+        let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+            core.drop_future_or_output();
+        }));
+
+        core.store_output(Err(panic_result_to_join_error(core.id, res)));
+    }
 
     /// Completes the task. This method assumes that the state is RUNNING.
     fn complete(self) {
@@ -333,16 +375,6 @@ enum PollFuture {
     Done,
     Dealloc,
     Panicked(SchedulerPanic),
-}
-
-/// Cancels the task and store the appropriate error in the stage field.
-fn cancel_task<T: Future, S: Schedule>(core: &Core<T, S>) {
-    // Drop the future from a panic guard.
-    let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        core.drop_future_or_output();
-    }));
-
-    core.store_output(Err(panic_result_to_join_error(core.id, res)));
 }
 
 fn panic_result_to_join_error(
