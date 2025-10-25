@@ -5,12 +5,13 @@ use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
-use crate::task::ThreadId;
+use crate::task::TaskNodeGuard;
 use anyhow::{Result, anyhow};
 use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::pin::pin;
 use std::task::Poll;
+use std::thread::ThreadId;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
@@ -173,7 +174,7 @@ impl Worker {
         loop {
             if scheduler.reset_root_woken() && root_result.is_none() {
                 dbg!("polling root future");
-                let _g = ctx.set_polling_root();
+                let _guard = TaskNodeGuard::enter_root_node();
 
                 if let Poll::Ready(v) = root_fut.as_mut().poll(&mut cx) {
                     root_result = Some(v);
@@ -189,10 +190,14 @@ impl Worker {
             } else {
                 // No more work to do. This means it is time to poll the root future.
                 if ctx.with_core(|core| core.get_pending_ios() == 0) {
-                    // By definition if there are no pending IOs, then we should have no `ready_cqes`
-                    // and no `unsubmitted_sqes` because we have a 1:1 mapping between RawSqe <-> SQE.
-                    debug_assert!(!data.has_ready_cqes);
-                    debug_assert!(data.unsubmitted_sqes == 0);
+                    #[cfg(debug_assertions)]
+                    {
+                        // By definition if there are no pending IOs, then we should have no `ready_cqes`
+                        // and no `unsubmitted_sqes` because we have a 1:1 mapping between RawSqe <-> SQE.
+                        data.update(ctx);
+                        assert!(!data.has_ready_cqes);
+                        assert_eq!(data.unsubmitted_sqes, 0);
+                    }
 
                     match root_result.is_some() {
                         true => return Ok(root_result.unwrap()),

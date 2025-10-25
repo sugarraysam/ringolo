@@ -1,13 +1,14 @@
 use crate::context::Shared;
-use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::stealing::worker::Worker;
 use crate::runtime::{
-    AddMode, OwnedTasks, PanicReason, Schedule, SchedulerPanic, TaskOpts, YieldReason,
+    AddMode, OwnedTasks, PanicReason, RuntimeConfig, Schedule, SchedulerPanic, TaskMetadata,
+    TaskOpts, TaskRegistry, YieldReason,
 };
 use crate::sqe::IoError;
-use crate::task::{JoinHandle, Notified, Task};
+use crate::task::{Id, JoinHandle, Notified, Task};
 use crate::utils::scheduler::{Call, Method, Tracker};
 use crossbeam_deque::{Injector, Worker as CbWorker};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
 use std::task::Waker;
@@ -19,7 +20,7 @@ pub struct Scheduler {
     /// Runtime confguration to be injected in context and worker
     pub(crate) cfg: RuntimeConfig,
 
-    pub(crate) tasks: OwnedTasks<Handle>,
+    pub(crate) tasks: Arc<OwnedTasks<Handle>>,
 
     /// The global injector queue for new tasks.
     pub(crate) injector: Arc<Injector<StealableTask>>,
@@ -124,6 +125,10 @@ impl Schedule for Handle {
     fn unhandled_panic(&self, payload: SchedulerPanic) {
         unimplemented!("todo");
     }
+
+    fn task_registry(&self) -> Arc<dyn TaskRegistry> {
+        self.tasks.clone()
+    }
 }
 
 impl Handle {
@@ -131,14 +136,20 @@ impl Handle {
         unimplemented!("TODO");
     }
 
-    pub(crate) fn spawn<F>(&self, future: F, task_opts: Option<TaskOpts>) -> JoinHandle<F::Output>
+    pub(crate) fn spawn<F>(
+        &self,
+        future: F,
+        opts: Option<TaskOpts>,
+        metadata: Option<TaskMetadata>,
+    ) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
         let id = crate::task::Id::next();
 
-        let (task, notified, join_handle) = crate::task::new_task(future, task_opts, self.clone());
+        let (task, notified, join_handle) =
+            crate::task::new_task(future, opts, metadata, self.clone());
 
         // TODO: insert task take ownership
         // debug_assert!(self.tasks.insert(task).is_none());

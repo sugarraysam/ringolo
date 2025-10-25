@@ -302,7 +302,7 @@ impl<T> JoinHandle<T> {
     /// [task ID]: crate::task::Id
     pub fn id(&self) -> Id {
         // Safety: The header pointer is valid.
-        unsafe { Header::get_id(self.raw.header_ptr()) }
+        unsafe { Header::get_task_node(self.raw.header_ptr()).id }
     }
 
     pub fn get_result(self) -> Result<T> {

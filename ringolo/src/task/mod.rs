@@ -1,4 +1,7 @@
-use crate::runtime::{Schedule, TaskOpts};
+use crate::{
+    runtime::{Schedule, TaskOpts},
+    spawn::TaskMetadata,
+};
 
 // Public API
 pub mod abort;
@@ -12,7 +15,7 @@ pub use self::join::JoinHandle;
 
 // Re-exports
 pub mod id;
-pub(crate) use self::id::{Id, ThreadId};
+pub(crate) use self::id::Id;
 
 mod harness;
 
@@ -20,6 +23,9 @@ mod header;
 pub(crate) use self::header::Header;
 
 pub mod layout;
+
+pub(crate) mod node;
+pub(crate) use node::{CancellationStats, TaskNode, TaskNodeGuard};
 
 pub mod raw;
 pub(crate) use self::raw::RawTask;
@@ -46,7 +52,8 @@ pub(crate) type Result<T> = std::result::Result<T, JoinError>;
 /// notification.
 pub(crate) fn new_task<T, S>(
     task: T,
-    task_opts: Option<TaskOpts>,
+    opts: Option<TaskOpts>,
+    metadata: Option<TaskMetadata>,
     scheduler: S,
 ) -> (Task<S>, Notified<S>, JoinHandle<T::Output>)
 where
@@ -54,7 +61,7 @@ where
     T: Future + 'static,
     T::Output: 'static,
 {
-    let raw = RawTask::new::<T, S>(task, task_opts, scheduler);
+    let raw = RawTask::new::<T, S>(task, opts, metadata, scheduler);
     let task = Task::new(raw);
     let notified = Notified::new(Task::new(raw));
     let join = JoinHandle::new(raw);

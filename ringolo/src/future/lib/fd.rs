@@ -1,7 +1,5 @@
-#![allow(dead_code)]
-
 use crate::future::lib::{Close, OpcodeError};
-use crate::runtime::CleanupTaskBuilder;
+use crate::runtime::{CleanupTaskBuilder, spawn_cleanup};
 use either::Either;
 use io_uring::types::{DestinationSlot, Fd, Fixed};
 use std::marker::PhantomData;
@@ -97,7 +95,7 @@ struct SharedUringFdState {
 impl Drop for SharedUringFdState {
     fn drop(&mut self) {
         let task = CleanupTaskBuilder::new(Close::new(self.kind.as_raw_or_direct()));
-        crate::runtime::spawn_cleanup(task);
+        spawn_cleanup(task);
     }
 }
 
@@ -254,7 +252,7 @@ impl OwnedUringFd {
         match &self.state.kind {
             UringFdKindInner::Raw(fd) => *fd,
             _ => {
-                panic!("Unexpected UringFd variant");
+                panic_unexpected_variant();
             }
         }
     }
@@ -268,7 +266,7 @@ impl OwnedUringFd {
         match &self.state.kind {
             UringFdKindInner::Fixed(slot) => *slot,
             _ => {
-                panic!("Unexpected UringFd variant");
+                panic_unexpected_variant();
             }
         }
     }
@@ -346,7 +344,7 @@ impl<'a> BorrowedUringFd<'a> {
         match &self.kind {
             UringFdKindInner::Raw(fd) => *fd,
             _ => {
-                panic!("Unexpected UringFd variant");
+                panic_unexpected_variant();
             }
         }
     }
@@ -360,10 +358,17 @@ impl<'a> BorrowedUringFd<'a> {
         match &self.kind {
             UringFdKindInner::Fixed(slot) => *slot,
             _ => {
-                panic!("Unexpected UringFd variant");
+                panic_unexpected_variant();
             }
         }
     }
+}
+
+// Prevent CPU branch prediction from pulling in panic unwind code.
+#[cold]
+#[track_caller]
+fn panic_unexpected_variant() -> ! {
+    panic!("Unexpected UringFd variant");
 }
 
 impl PartialEq for OwnedUringFd {
@@ -472,7 +477,9 @@ mod tests {
         crate::with_scheduler!(|s| {
             let spawn_calls = s.tracker.get_calls(&Method::Spawn);
             assert_eq!(spawn_calls.len(), 1);
-            assert!(matches!(spawn_calls[0], Call::Spawn { opts } if opts == TaskOpts::STICKY));
+            assert!(
+                matches!(spawn_calls[0], Call::Spawn { opts, .. } if opts == TaskOpts::STICKY | TaskOpts::BACKGROUND_TASK)
+            );
         });
 
         Ok(())

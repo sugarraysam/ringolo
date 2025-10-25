@@ -1,9 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{Schedule, TaskOpts};
-
+use crate::runtime::{Schedule, TaskMetadata, TaskOpts};
 use crate::task::harness::Harness;
-use crate::task::id::TaskIdGuard;
+use crate::task::node::{TaskNode, TaskNodeGuard};
 use crate::task::state::State;
 use crate::task::trailer::Trailer;
 use crate::task::{Header, Id, Notified, Task};
@@ -13,6 +12,7 @@ use std::future::Future;
 use std::mem;
 use std::pin::Pin;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 /// The task cell. Contains the components of the task.
@@ -23,16 +23,16 @@ use std::task::{Context, Poll, Waker};
 /// Any changes to the layout of this struct _must_ also be reflected in the
 /// `const` fns in raw.rs.
 ///
-// # This struct should be cache padded to avoid false sharing. The cache padding rules are copied
-// from crossbeam-utils/src/cache_padded.rs
+// This struct is cache padded on 64 bytes boundary to avoid false sharing
+// between tasks. We use a full cache line for the header with `align(64)` so
+// Core + Trailer will require one or more separate 64 bytes cache line. This way
+// if another TaskLayout is in memory after this one, we are guaranteed threads
+// won't invalidate each other's cache lines.
 //
-// Starting from Intel's Sandy Bridge, spatial prefetcher is now pulling pairs of 64-byte cache
-// lines at a time, so we have to align to 128 bytes rather than 64.
-//
-// Sources:
-// - https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf
-// - https://github.com/facebook/folly/blob/1b5288e6eea6df074758f877c849b6e73bbb9fbb/folly/lang/Align.h#L107
-#[repr(C)]
+// This alignment should work on most platforms but there are other edge cases
+// described in `crossbeam-utils/src/cache_padded.rs` if we want to improve
+// portability.
+#[repr(C, align(64))]
 pub(super) struct TaskLayout<T: Future, S> {
     /// Hot task state data
     pub(super) header: Header,
@@ -49,18 +49,19 @@ impl<T: Future, S: Schedule> TaskLayout<T, S> {
     /// structures.
     pub(super) fn new(
         future: T,
-        task_opts: Option<TaskOpts>,
+        opts: Option<TaskOpts>,
+        metadata: Option<TaskMetadata>,
         scheduler: S,
         state: State,
     ) -> Box<TaskLayout<T, S>> {
         let vtable = vtable::<T, S>();
-        let id = Id::next();
+        let registry = scheduler.task_registry();
 
         let result = Box::new(TaskLayout {
-            header: Header::new(state, vtable, task_opts, id),
+            header: Header::new(state, vtable, opts),
             core: Core {
                 scheduler,
-                id,
+                task_node: TaskNode::new(Id::next(), opts, metadata, registry),
                 stage: CoreStage {
                     stage: UnsafeCell::new(Stage::Running(future)),
                 },
@@ -71,7 +72,11 @@ impl<T: Future, S: Schedule> TaskLayout<T, S> {
         #[cfg(debug_assertions)]
         {
             // Using a separate function for this code avoids instantiating it separately for every `T`.
-            unsafe fn check<S>(header: &Header, trailer: &Trailer, scheduler: &S) {
+            unsafe fn check<T: Future, S: Schedule>(
+                header: &Header,
+                trailer: &Trailer,
+                scheduler: &S,
+            ) {
                 let scheduler_addr = scheduler as *const S as usize;
                 let scheduler_ptr = unsafe { Header::get_scheduler::<S>(NonNull::from(header)) };
                 assert_eq!(scheduler_addr, scheduler_ptr.as_ptr() as usize);
@@ -79,10 +84,15 @@ impl<T: Future, S: Schedule> TaskLayout<T, S> {
                 let trailer_addr = trailer as *const Trailer as usize;
                 let trailer_ptr = unsafe { Header::get_trailer(NonNull::from(header)) };
                 assert_eq!(trailer_addr, trailer_ptr.as_ptr() as usize);
+
+                // Check alignment and CPU cache line friendliness.
+                assert_eq!(std::mem::size_of::<Header>(), 32);
+                assert_eq!(std::mem::align_of::<Header>(), 32);
+                assert_eq!(std::mem::align_of::<TaskLayout<T, S>>(), 64);
             }
 
             unsafe {
-                check(&result.header, &result.trailer, &result.core.scheduler);
+                check::<T, S>(&result.header, &result.trailer, &result.core.scheduler);
             }
         }
 
@@ -102,7 +112,7 @@ pub(super) struct Core<T: Future, S> {
     pub(super) scheduler: S,
 
     /// The task's ID, used for populating `JoinError`s.
-    pub(super) id: Id,
+    pub(super) task_node: Arc<TaskNode>,
 
     /// Either the future or the output.
     pub(super) stage: CoreStage<T>,
@@ -152,7 +162,7 @@ impl<T: Future, S: 'static> Core<T, S> {
                 // Safety: The caller ensures the future is pinned.
                 let future = unsafe { Pin::new_unchecked(future) };
 
-                let _guard = TaskIdGuard::enter(self.id);
+                let _guard = TaskNodeGuard::enter(Arc::clone(&self.task_node));
                 future.poll(&mut cx)
             })
         };
@@ -199,13 +209,13 @@ impl<T: Future, S: 'static> Core<T, S> {
             // Safety:: the caller ensures mutual exclusion to the field.
             match mem::replace(unsafe { &mut *ptr }, Stage::Consumed) {
                 Stage::Finished(output) => output,
-                _ => panic!("JoinHandle polled after completion"),
+                _ => unreachable!("JoinHandle polled after completion"),
             }
         })
     }
 
     unsafe fn set_stage(&self, stage: Stage<T>) {
-        let _guard = TaskIdGuard::enter(self.id);
+        let _guard = TaskNodeGuard::enter(Arc::clone(&self.task_node));
         self.stage.with_mut(|ptr| *ptr = stage);
     }
 }
@@ -237,6 +247,9 @@ pub(crate) struct Vtable {
 
     /// The number of bytes that the `scheduler` field is offset from the header.
     pub(super) scheduler_offset: usize,
+
+    /// The number of bytes that the `Arc<TaskNode>` field is offset from the header.
+    pub(super) task_node_offset: usize,
 }
 
 /// Get the vtable for the requested `T` and `S` generics.
@@ -251,6 +264,7 @@ pub(crate) fn vtable<T: Future, S: Schedule>() -> &'static Vtable {
         shutdown: shutdown::<T, S>,
         trailer_offset: OffsetHelper::<T, S>::TRAILER_OFFSET,
         scheduler_offset: OffsetHelper::<T, S>::SCHEDULER_OFFSET,
+        task_node_offset: OffsetHelper::<T, S>::TASK_NODE_OFFSET,
     }
 }
 
@@ -276,6 +290,13 @@ impl<T: Future, S: Schedule> OffsetHelper<T, S> {
     const SCHEDULER_OFFSET: usize = get_core_offset(
         std::mem::size_of::<Header>(),
         std::mem::align_of::<Core<T, S>>(),
+    );
+
+    const TASK_NODE_OFFSET: usize = get_task_node_offset(
+        std::mem::size_of::<Header>(),
+        std::mem::align_of::<Core<T, S>>(),
+        std::mem::size_of::<S>(),
+        std::mem::align_of::<Arc<TaskNode>>(),
     );
 }
 
@@ -317,6 +338,28 @@ const fn get_core_offset(header_size: usize, core_align: usize) -> usize {
     let core_misalign = offset % core_align;
     if core_misalign > 0 {
         offset += core_align - core_misalign;
+    }
+
+    offset
+}
+
+/// Compute the offset of the `Arc<TaskNode>` field in `Cell<T, S>` using the
+/// `#[repr(C)]` algorithm.
+///
+/// Pseudo-code for the `#[repr(C)]` algorithm can be found here:
+/// <https://doc.rust-lang.org/reference/type-layout.html#reprc-structs>
+const fn get_task_node_offset(
+    header_size: usize,
+    core_align: usize,
+    scheduler_size: usize,
+    task_node_align: usize,
+) -> usize {
+    let mut offset = get_core_offset(header_size, core_align);
+    offset += scheduler_size;
+
+    let task_node_misalign = offset % task_node_align;
+    if task_node_misalign > 0 {
+        offset += task_node_align - task_node_misalign;
     }
 
     offset

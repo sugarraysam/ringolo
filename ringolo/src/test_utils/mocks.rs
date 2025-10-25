@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{AddMode, Schedule, SchedulerPanic, YieldReason};
+use crate::runtime::{AddMode, Schedule, SchedulerPanic, TaskRegistry, YieldReason};
 use crate::task::layout::vtable;
 use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
@@ -29,6 +29,19 @@ impl Schedule for DummyScheduler {
     fn unhandled_panic(&self, _payload: SchedulerPanic) {
         unimplemented!("dummy scheduler");
     }
+
+    fn task_registry(&self) -> Arc<dyn TaskRegistry> {
+        Arc::new(DummyTaskRegistry)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DummyTaskRegistry;
+
+impl TaskRegistry for DummyTaskRegistry {
+    fn shutdown(&self, _id: &Id) {
+        unimplemented!("dummy task registry");
+    }
 }
 
 #[repr(C)]
@@ -47,7 +60,7 @@ impl WakerData {
         let vtable = vtable::<Ready<()>, DummyScheduler>();
 
         Self {
-            header: Header::new(State::new(), vtable, None, Id::next()),
+            header: Header::new(State::new(), vtable, None),
             wake_count: AtomicUsize::new(0),
         }
     }
@@ -56,7 +69,7 @@ impl WakerData {
         self.wake_count.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn get_pending_ios(&self) -> u16 {
+    pub(crate) fn get_pending_ios(&self) -> u32 {
         unsafe {
             let ptr = ptr::addr_of!(self.header) as *mut Header;
             Header::get_pending_ios(NonNull::new_unchecked(ptr))

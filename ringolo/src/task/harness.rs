@@ -305,7 +305,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
             core.drop_future_or_output();
         }));
 
-        core.store_output(Err(panic_result_to_join_error(core.id, res)));
+        core.store_output(Err(panic_result_to_join_error(core.task_node.id, res)));
     }
 
     /// Completes the task. This method assumes that the state is RUNNING.
@@ -360,7 +360,10 @@ impl<T: Future, S: Schedule> Harness<T, S> {
         // never destroyed, so that's ok.
         let me = ManuallyDrop::new(self.get_new_task());
 
-        if let Some(task) = self.core().scheduler.release(&me) {
+        let core = self.core();
+        core.task_node.release();
+
+        if let Some(task) = core.scheduler.release(&me) {
             mem::forget(task);
             2
         } else {
@@ -415,10 +418,7 @@ fn poll_future<T: Future, S: Schedule>(
     let (scheduler_panic, output) = match output {
         Ok(Poll::Pending) => return Poll::Pending,
         Ok(Poll::Ready(output)) => (None, Ok(output)),
-        Err(panic) => {
-            let (scheduler_panic, join_error) = parse_panic(core.id, panic);
-            (Some(scheduler_panic), Err(join_error))
-        }
+        Err(panic) => parse_panic::<T::Output>(core.task_node.id, panic),
     };
 
     // Store output for JoinHandle to reap before we panic.
@@ -438,7 +438,11 @@ fn poll_future<T: Future, S: Schedule>(
     Poll::Ready(panic_payload)
 }
 
-fn parse_panic(task_id: Id, panic: Box<dyn Any + Send + 'static>) -> (SchedulerPanic, JoinError) {
+#[cold]
+fn parse_panic<T>(
+    task_id: Id,
+    panic: Box<dyn Any + Send + 'static>,
+) -> (Option<SchedulerPanic>, Result<T, JoinError>) {
     let scheduler_panic = {
         if let Some(payload) = panic.downcast_ref::<SchedulerPanic>() {
             payload.clone()
@@ -448,5 +452,5 @@ fn parse_panic(task_id: Id, panic: Box<dyn Any + Send + 'static>) -> (SchedulerP
         }
     };
 
-    (scheduler_panic, JoinError::panic(task_id, panic))
+    (Some(scheduler_panic), Err(JoinError::panic(task_id, panic)))
 }

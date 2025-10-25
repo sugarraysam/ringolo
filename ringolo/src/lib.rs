@@ -10,7 +10,12 @@ mod future;
 pub use future::experimental::time;
 
 pub mod runtime;
-pub use runtime::{block_on, cancel_all_children, cancel_all_leaf_children, spawn};
+pub use runtime::{block_on, spawn, spawn_builder};
+
+pub use runtime::{
+    recursive_cancel_all, recursive_cancel_all_metadata, recursive_cancel_all_orphans,
+    recursive_cancel_any_metadata, recursive_cancel_leaf,
+};
 
 mod sqe;
 

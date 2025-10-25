@@ -1,34 +1,41 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{Schedule, TaskOpts};
+use crate::runtime::{Schedule, TaskMetadata, TaskOpts};
+use crate::task::Header;
 use crate::task::layout::TaskLayout;
+use crate::task::node::TaskNode;
 use crate::task::state::{Snapshot, State, TransitionToNotifiedByRef, TransitionToNotifiedByVal};
 use crate::task::trailer::Trailer;
-use crate::task::Header;
 use std::future::Future;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::task::Waker;
 
 /// Raw task handle
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct RawTask {
     ptr: NonNull<Header>,
 }
 
 impl RawTask {
-    pub(super) fn new<T, S>(task: T, task_opts: Option<TaskOpts>, scheduler: S) -> RawTask
+    pub(super) fn new<T, S>(
+        task: T,
+        opts: Option<TaskOpts>,
+        metadata: Option<TaskMetadata>,
+        scheduler: S,
+    ) -> RawTask
     where
         T: Future + 'static,
         S: Schedule,
     {
         let ptr = Box::into_raw(TaskLayout::<_, S>::new(
             task,
-            task_opts,
+            opts,
+            metadata,
             scheduler,
             State::new(),
         ));
         let ptr = unsafe { NonNull::new_unchecked(ptr.cast()) };
-
         RawTask { ptr }
     }
 
@@ -59,8 +66,12 @@ impl RawTask {
         &self.header().state
     }
 
+    pub(super) fn task_node(&self) -> Arc<TaskNode> {
+        unsafe { Header::get_task_node(self.ptr) }
+    }
+
     /// Safety: mutual exclusion is required to call this function.
-    pub(crate) fn poll(self) {
+    pub(super) fn poll(self) {
         let vtable = self.header().vtable;
         unsafe { (vtable.poll)(self.ptr) }
     }
@@ -95,6 +106,7 @@ impl RawTask {
     }
 
     pub(super) fn shutdown(self) {
+        // TODO: call through TaskNode, make sure OnceLock enforced, single shutdown
         let vtable = self.header().vtable;
         unsafe { (vtable.shutdown)(self.ptr) }
     }

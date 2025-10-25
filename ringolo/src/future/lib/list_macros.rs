@@ -47,11 +47,11 @@ macro_rules! any_extract {
             Err(e) => Err(e),
             Ok(any_op) => match any_op {
                 $crate::future::lib::list::AnyOpOutput::$variant(inner) => Ok(inner),
-                other => panic!(
-                    "any_extract: type mismatch. Expected {} but got {:?}",
+                other => $crate::future::lib::list_macros::panic_any_extract(format!(
+                    "Type mismatch expected {} but got {:?}",
                     stringify!($crate::future::lib::list::AnyOpOutput::$variant),
-                    other
-                ),
+                    other,
+                )),
             },
         }
     };
@@ -87,10 +87,8 @@ macro_rules! any_extract_all {
 
         // 2. Runtime length check
         if vec.len() != expected_len {
-            panic!(
-                "any_extract: assertion failed: expected {} outputs but got {}",
-                expected_len,
-                vec.len()
+            $crate::future::lib::list_macros::panic_any_extract(
+                format!("expected {} outputs but got {}", expected_len, vec.len())
             );
         }
 
@@ -106,4 +104,13 @@ macro_rules! any_extract_all {
             }),+
         )
     }};
+}
+
+#[cold]
+#[track_caller]
+pub(crate) fn panic_any_extract<M>(msg: M) -> !
+where
+    M: std::fmt::Display,
+{
+    panic!("FATAL: any_extract error: {msg}.")
 }

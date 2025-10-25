@@ -1,11 +1,13 @@
 use crate::sqe::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListBuilder, SqeListKind};
-use anyhow::Result;
+use crate::task::TaskNode;
+use anyhow::{Context, Result};
 use io_uring::opcode::{Fsync, Nop, OpenAt, Read, Write};
 use io_uring::squeue::Entry;
 use io_uring::types::Fd;
 use std::ffi::CString;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::sync::Arc;
 
 // Exports
 pub(crate) mod context;
@@ -16,6 +18,19 @@ pub(crate) use future::*;
 
 pub(crate) mod mocks;
 pub(crate) use mocks::{DummyScheduler, mock_waker};
+
+pub(crate) fn compute_task_node_tree_size(root: Arc<TaskNode>) -> Result<usize> {
+    let mut total = 0;
+    let mut to_visit = vec![root];
+
+    while !to_visit.is_empty() {
+        let curr = to_visit.pop().context("nothing to visit")?;
+        total += 1;
+        to_visit.extend(curr.clone_children());
+    }
+
+    Ok(total)
+}
 
 // Make sure to keep `data` and `File` alive until SQ has been submitted.
 // We write-fsync-read and skip open+close because the tempfile library is

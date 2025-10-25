@@ -1,4 +1,5 @@
 use crate::runtime::{AddMode, PanicReason, TaskOpts, YieldReason};
+use crate::spawn::TaskMetadata;
 use crate::task::Id;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ pub(crate) enum Call {
     },
     Spawn {
         opts: TaskOpts,
+        metadata: Option<TaskMetadata>,
     },
     UnhandledPanic {
         reason: PanicReason,

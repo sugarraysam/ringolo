@@ -129,7 +129,7 @@ mod tests {
     use super::*;
     use crate::context::with_slab;
     use crate::future::lib::AsyncCancel;
-    use crate::runtime::Builder;
+    use crate::runtime::{Builder, spawn_cleanup};
     use crate::test_utils::init_local_runtime_and_context;
     use crate::utils::scheduler::{Call, Method};
     use crate::{
@@ -189,7 +189,7 @@ mod tests {
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
         let task = CleanupTaskBuilder::new(AsyncCancel::new(builder)).with_slab_entry(user_data);
 
-        let handle = crate::runtime::spawn_cleanup(task);
+        let handle = spawn_cleanup(task);
 
         ringolo::block_on(async {
             assert!(handle.await.is_ok());
@@ -217,7 +217,7 @@ mod tests {
         let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
         let task = CleanupTaskBuilder::new(AsyncCancel::new(builder)).with_slab_entry(user_data);
 
-        let handle = crate::runtime::spawn_cleanup(task);
+        let handle = spawn_cleanup(task);
 
         let root_res = std::panic::catch_unwind(|| {
             ringolo::block_on(async {

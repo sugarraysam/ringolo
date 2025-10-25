@@ -1,24 +1,27 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::context;
 use crate::runtime::TaskOpts;
-use crate::task::id::{Id, ThreadId};
 use crate::task::layout::Vtable;
+use crate::task::node::TaskNode;
 use crate::task::state::State;
 use crate::task::trailer::Trailer;
 use std::cell::Cell;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::thread::ThreadId;
 
 /// Headers are accessed all the time and represent thin-pointers to Task (i.e.: future).
-/// We need them to be memory efficient, and ideally have an optimal alignment.
-/// The structure now stands at 32 bytes:
-/// - 8 bytes :: state (atomic_usize)
-/// - 8 bytes :: vtable (ptr)
-/// - 8 bytes :: id (u64)
-/// - 4 bytes :: thread_id (u32)
-/// - 2 bytes :: pending_io (u16)
-/// - 2 bytes :: task_opts (u16)
-#[repr(C)]
+/// We can only store "hot data" in this struct, and we must only add values that are accessed
+/// by the current thread to prevent false sharing. We should also optimize the layout for maximum
+/// CPU cache friendliness, which a CPU cache line is 64 to 128 bytes.
+///
+/// The structure now stands at 30 bytes:
+/// - 8 bytes  :: state (atomic_usize)
+/// - 8 bytes  :: vtable (ptr)
+/// - 8 bytes  :: thread_id (u64)
+/// - 4 bytes  :: pending_io (u32)
+/// - 2 byte   :: task_opts (u16)
+#[repr(C, align(32))]
 pub(crate) struct Header {
     /// Task state.
     pub(super) state: State,
@@ -28,20 +31,14 @@ pub(crate) struct Header {
 
     pub(super) owner_id: Cell<ThreadId>,
 
-    /// Task id which can also used as the tracing::Id. Tight integration with
-    /// tracing library to save few bytes in Header field. We store it in hot
-    /// data as we update the thread local context before polling any task, and
-    /// leverage the field constantly for task tracing.
-    pub(super) id: Id,
-
     /// We keep track of all locally scheduled IOs on io_uring as a signal to
     /// determine if a task can safely be stolen by another thread. This is
     /// because completion will arrive on the thread that registered the
     /// submissions.
-    pub(super) pending_ios: Cell<u16>,
+    pub(super) pending_ios: Cell<u32>,
 
     /// Special task options to modify scheduling behaviour.
-    pub(super) opts: Cell<TaskOpts>,
+    pub(super) opts: TaskOpts,
 }
 
 unsafe impl Send for Header {}
@@ -52,23 +49,17 @@ impl Header {
         state: State,
         vtable: &'static Vtable,
         task_opts: Option<TaskOpts>,
-        id: Id,
     ) -> Header {
         Header {
             state,
             vtable,
-            owner_id: Cell::new(context::current_thread_id()),
-            id,
+            owner_id: Cell::new(std::thread::current().id()),
             pending_ios: Cell::new(0),
-            opts: Cell::new(task_opts.unwrap_or_default()),
+            opts: task_opts.unwrap_or_default(),
         }
     }
 
     /// Gets a pointer to the `Trailer` of the task containing this `Header`.
-    ///
-    /// # Safety
-    ///
-    /// The provided raw pointer must point at the header of a task.
     pub(super) unsafe fn get_trailer(me: NonNull<Header>) -> NonNull<Trailer> {
         let offset = me.as_ref().vtable.trailer_offset;
         let trailer = me.as_ptr().cast::<u8>().add(offset).cast::<Trailer>();
@@ -76,10 +67,6 @@ impl Header {
     }
 
     /// Gets a pointer to the scheduler of the task containing this `Header`.
-    ///
-    /// # Safety
-    ///
-    /// The provided raw pointer must point at the header of a task.
     ///
     /// The generic type S must be set to the correct scheduler type for this
     /// task.
@@ -89,31 +76,28 @@ impl Header {
         NonNull::new_unchecked(scheduler)
     }
 
+    pub(super) unsafe fn get_task_node(me: NonNull<Header>) -> Arc<TaskNode> {
+        let offset = me.as_ref().vtable.task_node_offset;
+        let task_node = me.as_ptr().cast::<u8>().add(offset).cast::<Arc<TaskNode>>();
+        (*task_node).clone()
+    }
+
     /// Gets the owner_id of the task containing this `Header`.
-    ///
-    /// # Safety
-    ///
-    /// The provided raw pointer must point at the header of a task.
     pub(crate) unsafe fn get_owner_id(me: NonNull<Header>) -> ThreadId {
         me.as_ref().owner_id.get()
     }
 
-    /// Gets the id of the task containing this `Header`.
-    ///
-    /// # Safety
-    ///
-    /// The provided raw pointer must point at the header of a task.
-    pub(crate) unsafe fn get_id(me: NonNull<Header>) -> Id {
-        me.as_ref().id
+    pub(crate) unsafe fn set_owner_id(me: NonNull<Header>, owner_id: ThreadId) {
+        me.as_ref().owner_id.set(owner_id);
     }
 
     /// Get pending ios on local thread.
-    pub(crate) unsafe fn get_pending_ios(me: NonNull<Header>) -> u16 {
+    pub(crate) unsafe fn get_pending_ios(me: NonNull<Header>) -> u32 {
         me.as_ref().pending_ios.get()
     }
 
     /// Modify pending ios.
-    pub(crate) unsafe fn modify_pending_ios(me: NonNull<Header>, delta: i16) {
+    pub(crate) unsafe fn modify_pending_ios(me: NonNull<Header>, delta: i32) {
         me.as_ref()
             .pending_ios
             .update(|x| x.checked_add_signed(delta).expect("underflow"));
@@ -129,7 +113,7 @@ impl Header {
     pub(crate) unsafe fn is_stealable(me: NonNull<Header>) -> bool {
         let ptr = me.as_ref();
 
-        let is_sticky = ptr.opts.get().contains(TaskOpts::STICKY);
+        let is_sticky = ptr.opts.contains(TaskOpts::STICKY);
         let has_pending_ios = ptr.pending_ios.get() > 0;
 
         !is_sticky && !has_pending_ios

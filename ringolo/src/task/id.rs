@@ -1,4 +1,3 @@
-use crate::context;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use std::{fmt, num::NonZeroU32, num::NonZeroU64};
@@ -24,34 +23,29 @@ use std::{fmt, num::NonZeroU32, num::NonZeroU64};
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct Id(pub(crate) NonZeroU64);
 
-const ROOT_FUTURE_ID_VAL: u64 = 1;
-pub static ROOT_FUTURE_ID: Id = Id(NonZeroU64::new(ROOT_FUTURE_ID_VAL).unwrap());
+impl Id {
+    pub(crate) fn is_root(&self) -> bool {
+        self == &ROOT_ID
+    }
 
-/// Returns the [`Id`] of the currently running task.
-///
-/// # Panics
-///
-/// This function panics if called from outside a task. Please note that calls
-/// to `block_on` do not have task IDs, so the method will panic if called from
-/// within a call to `block_on`. For a version of this function that doesn't
-/// panic, see [`task::try_id()`](crate::runtime::task::try_id()).
-///
-/// [task ID]: crate::task::Id
-pub fn id() -> Id {
-    context::current_task_id().expect("Can't get a task id when not inside a task")
+    pub(crate) fn is_orphan_root(&self) -> bool {
+        self == &ORPHAN_ROOT_ID
+    }
 }
 
-/// Returns the [`Id`] of the currently running task, or `None` if called outside
-/// of a task.
-///
-/// This function is similar to  [`task::id()`](crate::runtime::task::id()), except
-/// that it returns `None` rather than panicking if called outside of a task
-/// context.
-///
-/// [task ID]: crate::task::Id
-pub fn try_id() -> Option<Id> {
-    context::current_task_id()
-}
+const ROOT_ID_VAL: u64 = 1;
+pub static ROOT_ID: Id = Id(NonZeroU64::new(ROOT_ID_VAL).unwrap());
+
+const ORPHAN_ROOT_ID_VAL: u64 = 2;
+pub static ORPHAN_ROOT_ID: Id = Id(NonZeroU64::new(ORPHAN_ROOT_ID_VAL).unwrap());
+
+const TASK_ID_START_VAL: u64 = 3;
+
+// Compile time check
+const _: () = assert!(
+    TASK_ID_START_VAL > ROOT_ID_VAL && TASK_ID_START_VAL > ORPHAN_ROOT_ID_VAL,
+    "TASK_ID_START_VAL must be greater than ROOT_ID_VAL and ORPHAN_ROOT_ID_VAL"
+);
 
 impl fmt::Display for Id {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -60,24 +54,16 @@ impl fmt::Display for Id {
 }
 
 impl Id {
-    pub(crate) fn next() -> Self {
+    pub(crate) fn next() -> Id {
         // Reserve ID == 1 for the root future.
-        static COUNTER: AtomicU64 = AtomicU64::new(ROOT_FUTURE_ID_VAL + 1);
+        // Reserve ID == 2 for the orphan root.
+        static COUNTER: AtomicU64 = AtomicU64::new(3);
 
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
 
         // Safety: this number is unimaginably large, even if the runtime was
         // creating 1 billion task/sec, it would take 584 years to wrap around.
-        let Some(id) = NonZeroU64::new(id) else {
-            Self::exhausted();
-        };
-
-        Self(id)
-    }
-
-    #[cold]
-    fn exhausted() -> ! {
-        panic!("failed to generate unique task ID: bitspace exhausted")
+        Id(NonZeroU64::new(id).expect("failed to generate unique task ID: bitspace exhausted"))
     }
 
     pub(crate) fn as_u64(&self) -> u64 {
@@ -87,26 +73,6 @@ impl Id {
     /// Get a unique task tracing Id to be used with tracing library.
     pub(crate) fn as_tracing_id(&self) -> tracing::Id {
         tracing::Id::from_non_zero_u64(self.0)
-    }
-}
-
-/// Set and clear the task id in the context when the future is executed or
-/// dropped, or when the output produced by the future is dropped.
-pub(super) struct TaskIdGuard {
-    parent_task_id: Option<Id>,
-}
-
-impl TaskIdGuard {
-    pub(super) fn enter(id: Id) -> Self {
-        TaskIdGuard {
-            parent_task_id: context::set_current_task_id(Some(id)),
-        }
-    }
-}
-
-impl Drop for TaskIdGuard {
-    fn drop(&mut self) {
-        context::set_current_task_id(self.parent_task_id);
     }
 }
 
@@ -122,16 +88,9 @@ impl ThreadId {
         // Safety: We use U32 which means we can create 4 Billion threads, which
         // should be more than enough. The reason why we don't use `std::thread::ThreadId`
         // is explained in `task::header::Header`.
-        let Some(id) = NonZeroU32::new(id) else {
-            Self::exhausted();
-        };
-
-        ThreadId(id)
-    }
-
-    #[cold]
-    fn exhausted() -> ! {
-        panic!("failed to generate unique thread ID: bitspace exhausted")
+        ThreadId(
+            NonZeroU32::new(id).expect("failed to generate unique thread ID: bitspace exhausted"),
+        )
     }
 }
 
@@ -151,7 +110,7 @@ mod tests {
         let mut all_ids = HashSet::with_capacity(n);
 
         for _ in 1..=n {
-            let (task, notified, join) = crate::task::new_task(async { 42 }, None, scheduler);
+            let (task, notified, join) = crate::task::new_task(async { 42 }, None, None, scheduler);
 
             assert_eq!(task.id(), notified.id());
             assert_eq!(task.id(), join.id());

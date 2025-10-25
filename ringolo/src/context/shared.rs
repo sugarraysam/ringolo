@@ -1,10 +1,10 @@
 use crate::context::{Core, PendingIoOp};
 use crate::runtime::RuntimeConfig;
-use crate::task::ThreadId;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread::ThreadId;
 
 use dashmap::DashMap;
 

@@ -2,10 +2,11 @@
 #![allow(dead_code)]
 
 use crate::runtime::{RuntimeConfig, Scheduler, local, stealing};
-use crate::task::{Id, ThreadId};
+use crate::task::{Id, TaskNode};
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
+use std::thread::ThreadId;
 use std::thread_local;
 
 // Exports
@@ -54,6 +55,7 @@ thread_local! {
     static CONTEXT: OnceCell<RefCell<RootContext>> = const { OnceCell::new() };
 }
 
+#[track_caller]
 pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) -> Result<()> {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
@@ -76,9 +78,7 @@ where
 
         match (&root.context, &root.scheduler) {
             (Context::Local(ctx), Scheduler::Local(scheduler)) => f(ctx, scheduler),
-            _ => {
-                panic!("Expected local scheduler to be initialized.");
-            }
+            _ => panic_scheduler_uninitialized(),
         }
     })
 }
@@ -93,9 +93,7 @@ where
 
         match (&root.context, &root.scheduler) {
             (Context::Stealing(ctx), Scheduler::Stealing(scheduler)) => f(ctx, scheduler),
-            _ => {
-                panic!("Expected stealing scheduler to be initialized.");
-            }
+            _ => panic_scheduler_uninitialized(),
         }
     })
 }
@@ -174,28 +172,28 @@ where
     })
 }
 
+#[inline(always)]
 pub(crate) fn current_thread_id() -> ThreadId {
-    with_context(|outer| match outer {
-        Context::Local(c) => c.core.borrow().thread_id,
-        Context::Stealing(c) => c.core.borrow().thread_id,
-    })
+    with_core(|core| core.thread_id)
 }
 
+#[inline(always)]
 pub(crate) fn current_task_id() -> Option<Id> {
-    with_context(|outer| match outer {
-        Context::Local(c) => c.core.borrow().current_task_id.get(),
-        Context::Stealing(c) => c.core.borrow().current_task_id.get(),
-    })
+    with_core(|core| core.current_task.borrow().as_ref().map(|t| t.id))
 }
 
-pub(crate) fn set_current_task_id(id: Option<Id>) -> Option<Id> {
-    with_context(|outer| match outer {
-        Context::Local(c) => c.core.borrow().current_task_id.replace(id),
-        Context::Stealing(c) => c.core.borrow().current_task_id.replace(id),
-    })
+#[inline(always)]
+pub(crate) fn current_task() -> Option<Arc<TaskNode>> {
+    with_core(|core| core.current_task.borrow().clone())
+}
+
+#[inline(always)]
+pub(crate) fn set_current_task(task: Option<Arc<TaskNode>>) -> Option<Arc<TaskNode>> {
+    with_core(|core| core.current_task.replace(task))
 }
 
 // Private helpers.
+#[track_caller]
 #[inline(always)]
 pub(crate) fn with_context<F, R>(f: F) -> R
 where
@@ -207,6 +205,7 @@ where
     })
 }
 
+#[track_caller]
 #[inline(always)]
 pub(crate) fn with_scheduler<F, R>(f: F) -> R
 where
@@ -243,6 +242,12 @@ macro_rules! with_scheduler {
     };
 }
 
+#[cold]
+#[track_caller]
+fn panic_scheduler_uninitialized() -> ! {
+    panic!("Expected scheduler to be initialized.");
+}
+
 #[derive(Debug)]
 pub(crate) enum PendingIoOp {
     Increment,
@@ -256,14 +261,8 @@ mod tests {
 
     use super::*;
     use anyhow::Result;
-    use std::collections::HashSet;
-    use std::os::fd::RawFd;
     use std::panic::catch_unwind;
     use std::thread;
-    // use std::sync::atomic::{AtomicBool, Ordering};
-    // use std::sync::{Arc, Mutex};
-    // use std::thread::{self, JoinHandle};
-    // use std::time::Duration;
 
     #[test]
     fn test_context_is_thread_local() -> Result<()> {
@@ -323,71 +322,4 @@ mod tests {
 
         Ok(())
     }
-
-    struct ThreadData {
-        pub thread_ids: HashSet<ThreadId>,
-        pub ring_fds: HashSet<RawFd>,
-    }
-
-    impl ThreadData {
-        pub fn new() -> Self {
-            Self {
-                thread_ids: HashSet::new(),
-                ring_fds: HashSet::new(),
-            }
-        }
-    }
-
-    // TODO: fix with stealing scheduler (need thread pool)
-    // #[test]
-    // fn test_context_ring_fd_registration() -> Result<()> {
-    //     let expected = 10;
-    //     let done = Arc::new(AtomicBool::new(false));
-
-    //     let data = Arc::new(Mutex::new(ThreadData::new()));
-    //     let mut handles: Vec<JoinHandle<Result<()>>> = Vec::new();
-
-    //     // register N threads and guarantee uniqueness for both:
-    //     // - thread_ids
-    //     // - ring_fds
-    //     for _ in 0..expected {
-    //         let data_clone = Arc::clone(&data);
-    //         let done_clone = Arc::clone(&done);
-
-    //         let handle = thread::spawn(move || -> Result<()> {
-    //             init_context(None, 32)?;
-    //             let (thread_id, ring_fd) = with_context(|ctx| -> (ThreadId, RawFd) {
-    //                 let ring_fd = GlobalContext::instance().get_ring_fd(ctx.thread_id);
-    //                 assert!(ring_fd.is_ok());
-    //                 assert_eq!(ring_fd.unwrap(), ctx.ring_fd);
-
-    //                 (ctx.thread_id, ctx.ring_fd)
-    //             });
-
-    //             let mut data = data_clone.lock().unwrap();
-    //             assert!(data.thread_ids.insert(thread_id));
-    //             assert!(data.ring_fds.insert(ring_fd));
-
-    //             while !done_clone.load(Ordering::Relaxed) {
-    //                 thread::sleep(Duration::from_millis(10));
-    //             }
-
-    //             Ok(())
-    //         });
-
-    //         handles.push(handle);
-    //     }
-
-    //     done.store(true, Ordering::Relaxed);
-
-    //     for handle in handles {
-    //         assert!(handle.join().is_ok());
-    //     }
-
-    //     let data = data.lock().unwrap();
-    //     assert_eq!(data.thread_ids.len(), expected);
-    //     assert_eq!(data.ring_fds.len(), expected);
-
-    //     Ok(())
-    // }
 }

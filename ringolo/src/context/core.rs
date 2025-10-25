@@ -2,14 +2,15 @@
 
 use crate::context::{PendingIoOp, RawSqeSlab, Shared};
 use crate::runtime::RuntimeConfig;
-use crate::task::{Header, Id, ThreadId};
+use crate::task::{Header, TaskNode};
 use anyhow::Result;
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::os::unix::io::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Waker;
+use std::thread;
 
 use crate::context::ring::SingleIssuerRing;
 
@@ -18,7 +19,7 @@ use crate::context::ring::SingleIssuerRing;
 /// multiple fields as mut in the same context. Otherwise we will run in borrow
 /// checker issues.
 pub(crate) struct Core {
-    pub(crate) thread_id: ThreadId,
+    pub(crate) thread_id: thread::ThreadId,
 
     /// Track number of locally pending IOs. This is used by the scheduler to
     /// determine if there is more pending work.
@@ -33,10 +34,7 @@ pub(crate) struct Core {
 
     /// Task that is currently executing on this thread. This field is used to
     /// determine the parent of newly spawned tasks.
-    pub(crate) current_task_id: Cell<Option<Id>>,
-
-    /// Set to true if we are currently polling root future.
-    pub(crate) polling_root_future: Cell<bool>,
+    pub(crate) current_task: RefCell<Option<Arc<TaskNode>>>,
 }
 
 impl Core {
@@ -44,15 +42,14 @@ impl Core {
         let ring = SingleIssuerRing::try_new(cfg)?;
 
         let mut core = Core {
-            thread_id: ThreadId::next(),
+            thread_id: thread::current().id(),
             pending_ios: Arc::new(AtomicUsize::new(0)),
             slab: RefCell::new(RawSqeSlab::new(
                 cfg.sq_ring_size * cfg.cq_ring_size_multiplier,
             )),
             ring_fd: ring.as_raw_fd(),
             ring: RefCell::new(ring),
-            current_task_id: Cell::new(None),
-            polling_root_future: Cell::new(false),
+            current_task: RefCell::new(None),
         };
 
         // We share an atomic counter for pending_ios on this thread. The
@@ -66,7 +63,10 @@ impl Core {
     }
 
     pub(crate) fn is_polling_root(&self) -> bool {
-        self.polling_root_future.get()
+        self.current_task
+            .borrow()
+            .as_ref()
+            .is_some_and(|task| task.id.is_root())
     }
 
     pub(crate) fn get_pending_ios(&self) -> usize {
@@ -111,7 +111,7 @@ impl Core {
         op: PendingIoOp,
         waker: Option<&Waker>,
     ) {
-        let delta: i16 = match op {
+        let delta: i32 = match op {
             PendingIoOp::Increment => {
                 self.pending_ios.fetch_add(1, Ordering::Release);
                 1

@@ -123,7 +123,7 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send
                     }
                 },
                 State::Completed => {
-                    panic!("Future polled after completion");
+                    unreachable!("Future polled after completion");
                 }
             }
         }
@@ -211,7 +211,6 @@ mod tests {
         vec![
             SqeListKind::Batch,
             SqeListKind::Batch,
-            SqeListKind::Batch,
         ],
         vec![
             vec![
@@ -222,10 +221,6 @@ mod tests {
                 openat(-22, "dummy"),
                 openat(-33, "invalid"),
             ],
-            vec![
-                nop(),
-                nop(),
-            ],
         ],
         vec![
             vec![
@@ -235,10 +230,6 @@ mod tests {
             vec![
                 Either::Right(libc::ENOENT),
                 Either::Right(libc::ENOENT),
-            ],
-            vec![
-                Either::Left(0),
-                Either::Left(0),
             ],
         ]
     )]
@@ -316,7 +307,7 @@ mod tests {
         for _ in 0..10 {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
-            assert_eq!(waker_data.get_pending_ios(), num_lists as u16);
+            assert_eq!(waker_data.get_pending_ios(), num_lists as u32);
 
             context::with_ring_mut(|ring| {
                 assert_eq!(ring.sq().len(), n_sqes);

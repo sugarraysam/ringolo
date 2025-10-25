@@ -32,7 +32,13 @@ impl Trailer {
         let ptr = self.waker.get();
         match unsafe { &*ptr } {
             Some(waker) => waker.wake_by_ref(),
-            None => panic!("waker missing"),
+            None => panic_waker_missing(),
         };
     }
+}
+
+#[cold]
+#[track_caller]
+fn panic_waker_missing() -> ! {
+    panic!("waker missing");
 }

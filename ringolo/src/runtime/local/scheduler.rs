@@ -1,9 +1,9 @@
 use crate::context;
 use crate::runtime::local::worker::Worker;
-use crate::runtime::runtime::RuntimeConfig;
 use crate::runtime::waker::Wake;
 use crate::runtime::{
-    AddMode, EventLoop, OwnedTasks, Schedule, SchedulerPanic, TaskOpts, YieldReason,
+    AddMode, EventLoop, OwnedTasks, RuntimeConfig, Schedule, SchedulerPanic, TaskMetadata,
+    TaskOpts, TaskRegistry, YieldReason,
 };
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
@@ -21,7 +21,7 @@ pub struct Scheduler {
     #[allow(unused)]
     pub(crate) cfg: RuntimeConfig,
 
-    pub(crate) tasks: OwnedTasks<Handle>,
+    pub(crate) tasks: Arc<OwnedTasks<Handle>>,
 
     pub(crate) worker: Worker,
 
@@ -92,6 +92,7 @@ unsafe impl Sync for Handle {}
 impl Schedule for Handle {
     /// Schedule a task to run next (i.e.: front of queue).
     fn schedule(&self, is_new: bool, task: LocalTask) {
+        #[cfg(test)]
         self.track(
             Method::Schedule,
             Call::Schedule {
@@ -109,6 +110,7 @@ impl Schedule for Handle {
     /// Schedule a task to run soon.
     #[track_caller]
     fn yield_now(&self, waker: &Waker, reason: YieldReason, mode: Option<AddMode>) {
+        #[cfg(test)]
         self.track(Method::YieldNow, Call::YieldNow { reason, mode });
 
         // Default to adding the task to the back of the queue.
@@ -124,9 +126,9 @@ impl Schedule for Handle {
                     ring.submit_and_wait(1, None)?;
                     ring.process_cqes(slab, None)
                 }) {
-                    panic!(
-                        "FATAL: scheduler error: {:?}. Unable to submit or process cqes: {:?}",
-                        reason, e
+                    panic_on_scheduler_error(
+                        format!("Unable to submit or process cqes: {reason:?}"),
+                        &e,
                     );
                 }
             }
@@ -148,11 +150,13 @@ impl Schedule for Handle {
     }
 
     fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
+        #[cfg(test)]
         self.track(Method::Release, Call::Release { id: task.id() });
         self.tasks.remove(&task.id())
     }
 
     fn unhandled_panic(&self, payload: SchedulerPanic) {
+        #[cfg(test)]
         self.track(
             Method::UnhandledPanic,
             Call::UnhandledPanic {
@@ -169,40 +173,61 @@ impl Schedule for Handle {
             payload.reason, payload.msg
         );
     }
+
+    fn task_registry(&self) -> Arc<dyn TaskRegistry> {
+        self.tasks.clone()
+    }
 }
 
 impl Handle {
-    #[track_caller]
     pub(crate) fn block_on<F: Future>(&self, root_fut: F) -> F::Output {
         match self.worker.event_loop(Some(root_fut)) {
             Ok(res) => res,
-            Err(e) => panic!("Failed to drive future to completion: {:?}", e),
+            Err(e) => panic_on_scheduler_error("Failed to drive future to completion", &e),
         }
     }
 
-    pub(crate) fn spawn<F>(&self, future: F, task_opts: Option<TaskOpts>) -> JoinHandle<F::Output>
+    pub(crate) fn spawn<F>(
+        &self,
+        future: F,
+        opts: Option<TaskOpts>,
+        metadata: Option<TaskMetadata>,
+    ) -> JoinHandle<F::Output>
     where
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
+        // All tasks are sticky on local scheduler.
+        let opts = opts.map(|opt| opt | TaskOpts::STICKY);
+
+        #[cfg(test)]
         self.track(
             Method::Spawn,
             Call::Spawn {
-                opts: task_opts.unwrap_or_default(),
+                opts: opts.clone().unwrap_or_default(),
+                metadata: metadata.clone(),
             },
         );
 
-        // All tasks are sticky on local scheduler.
-        let task_opts = task_opts.map(|opt| opt | TaskOpts::STICKY);
+        let (task, notified, join_handle) =
+            crate::task::new_task(future, opts, metadata, self.clone());
 
-        let (task, notified, join_handle) = crate::task::new_task(future, task_opts, self.clone());
-
-        let existed = self.tasks.insert(task, context::current_task_id());
-        debug_assert!(!existed);
+        let existed = self.tasks.insert(task);
+        debug_assert!(existed.is_none());
 
         self.schedule(true, notified);
         join_handle
     }
+}
+
+#[cold]
+#[track_caller]
+fn panic_on_scheduler_error<M, E>(msg: M, e: &E) -> !
+where
+    M: std::fmt::Display,
+    E: std::fmt::Debug,
+{
+    panic!("FATAL: scheduler error. {msg}: {e:?}",);
 }
 
 impl Deref for Handle {

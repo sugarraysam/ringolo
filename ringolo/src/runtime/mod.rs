@@ -1,30 +1,38 @@
 use crate::{
-    context,
-    runtime::{cleanup::OpCleanupPayload, registry::CancellationStats},
-    task::{JoinHandle, Notified, Task},
+    task::{Notified, Task},
     with_scheduler,
 };
 use anyhow::Result;
-use bitflags::bitflags;
-use std::fmt;
 use std::task::Waker;
+use std::{fmt, sync::Arc};
 
 // Public API
+pub mod cancel;
+pub use cancel::{
+    recursive_cancel_all, recursive_cancel_all_metadata, recursive_cancel_all_orphans,
+    recursive_cancel_any_metadata, recursive_cancel_leaf,
+};
+
 pub mod runtime;
 pub use runtime::Builder;
 
+pub mod spawn;
+pub use spawn::{TaskMetadata, TaskOpts, spawn, spawn_builder};
+
 // Exports
-pub(crate) mod cleanup;
+pub mod cleanup;
 pub(crate) use cleanup::CleanupTaskBuilder;
 
-pub(crate) mod local;
+pub mod local;
 
-pub(crate) mod registry;
-pub(crate) use registry::OwnedTasks;
+pub mod registry;
+pub(crate) use registry::{OwnedTasks, TaskRegistry, get_orphan_root, get_root};
 
 pub(crate) use runtime::{RuntimeConfig, SPILL_TO_HEAP_THRESHOLD};
 
-pub(crate) mod stealing;
+pub(crate) use spawn::spawn_cleanup;
+
+pub mod stealing;
 
 mod ticker;
 use ticker::{Ticker, TickerData, TickerEvents};
@@ -60,6 +68,9 @@ pub(crate) trait Schedule: Sync + Sized + 'static + std::fmt::Debug {
     /// Polling the task resulted in a panic. Let the scheduler handle it according
     /// to runtime config and policies.
     fn unhandled_panic(&self, payload: SchedulerPanic);
+
+    /// Returns TaskRegistry for this scheduler.
+    fn task_registry(&self) -> Arc<dyn TaskRegistry>;
 }
 
 #[derive(Debug)]
@@ -126,14 +137,6 @@ pub(crate) trait EventLoop {
     fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output>;
 }
 
-bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub(crate) struct TaskOpts: u16 {
-        /// Task will stick to the thread onto which it is created.
-        const STICKY = 1;
-    }
-}
-
 /// Boundary value to prevent stack overflow caused by a large-sized
 /// Future being placed in the stack.
 pub(crate) const BOX_ROOT_FUTURE_THRESHOLD: usize = 16384;
@@ -154,46 +157,4 @@ pub fn block_on<F: Future>(root_fut: F) -> F::Output {
             s.block_on(root_fut)
         }
     })
-}
-
-// Future gets boxed in `task::layout::TaskLayout::new`, so don't box it
-// twice like the `root_future`.
-pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
-where
-    F: Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    with_scheduler!(|s| {
-        // TODO: check shutdown
-        s.spawn(future, None)
-    })
-}
-
-pub(crate) fn spawn_cleanup<T: OpCleanupPayload>(builder: CleanupTaskBuilder<T>) -> JoinHandle<()> {
-    with_scheduler!(|s| {
-        // TODO: check shutdown
-
-        // Copy the runtime OnCleanupError policy into the builder.
-        let task = builder.on_error(s.cfg.on_cleanup_error).build();
-
-        // Cleanup tasks need to be sticky to the local thread. It does not make sense
-        // to cancel an io_uring operation from another thread.
-        s.spawn(task.into_future(), Some(TaskOpts::STICKY))
-    })
-}
-
-pub fn cancel_all_children() -> CancellationStats {
-    let Some(parent_id) = context::current_task_id() else {
-        return CancellationStats::default();
-    };
-
-    with_scheduler!(|s| { s.tasks.cancel_all_children(parent_id) })
-}
-
-pub fn cancel_all_leaf_children() -> CancellationStats {
-    let Some(parent_id) = context::current_task_id() else {
-        return CancellationStats::default();
-    };
-
-    with_scheduler!(|s| { s.tasks.cancel_all_leaf_children(parent_id) })
 }

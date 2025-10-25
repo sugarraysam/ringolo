@@ -1,12 +1,13 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::runtime::Schedule;
-use crate::task::{Header, RawTask, ThreadId};
+use crate::task::{Header, Id, RawTask};
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
 use std::task::Waker;
+use std::thread::ThreadId;
 
 /// An owned handle to the task, tracked by ref count.
 #[repr(transparent)]
@@ -19,7 +20,7 @@ unsafe impl<S> Send for Task<S> {}
 unsafe impl<S> Sync for Task<S> {}
 
 impl<S: 'static> Task<S> {
-    pub(super) fn new(raw: RawTask) -> Task<S> {
+    pub(crate) fn new(raw: RawTask) -> Task<S> {
         Task {
             raw,
             _p: PhantomData,
@@ -30,7 +31,7 @@ impl<S: 'static> Task<S> {
         Task::new(RawTask::from_raw(ptr))
     }
 
-    pub(super) fn as_raw(&self) -> RawTask {
+    pub(crate) fn as_raw(&self) -> RawTask {
         self.raw
     }
 
@@ -46,9 +47,8 @@ impl<S: 'static> Task<S> {
     /// currently spawned tasks.
     ///
     /// [task ID]: crate::task::Id
-    pub(crate) fn id(&self) -> crate::task::Id {
-        // Safety: The header pointer is valid.
-        unsafe { Header::get_id(self.raw.header_ptr()) }
+    pub(crate) fn id(&self) -> Id {
+        self.raw.task_node().id
     }
 
     /// Returns true if the task can safely be stolen by another thread. This is
@@ -58,8 +58,13 @@ impl<S: 'static> Task<S> {
     // We keep track of inflight IO operations through the waker, and
     // the Submittable interface.
     pub(crate) fn is_stealable(&self) -> bool {
-        // Safety: The header pointer is valid.
         unsafe { Header::is_stealable(self.raw.header_ptr()) }
+    }
+
+    pub(crate) fn set_owner_id(&self, owner_id: ThreadId) {
+        unsafe {
+            Header::set_owner_id(self.raw.header_ptr(), owner_id);
+        }
     }
 }
 
@@ -129,19 +134,16 @@ impl<S: 'static> Notified<S> {
         self.0.header()
     }
 
-    #[inline(always)]
-    pub(crate) fn id(&self) -> crate::task::Id {
+    pub(crate) fn id(&self) -> Id {
         self.0.id()
     }
 
-    #[inline(always)]
     pub(crate) fn is_stealable(&self) -> bool {
         self.0.is_stealable()
     }
 
-    #[inline(always)]
-    pub(crate) fn set_owner_id(&self, thread_id: ThreadId) {
-        self.header().owner_id.set(thread_id);
+    pub(crate) fn set_owner_id(&self, owner_id: ThreadId) {
+        self.0.set_owner_id(owner_id)
     }
 }
 
