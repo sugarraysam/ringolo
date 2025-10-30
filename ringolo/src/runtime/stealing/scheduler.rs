@@ -11,6 +11,7 @@ use crossbeam_deque::{Injector, Worker as CbWorker};
 use std::collections::HashSet;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::Waker;
 
 pub(crate) type StealableTask = Notified<Handle>;
@@ -157,6 +158,16 @@ impl Handle {
         self.schedule(true, notified);
 
         join_handle
+    }
+
+    pub(crate) fn shutdown(&self) {
+        self.shared.shutdown.store(true, Ordering::Release);
+        self.tasks.shutdown_all();
+
+        // TODO:
+        // - wake-up parked workers?
+        // - shutdown global injector queue
+        // - do we need signal on shared?
     }
 }
 

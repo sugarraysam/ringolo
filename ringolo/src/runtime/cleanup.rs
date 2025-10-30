@@ -86,7 +86,10 @@ impl<T: OpCleanupPayload> CleanupTask<T> {
                 Ok(_) => break,
                 Err(err) => {
                     match (err.is_retryable(), &mut self.on_error) {
-                        (_, OnCleanupError::Ignore) => break,
+                        (_, OnCleanupError::Ignore) => {
+                            dbg!("ignoring cleanup error");
+                            break;
+                        }
                         (true, OnCleanupError::Retry(retries_left)) if *retries_left > 0 => {
                             *retries_left -= 1;
                             continue; // Continue to the next iteration of the loop to retry.
@@ -182,7 +185,7 @@ mod tests {
     #[test]
     fn test_on_cleanup_error_ignore() -> Result<()> {
         let builder = Builder::new_local().on_cleanup_error(OnCleanupError::Ignore);
-        init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         let user_data = 42;
 
@@ -196,13 +199,11 @@ mod tests {
         });
 
         // Make sure there was no panic
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 1);
+        let spawn_calls = scheduler.tracker.get_calls(&Method::Spawn);
+        assert_eq!(spawn_calls.len(), 1);
 
-            let unhandled_panic_calls = s.tracker.get_calls(&Method::UnhandledPanic);
-            assert!(unhandled_panic_calls.is_empty());
-        });
+        let unhandled_panic_calls = scheduler.tracker.get_calls(&Method::UnhandledPanic);
+        assert!(unhandled_panic_calls.is_empty());
 
         Ok(())
     }
@@ -210,7 +211,7 @@ mod tests {
     #[test]
     fn test_on_cleanup_error_panic() -> Result<()> {
         let builder = Builder::new_local().on_cleanup_error(OnCleanupError::Panic);
-        init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         let user_data = 333;
 
@@ -233,19 +234,17 @@ mod tests {
         assert!(res.is_err());
         assert!(res.unwrap_err().is_panic());
 
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 1);
+        let spawn_calls = scheduler.tracker.get_calls(&Method::Spawn);
+        assert_eq!(spawn_calls.len(), 1);
 
-            let unhandled_panic_calls = s.tracker.get_calls(&Method::UnhandledPanic);
-            assert_eq!(unhandled_panic_calls.len(), 1);
-            assert_eq!(
-                unhandled_panic_calls.first(),
-                Some(&Call::UnhandledPanic {
-                    reason: PanicReason::CleanupTask
-                })
-            );
-        });
+        let unhandled_panic_calls = scheduler.tracker.get_calls(&Method::UnhandledPanic);
+        assert_eq!(unhandled_panic_calls.len(), 1);
+        assert_eq!(
+            unhandled_panic_calls.first(),
+            Some(&Call::UnhandledPanic {
+                reason: PanicReason::CleanupTask
+            })
+        );
 
         Ok(())
     }

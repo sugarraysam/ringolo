@@ -181,11 +181,10 @@ impl TaskNode {
         children
     }
 
-    #[cfg(test)]
     pub(crate) fn clone_children(&self) -> SmallVec<[Arc<TaskNode>; SPILL_TO_HEAP_THRESHOLD]> {
         self.children
             .iter()
-            .map(|e| Arc::clone(&e.value()))
+            .map(|e| Arc::clone(e.value()))
             .collect()
     }
 
@@ -197,6 +196,20 @@ impl TaskNode {
 
     pub(crate) fn num_children(&self) -> usize {
         self.child_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn num_children_recursive(&self) -> usize {
+        let mut total = 0;
+        let mut to_visit = self.clone_children();
+
+        while !to_visit.is_empty() {
+            // Safety: we just checked to_visit is not empty.
+            let curr = to_visit.pop().unwrap();
+            total += 1;
+            to_visit.extend(curr.clone_children());
+        }
+
+        total
     }
 
     fn has_any_metadata(&self, metadata: &TaskMetadata) -> bool {
@@ -261,12 +274,14 @@ impl fmt::Debug for TaskNode {
 
 impl Drop for TaskNode {
     fn drop(&mut self) {
-        if self.has_children() {
+        // Do not orphan children if the runtime is shutting down and the
+        // TaskRegistry is closed.
+        if self.has_children() && !self.registry.is_closed() {
             // Don't orphan children of orphan root to avoid infinite loop.
             if self.id.is_orphan_root() {
                 eprintln!(
                     "WARNING: Exited runtime with {} orphans.",
-                    self.num_children()
+                    self.num_children_recursive()
                 );
                 return;
             }
@@ -463,7 +478,6 @@ mod tests {
     use crate::runtime::{TaskMetadata, TaskOpts};
     use crate::task::JoinHandle;
     use crate::task::id::ROOT_ID;
-    use crate::test_utils::compute_task_node_tree_size;
     use anyhow::{Context, Result};
     use rstest::rstest;
     use std::pin::Pin;
@@ -564,7 +578,7 @@ mod tests {
 
             Box::pin(async move {
                 if current_depth > max_depth {
-                    let got_curr_tree_size = compute_task_node_tree_size(get_root())?;
+                    let got_curr_tree_size = get_root().num_children_recursive() + 1;
                     assert_eq!(got_curr_tree_size, curr_tree_size.load(Ordering::Relaxed));
 
                     curr_tree_size.fetch_sub(1, Ordering::Relaxed);

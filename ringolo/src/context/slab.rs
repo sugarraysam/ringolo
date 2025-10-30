@@ -183,7 +183,7 @@ mod tests {
 
     #[test]
     fn test_insert_and_len() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes);
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn test_slab_full() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes - 1);
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_reserve_batch() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         context::with_slab_mut(|slab| -> Result<()> {
             let n_sqes = 16;

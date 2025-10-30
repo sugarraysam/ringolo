@@ -3,7 +3,7 @@ use crate::runtime::RuntimeConfig;
 use anyhow::{Result, anyhow};
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::ThreadId;
 
 use dashmap::DashMap;
@@ -13,12 +13,16 @@ use dashmap::DashMap;
 
 #[derive(Debug)]
 pub struct Shared {
+    pub(crate) shutdown: Arc<AtomicBool>,
+
     pub(crate) worker_data: DashMap<ThreadId, WorkerData>,
 }
 
 impl Shared {
     pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
         Self {
+            shutdown: Arc::new(AtomicBool::new(false)),
+
             // TODO: revise this data struct, not optimal, we can have empty shards
             // depending on how thread_id's are hashed.
             // There is no need to have more shards then the number of workers.

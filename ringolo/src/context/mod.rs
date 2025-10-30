@@ -1,7 +1,7 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(dead_code)]
 
-use crate::runtime::{RuntimeConfig, Scheduler, local, stealing};
+use crate::runtime::{local, stealing, RuntimeConfig, Scheduler};
 use crate::task::{Id, TaskNode};
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
@@ -59,8 +59,8 @@ thread_local! {
 pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) -> Result<()> {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
-            let ctx =
-                local::Context::try_new(cfg).expect("Failed to initialize thread-local context");
+            let ctx = local::Context::try_new(cfg, &scheduler)
+                .expect("Failed to initialize thread-local context");
             RefCell::new(RootContext::new_local(ctx, scheduler))
         });
     });
@@ -272,7 +272,7 @@ mod tests {
         let builder_a = Builder::new_local().sq_ring_size(THREAD_A_RING_SIZE);
         let builder_b = Builder::new_local().sq_ring_size(THREAD_B_RING_SIZE);
 
-        init_local_runtime_and_context(Some(builder_a))?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder_a))?;
 
         with_slab_and_ring_mut(|slab, ring| {
             assert_eq!(slab.capacity(), THREAD_A_RING_SIZE * 2);
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_context_has_interior_mutability() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         assert!(
             catch_unwind(|| {

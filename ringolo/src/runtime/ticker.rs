@@ -39,8 +39,5 @@ bitflags! {
 
         /// A request to shut down the runtime.
         const SHUTDOWN = 1 << 2;
-
-        /// An unhandled panic happened while polling tasks.
-        const UNHANDLED_PANIC = 1 << 3;
     }
 }

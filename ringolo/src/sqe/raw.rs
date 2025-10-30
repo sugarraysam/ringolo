@@ -1,8 +1,8 @@
 use io_uring::cqueue::CompletionFlags;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::Waker;
 
 use crate::context;
@@ -345,7 +345,7 @@ mod tests {
 
     #[test]
     fn test_raw_sqe_set_waker_logic() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
         let mut sqe = RawSqe::new(CompletionHandler::new_single());
 
         let (waker1, waker1_data) = mock_waker();
@@ -375,7 +375,7 @@ mod tests {
         #[case] res: i32,
         #[case] expected: io::Result<i32>,
     ) -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
         let mut sqe = RawSqe::new(CompletionHandler::new_single());
 
         let (waker, waker_data) = mock_waker();
@@ -415,7 +415,7 @@ mod tests {
         #[case] res: i32,
         #[case] n_sqes: usize,
     ) -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
 
         context::with_slab_mut(|slab| -> Result<()> {
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn test_raw_sqe_stream_by_flag_completion() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
         let n = 5;
 
         // count = 0 triggers ByFlag completion
@@ -489,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_raw_sqe_lifecycle() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let raw = RawSqe::new(CompletionHandler::new_single());
         assert_eq!(raw.get_state(), RawSqeState::Pending);

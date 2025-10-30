@@ -14,7 +14,7 @@ pub use cancel::{
 };
 
 pub mod runtime;
-pub use runtime::Builder;
+pub use runtime::{Builder, Runtime};
 
 pub mod spawn;
 pub use spawn::{TaskMetadata, TaskOpts, spawn, spawn_builder};

@@ -33,7 +33,7 @@ use io_uring::squeue::Entry;
 use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{ready, Context, Poll};
 
 pub(crate) mod errors;
 pub(crate) use errors::OpcodeError;
@@ -151,7 +151,7 @@ pub(crate) trait MultishotPayload {
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError>;
 
     fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>)
-    -> Result<Self::Item, IoError>;
+        -> Result<Self::Item, IoError>;
 }
 
 #[derive(Debug)]
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_op_double_drop_no_undefined_behavior() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let op = Op::new(AsyncCancel::new(
             io_uring::types::CancelBuilder::user_data(42).all(),

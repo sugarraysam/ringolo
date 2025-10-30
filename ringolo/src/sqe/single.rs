@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn test_submit_and_complete_single_sqe() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let sqe = SqeSingle::new(nop());
         let mut sqe_fut = pin!(Sqe::new(sqe));

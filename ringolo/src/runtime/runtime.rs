@@ -352,16 +352,37 @@ impl Runtime {
     {
         ringolo::spawn(future)
     }
+
+    /// Shutdown the runtime.
+    ///
+    /// Tasks spawned through [`ringolo::spawn`] keep running until they yield.
+    /// Then they are dropped. They are not *guaranteed* to run to completion,
+    /// but *might* do so if they do not yield until completion.
+    ///
+    /// The thread initiating the shutdown blocks until all spawned work has been
+    /// stopped. This can take an indefinite amount of time. The `Drop`
+    /// implementation waits forever for this.
+    pub fn shutdown(self) {
+        self.shutdown_inner();
+    }
+
+    fn shutdown_inner(&self) {
+        match &self.scheduler {
+            Scheduler::Local(handle) => {
+                IS_RUNTIME_ACTIVE.with(|is_active| is_active.set(false));
+                handle.shutdown();
+            }
+            Scheduler::Stealing(handle) => {
+                handle.shutdown();
+            }
+        }
+    }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        match self.scheduler {
-            Scheduler::Local(_) => {
-                IS_RUNTIME_ACTIVE.with(|is_active| is_active.set(false));
-            }
-            Scheduler::Stealing(_) => { /* nothing to do */ }
-        }
+        dbg!("runtime dropped..shutting down");
+        self.shutdown_inner();
     }
 }
 

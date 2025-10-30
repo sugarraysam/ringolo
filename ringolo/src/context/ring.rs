@@ -201,7 +201,7 @@ mod tests {
 
     #[test]
     fn test_taskrun_flag() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let mut sqe_fut = pin!(Op::new(Timeout::new(Duration::from_millis(1), None)));
         let (waker, _) = mock_waker();
@@ -240,7 +240,7 @@ mod tests {
     #[case::len_128_capacity_16(128, 16)]
     fn test_sq_len_and_capacity(#[case] sq_ring_size: usize, #[case] n: usize) -> Result<()> {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
-        init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {
@@ -290,7 +290,7 @@ mod tests {
     #[case::capacity_128_len_16(128, 16)]
     fn test_cq_len_and_sync(#[case] sq_ring_size: usize, #[case] n: usize) -> Result<()> {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
-        init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {

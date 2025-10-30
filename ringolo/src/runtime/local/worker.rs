@@ -1,4 +1,4 @@
-use crate::context;
+use crate::context::{self, Shared};
 use crate::runtime::local;
 use crate::runtime::local::scheduler::LocalTask;
 use crate::runtime::runtime::RuntimeConfig;
@@ -10,11 +10,15 @@ use anyhow::{Result, anyhow};
 use std::cell::{OnceCell, RefCell};
 use std::collections::VecDeque;
 use std::pin::pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::thread::ThreadId;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
+    /// Shared context available in scheduler and worker
+    shared: Arc<Shared>,
+
     /// ThreadId associated with this worker.
     thread_id: OnceCell<ThreadId>,
 
@@ -29,8 +33,9 @@ pub(crate) struct Worker {
 }
 
 impl Worker {
-    pub(super) fn new(cfg: &RuntimeConfig) -> Self {
+    pub(super) fn new(cfg: &RuntimeConfig, shared: Arc<Shared>) -> Self {
         Self {
+            shared,
             thread_id: OnceCell::new(),
             pollable: RefCell::new(VecDeque::new()),
             cfg: RefCell::new(cfg.into()),
@@ -102,10 +107,6 @@ impl TickerData for EventLoopConfig {
 
         // (2) Check policies
         let mut events = TickerEvents::empty();
-
-        // TODO:
-        // - shutdown
-        // - unhandled panic
 
         if self.should_submit(tick) {
             events.insert(TickerEvents::SUBMIT_SQES);
@@ -218,13 +219,10 @@ impl Worker {
 
     #[inline(always)]
     fn process_ticker_events(&self, ctx: &local::Context, events: TickerEvents) -> Result<()> {
-        if events.contains(TickerEvents::SHUTDOWN) {
-            unimplemented!("TODO");
-
         // Because we use `DEFER_TASKRUN`, we need to make an `io_uring_enter` syscall /w GETEVENTS
         // to process pending kernel `task_work` and post CQEs. It would be silly to not submit
         // pending SQEs in same syscall.
-        } else if events.contains(TickerEvents::PROCESS_CQES) {
+        if events.contains(TickerEvents::PROCESS_CQES) {
             dbg!("processing cqes");
             ctx.with_slab_and_ring_mut(|slab, ring| {
                 ring.submit_and_wait(1, None)?;

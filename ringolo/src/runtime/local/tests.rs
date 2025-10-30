@@ -1,14 +1,19 @@
 use super::*;
 use crate as ringolo;
+use crate::context;
 use crate::future::lib::{Nop, Op};
 use crate::runtime::waker::Wake;
-use crate::runtime::{Builder, Schedule, YieldReason};
+use crate::runtime::{Builder, Schedule, TaskRegistry, YieldReason};
 use crate::sqe::{IoError, Sqe, SqeCollection};
 use crate::test_utils::*;
+use crate::time::Sleep;
 use crate::utils::scheduler::*;
 use crate::with_scheduler;
 use anyhow::Result;
 use static_assertions::assert_impl_all;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 assert_impl_all!(Scheduler: Send, Sync, Wake);
 assert_impl_all!(Handle: Send, Sync, Schedule);
@@ -183,5 +188,48 @@ fn test_local_scheduler_spawn_within_block_on() -> Result<()> {
     });
 
     assert_eq!(res, 42);
+    Ok(())
+}
+
+#[test]
+fn test_runtime_shutdown() -> Result<()> {
+    let start = Instant::now();
+    let runtime = Builder::new_local().try_build()?;
+
+    let scheduler = runtime.expect_local_scheduler();
+    let shared = runtime.block_on(async move {
+        context::with_shared(|shared| {
+            assert!(!shared.shutdown.load(Ordering::Relaxed));
+            Arc::clone(&shared)
+        })
+    });
+
+    // Spawn tasks on runtime that are very long
+    let n = 3;
+    let handles = (0..n)
+        .into_iter()
+        .map(|_| {
+            runtime.spawn(async {
+                Sleep::try_new(Duration::from_secs(10))?
+                    .await
+                    .map_err(anyhow::Error::from)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // We shutdown, but have saved both shared + scheduler to verify shutdown.
+    runtime.shutdown();
+
+    assert!(shared.shutdown.load(Ordering::Relaxed));
+    assert!(scheduler.tasks.is_closed());
+    assert_eq!(scheduler.tasks.len(), n);
+
+    // Make sure we did not have to wait for the tasks to complete
+    assert!(start.elapsed() < Duration::from_secs(1));
+    for handle in handles {
+        assert!(handle.is_finished());
+        assert!(handle.get_result().is_err_and(|e| e.is_cancelled()));
+    }
+
     Ok(())
 }

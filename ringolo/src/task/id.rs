@@ -102,7 +102,7 @@ mod tests {
 
     #[test]
     fn test_new_task_id_unique() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let n = 13;
         let scheduler = DummyScheduler::default();

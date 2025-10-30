@@ -1,8 +1,7 @@
 use crate::runtime::Schedule;
 use crate::task::id::{ORPHAN_ROOT_ID, ROOT_ID};
 use crate::task::{Id, Task, TaskNode};
-use dashmap::{DashMap, DashSet};
-use std::collections::HashMap;
+use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -41,21 +40,19 @@ pub(crate) struct OwnedTasks<S: 'static> {
     // all shards.
     size: AtomicUsize,
 
-    orphans: DashSet<Id>,
-
-    shutdown: Arc<AtomicBool>,
+    // Close the OwnedTasks when we are shutting down. This is to prevent adding
+    // new tasks and guarantee shutdown is only called once.
+    closed: Arc<AtomicBool>,
 }
 
 impl<S: Schedule> OwnedTasks<S> {
-    // TODO: shutdown pass by argument
     pub(crate) fn new(capacity: usize) -> Arc<Self> {
         let registry = Arc::new(Self {
             root: OnceLock::new(),
             orphan_root: OnceLock::new(),
             tasks: DashMap::with_capacity(capacity),
             size: AtomicUsize::new(0),
-            orphans: DashSet::new(),
-            shutdown: Arc::new(AtomicBool::new(false)),
+            closed: Arc::new(AtomicBool::new(false)),
         });
 
         registry
@@ -81,7 +78,7 @@ impl<S: Schedule> OwnedTasks<S> {
 
     /// Inserts a new task, returning its ID.
     pub(crate) fn insert(&self, task: Task<S>) -> Option<Task<S>> {
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.closed.load(Ordering::Acquire) {
             task.shutdown();
             None
         } else {
@@ -108,51 +105,37 @@ impl<S: Schedule> OwnedTasks<S> {
 
     /// Initiates a graceful shutdown by signaling all tasks.
     pub(crate) fn shutdown_all(&self) {
-        if !self.shutdown.swap(true, Ordering::AcqRel) {
+        if !self.closed.swap(true, Ordering::AcqRel) {
             // Leverage dashmap `raw-api` for more efficient locking and draining.
-            let all_tasks = self.tasks.shards().iter().fold(
-                HashMap::with_capacity(self.len()),
+            let tasks = self.tasks.shards().iter().fold(
+                Vec::with_capacity(self.len()),
                 |mut acc, shard| {
                     acc.extend(shard.write().drain());
                     acc
                 },
             );
 
-            // See note in `task::node::TaskNode::release` to understand why we
-            // need to filter `orphan_ids` as there is a non-zero chance some of them
-            // are stale.
-            let orphan_ids = self
-                .orphans
-                .shards()
-                .iter()
-                .fold(Vec::new(), |mut acc, shard| {
-                    acc.extend(
-                        shard
-                            .write()
-                            .drain()
-                            .map(|(id, _)| id)
-                            .filter(|id| all_tasks.contains_key(id)),
-                    );
-                    acc
-                });
-
             // TODO: tracing
             eprintln!(
-                "Shutting down {} tasks and {} orphans",
-                all_tasks.len(),
-                orphan_ids.len(),
+                "Shutting down {} tasks and {} orphans...",
+                tasks.len(),
+                self.get_orphan_root().num_children_recursive()
             );
 
-            for (_id, task) in all_tasks {
+            for (_id, task) in tasks {
                 task.into_inner().shutdown();
             }
         }
     }
 }
 
-/// This trait is used by TaskNode to shutdown specific tasks.
+/// Expose functionality of the TaskRegistry common to any scheduler.
 pub trait TaskRegistry: Send + Sync + std::fmt::Debug {
+    /// Allow shutting down a specific task.
     fn shutdown(&self, id: &Id);
+
+    /// Returns true if the registry was closed as part of runtime shutdown.
+    fn is_closed(&self) -> bool;
 }
 
 impl<S: Schedule> TaskRegistry for OwnedTasks<S> {
@@ -160,5 +143,9 @@ impl<S: Schedule> TaskRegistry for OwnedTasks<S> {
         if let Some((_, task)) = self.tasks.remove(id) {
             task.shutdown()
         }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 }

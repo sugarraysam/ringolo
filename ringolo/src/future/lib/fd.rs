@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn test_fixed_descriptor_exhaustion(#[case] n: u32) -> Result<()> {
         let builder = Builder::new_local().direct_fds_per_ring(n);
-        init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         crate::block_on(async {
             let mut sockets = Vec::with_capacity(n as usize);
@@ -542,10 +542,8 @@ mod tests {
         });
 
         // We expect `n` async cleanup operations
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), n as usize);
-        });
+        let spawn_calls = scheduler.tracker.get_calls(&Method::Spawn);
+        assert_eq!(spawn_calls.len(), n as usize);
 
         Ok(())
     }

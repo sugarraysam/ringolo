@@ -6,8 +6,8 @@ use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -40,6 +40,10 @@ pub(crate) struct DummyTaskRegistry;
 
 impl TaskRegistry for DummyTaskRegistry {
     fn shutdown(&self, _id: &Id) {
+        unimplemented!("dummy task registry");
+    }
+
+    fn is_closed(&self) -> bool {
         unimplemented!("dummy task registry");
     }
 }
@@ -127,7 +131,7 @@ mod tests {
 
     #[test]
     fn test_mock_raw_waker() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let (waker1, waker_data) = mock_waker();
         waker1.wake_by_ref();
@@ -144,7 +148,7 @@ mod tests {
 
     #[test]
     fn test_mock_raw_waker_data_ptr_is_header() -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let (waker, _) = mock_waker();
 

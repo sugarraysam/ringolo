@@ -195,7 +195,7 @@ mod tests {
     #[case::ten_timeouts(10, 1_000)]
     #[case::two_timeouts_slow(2, 1_000_000)]
     fn test_sqe_stream_timeout_multishot(#[case] count: u32, #[case] nsecs: u32) -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let n = count as usize;
 

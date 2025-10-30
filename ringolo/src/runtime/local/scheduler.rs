@@ -1,4 +1,4 @@
-use crate::context;
+use crate::context::{self, Shared};
 use crate::runtime::local::worker::Worker;
 use crate::runtime::waker::Wake;
 use crate::runtime::{
@@ -12,14 +12,16 @@ use anyhow::Result;
 use std::cell::RefCell;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::Waker;
 
 pub(crate) type LocalTask = Notified<Handle>;
 
 #[derive(Debug)]
 pub struct Scheduler {
-    #[allow(unused)]
     pub(crate) cfg: RuntimeConfig,
+
+    pub(crate) shared: Arc<Shared>,
 
     pub(crate) tasks: Arc<OwnedTasks<Handle>>,
 
@@ -33,11 +35,14 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
+        let shared = Arc::new(Shared::new(cfg));
+
         Self {
             cfg: cfg.clone(),
             tasks: OwnedTasks::new(cfg.sq_ring_size),
-            worker: Worker::new(cfg),
+            worker: Worker::new(cfg, Arc::clone(&shared)),
             root_woken: RefCell::new(true),
+            shared,
 
             #[cfg(test)]
             tracker: Tracker::new(),
@@ -91,12 +96,12 @@ unsafe impl Sync for Handle {}
 
 impl Schedule for Handle {
     /// Schedule a task to run next (i.e.: front of queue).
-    fn schedule(&self, is_new: bool, task: LocalTask) {
+    fn schedule(&self, _is_new: bool, task: LocalTask) {
         #[cfg(test)]
         self.track(
             Method::Schedule,
             Call::Schedule {
-                is_new,
+                is_new: _is_new,
                 id: task.id(),
             },
         );
@@ -217,6 +222,14 @@ impl Handle {
 
         self.schedule(true, notified);
         join_handle
+    }
+
+    pub(crate) fn shutdown(&self) {
+        // This is not necessary for single-threaded runtime but we guarantee
+        // thread-safe oneshot shutdown.
+        if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
+            self.tasks.shutdown_all();
+        }
     }
 }
 

@@ -218,8 +218,8 @@ mod tests {
                 nop(),
             ],
             vec![
-                openat(-22, "dummy"),
-                openat(-33, "invalid"),
+                openat(i32::MIN + 1, "dummy"),
+                openat(i32::MIN + 2, "invalid"),
             ],
         ],
         vec![
@@ -245,15 +245,15 @@ mod tests {
                 nop(),
             ],
             vec![
-                openat(-333, "dummy"),
-                openat(-111, "invalid"),
+                openat(i32::MIN + 1, "dummy"),
+                openat(i32::MIN + 2, "invalid"),
                 nop(),
-                openat(-22, "invalid"),
+                openat(i32::MIN + 3, "invalid"),
             ],
             vec![
                 nop(),
                 nop(),
-                openat(-333, "dummy"),
+                openat(i32::MIN + 1, "dummy"),
                 nop(),
                 nop(),
             ],
@@ -286,7 +286,7 @@ mod tests {
     ) -> Result<()> {
         assert_eq!(entries.len(), expected_results.len());
 
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let num_lists = entries.len();
         let n_sqes = entries.iter().map(Vec::len).sum();

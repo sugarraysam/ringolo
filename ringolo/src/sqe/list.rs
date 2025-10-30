@@ -8,8 +8,8 @@ use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
 use std::io::{self, Error};
 use std::iter;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::task::{Poll, Waker};
 
 // Batch and Chain APIs resolve to this type
@@ -363,7 +363,7 @@ mod tests {
     #[case::batch(SqeListKind::Batch)]
     #[case::batch(SqeListKind::Chain)]
     fn test_list_builder(#[case] kind: SqeListKind) -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let n = 4;
         let mut list = match kind {
@@ -416,7 +416,7 @@ mod tests {
         #[case] size: usize,
         #[case] kind: SqeListKind,
     ) -> Result<()> {
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let list = match kind {
             SqeListKind::Batch => build_batch(size),
@@ -516,7 +516,7 @@ mod tests {
     ) -> Result<()> {
         assert_eq!(entries.len(), expected_results.len());
 
-        init_local_runtime_and_context(None)?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
         let size = entries.len();
         let sqe_list = Sqe::new(build_list_with_entries(kind, entries));
@@ -592,7 +592,7 @@ mod tests {
         let batch_size = 16;
 
         let builder = Builder::new_local().sq_ring_size(ring_size);
-        init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         let (waker, _) = mock_waker();
 
