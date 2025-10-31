@@ -18,8 +18,9 @@ pub(crate) type StealableTask = Notified<Handle>;
 
 #[derive(Debug)]
 pub struct Scheduler {
-    /// Runtime confguration to be injected in context and worker
     pub(crate) cfg: RuntimeConfig,
+
+    pub(crate) default_task_opts: TaskOpts,
 
     pub(crate) tasks: Arc<OwnedTasks<Handle>>,
 
@@ -34,8 +35,8 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    pub(crate) fn new(cfg: RuntimeConfig) -> Self {
-        let shared = Arc::new(Shared::new(&cfg));
+    pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
+        let shared = Arc::new(Shared::new(cfg));
 
         let injector = Arc::new(Injector::new());
         let mut local_queues = Vec::with_capacity(cfg.worker_threads);
@@ -80,7 +81,8 @@ impl Scheduler {
 
         Self {
             cfg: cfg.clone(),
-            tasks: OwnedTasks::new(cfg.sq_ring_size),
+            default_task_opts: cfg.default_task_opts(),
+            tasks: OwnedTasks::new(cfg),
             injector,
             shared,
 
@@ -147,7 +149,7 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        let id = crate::task::Id::next();
+        let opts = opts.map(|opt| opt | self.default_task_opts);
 
         let (task, notified, join_handle) =
             crate::task::new_task(future, opts, metadata, self.clone());

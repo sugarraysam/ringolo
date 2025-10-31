@@ -1,4 +1,4 @@
-use crate::runtime::Schedule;
+use crate::runtime::{OrphanPolicy, RuntimeConfig, Schedule};
 use crate::task::id::{ORPHAN_ROOT_ID, ROOT_ID};
 use crate::task::{Id, Task, TaskNode};
 use dashmap::DashMap;
@@ -28,11 +28,7 @@ pub(crate) fn get_orphan_root() -> Arc<TaskNode> {
 // we must minimize contention and ensure optimal performance.
 #[derive(Debug)]
 pub(crate) struct OwnedTasks<S: 'static> {
-    /// Structured Concurrency: Root of the task task tree.
-    root: OnceLock<Arc<TaskNode>>,
-
-    /// Structured Concurrency: Root of the orphan task tree created through cancellation.
-    orphan_root: OnceLock<Arc<TaskNode>>,
+    orphan_policy: OrphanPolicy,
 
     tasks: DashMap<Id, Task<S>>,
 
@@ -43,16 +39,23 @@ pub(crate) struct OwnedTasks<S: 'static> {
     // Close the OwnedTasks when we are shutting down. This is to prevent adding
     // new tasks and guarantee shutdown is only called once.
     closed: Arc<AtomicBool>,
+
+    /// Structured Concurrency: Root of the task task tree.
+    root: OnceLock<Arc<TaskNode>>,
+
+    /// Structured Concurrency: Root of the orphan task tree created through cancellation.
+    orphan_root: OnceLock<Arc<TaskNode>>,
 }
 
 impl<S: Schedule> OwnedTasks<S> {
-    pub(crate) fn new(capacity: usize) -> Arc<Self> {
+    pub(crate) fn new(cfg: &RuntimeConfig) -> Arc<Self> {
         let registry = Arc::new(Self {
-            root: OnceLock::new(),
-            orphan_root: OnceLock::new(),
-            tasks: DashMap::with_capacity(capacity),
+            orphan_policy: cfg.orphan_policy,
+            tasks: DashMap::with_capacity(cfg.sq_ring_size),
             size: AtomicUsize::new(0),
             closed: Arc::new(AtomicBool::new(false)),
+            root: OnceLock::new(),
+            orphan_root: OnceLock::new(),
         });
 
         registry
@@ -136,6 +139,9 @@ pub trait TaskRegistry: Send + Sync + std::fmt::Debug {
 
     /// Returns true if the registry was closed as part of runtime shutdown.
     fn is_closed(&self) -> bool;
+
+    /// Get the OrphanPolicy to decide if we need to cancel or adopt orphans.
+    fn orphan_policy(&self) -> OrphanPolicy;
 }
 
 impl<S: Schedule> TaskRegistry for OwnedTasks<S> {
@@ -147,5 +153,9 @@ impl<S: Schedule> TaskRegistry for OwnedTasks<S> {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    fn orphan_policy(&self) -> OrphanPolicy {
+        self.orphan_policy
     }
 }

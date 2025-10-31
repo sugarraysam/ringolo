@@ -478,7 +478,7 @@ mod tests {
             let spawn_calls = s.tracker.get_calls(&Method::Spawn);
             assert_eq!(spawn_calls.len(), 1);
             assert!(
-                matches!(spawn_calls[0], Call::Spawn { opts, .. } if opts == TaskOpts::STICKY | TaskOpts::BACKGROUND_TASK)
+                matches!(spawn_calls[0], Call::Spawn { opts, .. } if opts == TaskOpts::BACKGROUND_TASK | s.default_task_opts)
             );
         });
 

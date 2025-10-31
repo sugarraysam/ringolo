@@ -1,13 +1,13 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{AddMode, Schedule, SchedulerPanic, TaskRegistry, YieldReason};
+use crate::runtime::{AddMode, OrphanPolicy, Schedule, SchedulerPanic, TaskRegistry, YieldReason};
 use crate::task::layout::vtable;
 use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -44,6 +44,10 @@ impl TaskRegistry for DummyTaskRegistry {
     }
 
     fn is_closed(&self) -> bool {
+        unimplemented!("dummy task registry");
+    }
+
+    fn orphan_policy(&self) -> OrphanPolicy {
         unimplemented!("dummy task registry");
     }
 }

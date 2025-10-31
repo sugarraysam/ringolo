@@ -21,11 +21,13 @@ pub(crate) type LocalTask = Notified<Handle>;
 pub struct Scheduler {
     pub(crate) cfg: RuntimeConfig,
 
-    pub(crate) shared: Arc<Shared>,
+    pub(crate) default_task_opts: TaskOpts,
 
     pub(crate) tasks: Arc<OwnedTasks<Handle>>,
 
     pub(crate) worker: Worker,
+
+    pub(crate) shared: Arc<Shared>,
 
     pub(crate) root_woken: RefCell<bool>,
 
@@ -39,10 +41,11 @@ impl Scheduler {
 
         Self {
             cfg: cfg.clone(),
-            tasks: OwnedTasks::new(cfg.sq_ring_size),
+            default_task_opts: cfg.default_task_opts(),
+            tasks: OwnedTasks::new(cfg),
             worker: Worker::new(cfg, Arc::clone(&shared)),
-            root_woken: RefCell::new(true),
             shared,
+            root_woken: RefCell::new(true),
 
             #[cfg(test)]
             tracker: Tracker::new(),
@@ -202,8 +205,7 @@ impl Handle {
         F: Future + Send + 'static,
         F::Output: Send + 'static,
     {
-        // All tasks are sticky on local scheduler.
-        let opts = opts.map(|opt| opt | TaskOpts::STICKY);
+        let opts = opts.map(|opt| opt | self.default_task_opts);
 
         #[cfg(test)]
         self.track(

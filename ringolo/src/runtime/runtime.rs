@@ -4,6 +4,7 @@ use crate::runtime::Scheduler;
 use crate::runtime::cleanup::OnCleanupError;
 use crate::runtime::local;
 use crate::runtime::stealing;
+use crate::spawn::TaskOpts;
 use crate::task::JoinHandle;
 use anyhow::{Result, anyhow};
 use std::cell::Cell;
@@ -12,10 +13,6 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 use std::thread;
-
-// TODO missing from tokio:
-// - UnhandledPanic
-// - metrics
 
 // Used wherever we rely on SmallVec to store entries on stack first.
 // Prevent most heap allocations. Threads have 2 MB stack size by default and so
@@ -74,6 +71,28 @@ impl fmt::Debug for ThreadNameFn {
 // Safety: can safely generate thread names from many threads
 unsafe impl Send for ThreadNameFn {}
 unsafe impl Sync for ThreadNameFn {}
+
+/// Defines how we enforce structured concurrency. This is the idea that every
+/// task should have a clear owner and should not be allowed to outlive it's parent.
+/// In structured concurrency, you can't "leak" tasks and all of a task children
+/// are cancelled on exit. You have to explicitly use `TaskOpts::BACKGROUND_TASK`
+/// if you want a child to outlive it's parent, as this option attaches the child
+/// to the ROOT_NODE of the task tree instead of the parent.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrphanPolicy {
+    /// All children of a task are cancelled on exit. The program is *not allowed*
+    /// to create orphans. This leads to better performance because we prevent many
+    /// synchronous parent swapping operations and avoid child adoption by the
+    /// ORPHAN_ROOT_NODE.
+    #[default]
+    Enforced,
+
+    /// Children are allowed to outlive their parents. If a parent terminates before
+    /// it's children, all of the children are adopted by the ORPHAN_ROOT_NODE and
+    /// become orphans. This flexibility comes at a cost, with synchronous parent
+    /// swapping operations and child adoption.
+    Permissive,
+}
 
 #[derive(Debug)]
 pub struct Builder {
@@ -137,6 +156,9 @@ pub struct Builder {
 
     /// When an async cleanup operation fails, what to do?
     pub(super) on_cleanup_error: OnCleanupError,
+
+    /// Defines how to enforce structured concurrency.
+    pub(super) orphan_policy: OrphanPolicy,
 }
 
 impl Builder {
@@ -155,6 +177,7 @@ impl Builder {
             cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
             on_cleanup_error: OnCleanupError::default(),
             direct_fds_per_ring: DIRECT_FDS_PER_RING,
+            orphan_policy: OrphanPolicy::default(),
         }
     }
 
@@ -277,6 +300,11 @@ impl Builder {
         self
     }
 
+    pub fn orphan_policy(mut self, orphan_policy: OrphanPolicy) -> Self {
+        self.orphan_policy = orphan_policy;
+        self
+    }
+
     /// Creates the configured `Runtime`.
     ///
     /// The returned `Runtime` instance is ready to spawn tasks.
@@ -325,7 +353,7 @@ impl Builder {
 
     fn try_build_stealing_runtime(self) -> Result<Runtime> {
         let cfg = self.try_into()?;
-        let scheduler = stealing::Scheduler::new(cfg);
+        let scheduler = stealing::Scheduler::new(&cfg);
         Ok(Runtime::new(Scheduler::Stealing(scheduler.into_handle())))
     }
 }
@@ -421,6 +449,7 @@ pub(crate) struct RuntimeConfig {
     pub(crate) cq_ring_size_multiplier: usize,
     pub(crate) direct_fds_per_ring: u32,
     pub(crate) on_cleanup_error: OnCleanupError,
+    pub(crate) orphan_policy: OrphanPolicy,
 }
 
 impl RuntimeConfig {
@@ -441,6 +470,21 @@ impl RuntimeConfig {
         check_fd_ulimit(num_workers * self.direct_fds_per_ring as usize)?;
 
         Ok(())
+    }
+
+    pub(crate) fn default_task_opts(&self) -> TaskOpts {
+        let mut opts = TaskOpts::default();
+
+        // All tasks are sticky on local scheduler since we have a single thread.
+        if matches!(self.kind, Kind::Local) {
+            opts |= TaskOpts::STICKY;
+        }
+
+        if matches!(self.orphan_policy, OrphanPolicy::Enforced) {
+            opts |= TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT;
+        };
+
+        opts
     }
 }
 
@@ -466,6 +510,7 @@ impl TryFrom<Builder> for RuntimeConfig {
             cq_ring_size_multiplier: builder.cq_ring_size_multiplier,
             direct_fds_per_ring: builder.direct_fds_per_ring,
             on_cleanup_error: builder.on_cleanup_error,
+            orphan_policy: builder.orphan_policy,
         };
 
         cfg.validate()?;
@@ -475,13 +520,6 @@ impl TryFrom<Builder> for RuntimeConfig {
 }
 
 /// Checks if the desired number of file descriptors is within the system's soft limit.
-///
-/// # Arguments
-/// * `desired_fds` - The total number of file descriptors your application requires.
-///
-/// # Returns
-/// * `Ok(())` if the limit is sufficient.
-/// * `Err(std::io::Error)` with a descriptive message if the limit is too low or cannot be read.
 fn check_fd_ulimit(desired_fds: usize) -> io::Result<()> {
     let mut rlimit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     let ret = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, rlimit.as_mut_ptr()) };
@@ -496,8 +534,8 @@ fn check_fd_ulimit(desired_fds: usize) -> io::Result<()> {
     if desired_fds > current_limit {
         let error_message = format!(
             "Required file descriptors ({}) exceed the current ulimit ({}) for open files. \
-             Please increase the limit. For example, run 'ulimit -n 65536' in your shell before \
-             starting the application.",
+             Please increase the limit. For example, run '$ ulimit -n 65536' in your shell \
+             before starting the application.",
             desired_fds, current_limit
         );
         Err(io::Error::other(error_message))

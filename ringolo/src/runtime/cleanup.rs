@@ -68,6 +68,13 @@ pub(crate) struct CleanupTask<T: OpCleanupPayload> {
     on_error: OnCleanupError,
 }
 
+// # TODO:
+//    A much better cancellation model would integrate tightly within the Task. Here we
+//    spawn a new task to perform cancellation, and use a new RawSqe. A much better
+//    model would re-use the same Task and re-use the same RawSqe. We need to
+//    expand the state of both of these structs to account for this state, and
+//    somehow wrap every single regular task to allow for cancellation.
+//    How to wrap the user-provided future with this logic?
 impl<T: OpCleanupPayload> CleanupTask<T> {
     fn new(op: Op<T>, user_data: Option<usize>, on_error: OnCleanupError) -> Self {
         Self {
@@ -86,10 +93,8 @@ impl<T: OpCleanupPayload> CleanupTask<T> {
                 Ok(_) => break,
                 Err(err) => {
                     match (err.is_retryable(), &mut self.on_error) {
-                        (_, OnCleanupError::Ignore) => {
-                            dbg!("ignoring cleanup error");
-                            break;
-                        }
+                        (_, OnCleanupError::Ignore) => break,
+
                         (true, OnCleanupError::Retry(retries_left)) if *retries_left > 0 => {
                             *retries_left -= 1;
                             continue; // Continue to the next iteration of the loop to retry.

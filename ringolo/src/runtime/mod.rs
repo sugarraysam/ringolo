@@ -28,7 +28,7 @@ pub mod local;
 pub mod registry;
 pub(crate) use registry::{OwnedTasks, TaskRegistry, get_orphan_root, get_root};
 
-pub(crate) use runtime::{RuntimeConfig, SPILL_TO_HEAP_THRESHOLD};
+pub(crate) use runtime::{OrphanPolicy, RuntimeConfig, SPILL_TO_HEAP_THRESHOLD};
 
 pub(crate) use spawn::spawn_cleanup;
 

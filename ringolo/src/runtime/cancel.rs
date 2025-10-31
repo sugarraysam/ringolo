@@ -40,9 +40,10 @@ pub fn recursive_cancel_all_orphans() -> Result<CancellationStats, CancelError> 
 #[cfg(test)]
 mod tests {
     use crate::future::experimental::time::{Sleep, YieldNow};
-    use crate::runtime::{AddMode, get_orphan_root};
+    use crate::runtime::{AddMode, Builder, OrphanPolicy, get_orphan_root};
     use crate::spawn::{TaskMetadata, TaskOpts};
     use crate::task::JoinHandle;
+    use crate::test_utils::init_local_runtime_and_context;
     use crate::{self as ringolo, context};
     use anyhow::{Context, Result};
     use rstest::rstest;
@@ -51,56 +52,65 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    #[ringolo::test]
-    async fn test_cancelling_node_creates_orphans() -> Result<()> {
-        let n = 3;
+    fn test_cancelling_node_creates_orphans() -> Result<()> {
+        // Need to explicilty disable OrphanPolicy as the default is Enforced where
+        // we are not allowed to create orphans.
+        let builder = Builder::new_local().orphan_policy(OrphanPolicy::Permissive);
+        let (runtime, _scheduler) = init_local_runtime_and_context(Some(builder))?;
 
-        let cancelled: JoinHandle<Result<()>> = ringolo::spawn_builder()
-            .with_metadata(TaskMetadata::from(["dead"]))
-            .spawn(async move {
-                let orphans = (0..n)
-                    .map(|_| {
-                        ringolo::spawn(async {
-                            Sleep::try_new(Duration::from_secs(10))?
-                                .await
-                                .map_err(anyhow::Error::from)
+        let res: anyhow::Result<()> = runtime.block_on(async {
+            let n = 3;
+
+            let cancelled: JoinHandle<Result<()>> = ringolo::spawn_builder()
+                .with_metadata(TaskMetadata::from(["dead"]))
+                .spawn(async move {
+                    let orphans = (0..n)
+                        .map(|_| {
+                            ringolo::spawn(async {
+                                Sleep::try_new(Duration::from_secs(10))?
+                                    .await
+                                    .map_err(anyhow::Error::from)
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>();
+                        .collect::<Vec<_>>();
 
-                let parent = context::current_task().context("no task in context")?;
-                assert_eq!(parent.num_children(), n);
+                    let parent = context::current_task().context("no task in context")?;
+                    assert_eq!(parent.num_children(), n);
 
-                for orphan in orphans {
-                    orphan.await??;
-                }
+                    for orphan in orphans {
+                        orphan.await??;
+                    }
 
-                Ok(())
-            });
+                    Ok(())
+                });
 
-        // Make sure we spawn all nodes
-        YieldNow::new(Some(AddMode::Fifo)).await?;
+            // Make sure we spawn all nodes
+            YieldNow::new(Some(AddMode::Fifo)).await?;
 
-        // Cancel parent
-        let stats = ringolo::recursive_cancel_all_metadata(&TaskMetadata::from(["dead"]))?;
-        assert_eq!(stats.cancelled, 1);
-        assert_eq!(stats.visited, n + 1);
+            // Cancel parent
+            let stats = ringolo::recursive_cancel_all_metadata(&TaskMetadata::from(["dead"]))?;
+            assert_eq!(stats.cancelled, 1);
+            assert_eq!(stats.visited, n + 1);
 
-        // Check orphanage - only happens after we drop the join_handle
-        let orphan_root = get_orphan_root();
-        assert_eq!(orphan_root.num_children(), 0);
-        drop(cancelled);
-        assert_eq!(orphan_root.num_children(), n);
+            // Check orphanage - only happens after we drop the join_handle
+            let orphan_root = get_orphan_root();
+            assert_eq!(orphan_root.num_children(), 0);
+            drop(cancelled);
+            assert_eq!(orphan_root.num_children(), n);
 
-        // Now cancel remaining orphans
-        let stats = ringolo::recursive_cancel_all_orphans()?;
-        assert_eq!(stats.cancelled, n);
-        assert_eq!(stats.visited, n);
+            // Now cancel remaining orphans
+            let stats = ringolo::recursive_cancel_all_orphans()?;
+            assert_eq!(stats.cancelled, n);
+            assert_eq!(stats.visited, n);
 
-        // Orphans remove themselves from orphanage
-        let orphan_root = get_orphan_root();
-        assert_eq!(orphan_root.num_children(), 0);
+            // Orphans remove themselves from orphanage
+            let orphan_root = get_orphan_root();
+            assert_eq!(orphan_root.num_children(), 0);
 
+            Ok(())
+        });
+
+        assert!(res.is_ok());
         Ok(())
     }
 

@@ -9,7 +9,8 @@ use std::sync::{Arc, Weak};
 
 use crate::context;
 use crate::runtime::{
-    SPILL_TO_HEAP_THRESHOLD, TaskMetadata, TaskOpts, TaskRegistry, get_orphan_root, get_root,
+    OrphanPolicy, SPILL_TO_HEAP_THRESHOLD, TaskMetadata, TaskOpts, TaskRegistry, get_orphan_root,
+    get_root,
 };
 use crate::task::Id;
 
@@ -274,22 +275,25 @@ impl fmt::Debug for TaskNode {
 
 impl Drop for TaskNode {
     fn drop(&mut self) {
-        // Do not orphan children if the runtime is shutting down and the
-        // TaskRegistry is closed.
         if self.has_children() && !self.registry.is_closed() {
-            // Don't orphan children of orphan root to avoid infinite loop.
-            if self.id.is_orphan_root() {
-                eprintln!(
-                    "WARNING: Exited runtime with {} orphans.",
-                    self.num_children_recursive()
-                );
-                return;
-            }
+            let policy_enforced = matches!(self.registry.orphan_policy(), OrphanPolicy::Enforced);
+            let cancel_on_exit = self.opts.contains(TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT);
 
-            // We either cancel or orphan all children.
-            if self.opts.contains(TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT) {
-                self.recursive_cancel_all();
+            if policy_enforced || cancel_on_exit {
+                let stats = self.recursive_cancel_all();
+                let msg = if policy_enforced {
+                    "OrphanPolicy is enforced"
+                } else {
+                    "parent explicitly set TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT"
+                };
+
+                // TODO: tracing
+                eprintln!(
+                    "WARNING: Cancelled {} child task(s) to prevent orphans because {}.",
+                    stats.cancelled, msg
+                );
             } else {
+                // Otherwise, we orphan the children.
                 self.take_all_children().into_iter().for_each(|child| {
                     child.orphan();
                 });
@@ -486,7 +490,7 @@ mod tests {
     // All tasks on local scheduler are sticky
     #[case::one(TaskOpts::STICKY, TaskMetadata::default())]
     #[case::two(TaskOpts::STICKY | TaskOpts::BACKGROUND_TASK, TaskMetadata::from(["a","b","c"]))]
-    #[case::three(TaskOpts::STICKY |TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT | TaskOpts::BACKGROUND_TASK, TaskMetadata::from(["d","e"]))]
+    #[case::three(TaskOpts::STICKY | TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT | TaskOpts::BACKGROUND_TASK, TaskMetadata::from(["d","e"]))]
     #[ringolo::test]
     async fn test_spawn_task_with_opts_and_metadata(
         #[case] opts: TaskOpts,
@@ -497,8 +501,12 @@ mod tests {
             .with_metadata(metadata.clone())
             .spawn(async move {
                 let node = context::current_task().context("no task node in context")?;
-                assert_eq!(node.opts, opts);
-                assert_eq!(node.metadata, Some(metadata));
+
+                crate::with_scheduler!(|s| {
+                    assert_eq!(node.opts, opts | s.default_task_opts);
+                    assert_eq!(node.metadata, Some(metadata));
+                });
+
                 Ok(())
             });
 
