@@ -294,7 +294,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
         // IOs on the thread that owns this task.
         context::with_shared(|shared| unsafe {
             shared.modify_pending_ios(
-                Header::get_owner_id(header_ptr),
+                &Header::get_owner_id(header_ptr),
                 PendingIoOp::Decrement,
                 Header::get_pending_ios(header_ptr) as usize,
             );

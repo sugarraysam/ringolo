@@ -92,13 +92,7 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        if let Err(e) = self.shared.unregister_worker(&self.core.borrow()) {
-            eprintln!(
-                "Failed to unregister worker {:?}: {:?}",
-                self.core.borrow().thread_id,
-                e
-            );
-        }
+        self.shared.unregister_worker(&self.core.borrow());
     }
 }
 

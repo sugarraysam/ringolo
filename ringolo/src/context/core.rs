@@ -105,12 +105,7 @@ impl Core {
     // a Waker implementation where the `data` pointer is the `Scheduler`
     // itself, not a task `Header`. For this reason, we do not track pending_ios
     // on the root future, which makes sense as it would not be stealable anyways.
-    pub(crate) fn modify_pending_ios(
-        &self,
-        owned_by_root: bool,
-        op: PendingIoOp,
-        waker: Option<&Waker>,
-    ) {
+    fn modify_pending_ios(&self, owned_by_root: bool, op: PendingIoOp, waker: Option<&Waker>) {
         let delta: i32 = match op {
             PendingIoOp::Increment => {
                 self.pending_ios.fetch_add(1, Ordering::Release);
@@ -128,5 +123,44 @@ impl Core {
                 Header::modify_pending_ios(ptr, delta);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use crate as ringolo;
+    use crate::context::{self, PendingIoOp};
+    use anyhow::Result;
+
+    #[ringolo::test]
+    async fn test_pending_io_on_core_and_shared() -> Result<()> {
+        let thread_id = context::with_core(|core| {
+            core.modify_pending_ios(false, PendingIoOp::Increment, None);
+            core.modify_pending_ios(false, PendingIoOp::Increment, None);
+            core.modify_pending_ios(false, PendingIoOp::Decrement, None);
+
+            assert_eq!(core.get_pending_ios(), 1);
+            core.thread_id
+        });
+
+        context::with_shared(|shared| {
+            assert_eq!(shared.get_pending_ios(&thread_id), 1);
+
+            shared.modify_pending_ios(&thread_id, PendingIoOp::Increment, 1);
+            shared.modify_pending_ios(&thread_id, PendingIoOp::Increment, 1);
+            shared.modify_pending_ios(&thread_id, PendingIoOp::Decrement, 1);
+        });
+
+        context::with_core(|core| {
+            assert_eq!(core.get_pending_ios(), 2);
+
+            // Need to manually set to zero otherwise worker does not exit.
+            core.modify_pending_ios(false, PendingIoOp::Decrement, None);
+            core.modify_pending_ios(false, PendingIoOp::Decrement, None);
+        });
+
+        Ok(())
     }
 }

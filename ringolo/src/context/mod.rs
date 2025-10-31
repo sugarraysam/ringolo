@@ -1,7 +1,7 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(dead_code)]
 
-use crate::runtime::{local, stealing, RuntimeConfig, Scheduler};
+use crate::runtime::{RuntimeConfig, Scheduler, local, stealing};
 use crate::task::{Id, TaskNode};
 use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
@@ -13,14 +13,16 @@ use std::thread_local;
 mod core;
 pub(crate) use core::Core;
 
-pub(crate) mod ring;
+pub mod ring;
 pub(crate) use ring::SingleIssuerRing;
 
-pub(crate) mod shared;
+pub mod shared;
 pub(crate) use shared::Shared;
 
-pub(crate) mod slab;
+pub mod slab;
 pub(crate) use slab::RawSqeSlab;
+
+mod slots;
 
 pub(crate) struct RootContext {
     context: Context,
