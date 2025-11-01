@@ -25,15 +25,13 @@
 //!   results should be parsed. This is meant to be a low-level building block
 //!   library.
 //!
-use crate::runtime::CleanupTaskBuilder;
 use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
-use crate::task::JoinHandle;
 use futures::Stream;
 use io_uring::squeue::Entry;
 use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::task::{ready, Context, Poll};
+use std::task::{Context, Poll, ready};
 
 pub(crate) mod errors;
 pub(crate) use errors::OpcodeError;
@@ -144,14 +142,22 @@ impl<T: OpPayload> PinnedDrop for Op<T> {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum CancelHow {
+    AsyncCancel,
+    TimeoutRemove,
+}
+
 /// Traits and structs for multishot `io_uring` operations (i.e.: SqeStream).
 pub(crate) trait MultishotPayload {
     type Item;
 
+    fn cancel_how(&self) -> CancelHow;
+
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError>;
 
     fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>)
-        -> Result<Self::Item, IoError>;
+    -> Result<Self::Item, IoError>;
 }
 
 #[derive(Debug)]
@@ -191,7 +197,7 @@ impl<T: MultishotPayload> Multishot<T> {
         }
     }
 
-    pub(crate) fn cancel(self: Pin<&mut Self>) -> Option<JoinHandle<()>> {
+    pub(crate) fn cancel(self: Pin<&mut Self>) -> Option<usize> {
         let mut this = self.project();
 
         let cancelled = std::mem::replace(this.cancelled, true);
@@ -211,12 +217,17 @@ impl<T: MultishotPayload> Multishot<T> {
             }
         };
 
-        // Using `.all()` will NOT return -ENOENT if we can't find the associated SQE with user_data.
-        // Better to target a single SQE even if it is multishot.
-        let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
-        let task = CleanupTaskBuilder::new(AsyncCancel::new(builder)).with_slab_entry(user_data);
+        match this.data.cancel_how() {
+            CancelHow::AsyncCancel => {
+                let builder = io_uring::types::CancelBuilder::user_data(user_data as u64);
+                crate::async_cancel(builder, user_data);
+            }
+            CancelHow::TimeoutRemove => {
+                crate::async_timeout_remove(user_data);
+            }
+        }
 
-        Some(crate::runtime::spawn_cleanup(task))
+        Some(user_data)
     }
 }
 
@@ -254,7 +265,11 @@ impl<T: MultishotPayload> PinnedDrop for Multishot<T> {
         // nature and we can't block and wait for the result here. The task handles
         // errors and retries internally. It is also safe to drop the JoinHandle,
         // the task will continue in the background and it's result will be lost.
-        let _ = self.cancel();
+        let should_cancel = self.cancel();
+        eprintln!(
+            "Multishot responsible to cancel RawSqe: {:?}",
+            should_cancel
+        );
     }
 }
 

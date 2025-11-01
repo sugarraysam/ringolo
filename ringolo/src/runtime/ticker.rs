@@ -31,13 +31,17 @@ pub(crate) trait TickerData {
 bitflags! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub(crate) struct TickerEvents: u16 {
+        /// A request to shut down the runtime.
+        const SHUTDOWN = 1;
+
         /// A request to submit any pending submission queue entries to the kernel.
-        const SUBMIT_SQES = 1;
+        const SUBMIT_SQES = 1 << 1;
 
         /// A request to process any available completion queue entries from the kernel.
-        const PROCESS_CQES = 1 << 1;
+        const PROCESS_CQES = 1 << 2;
 
-        /// A request to shut down the runtime.
-        const SHUTDOWN = 1 << 2;
+        /// Enforce fairness in scheduler and force look in global injector queue to
+        /// make sure we get started on new work.
+        const POP_GLOBAL_QUEUE = 1 << 3;
     }
 }

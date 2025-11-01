@@ -57,6 +57,7 @@ impl<T: Future, S: Schedule> TaskLayout<T, S> {
         let vtable = vtable::<T, S>();
         let registry = scheduler.task_registry();
 
+        // Combine all constructors under a single heap allocation.
         let result = Box::new(TaskLayout {
             header: Header::new(state, vtable, opts),
             core: Core {
@@ -374,7 +375,7 @@ unsafe fn schedule<S: Schedule>(ptr: NonNull<Header>) {
     let scheduler = Header::get_scheduler::<S>(ptr);
     scheduler
         .as_ref()
-        .schedule(false, Notified::new(Task::from_raw(ptr.cast())));
+        .schedule(Notified::new(Task::from_raw(ptr.cast())));
 }
 
 unsafe fn dealloc<T: Future, S: Schedule>(ptr: NonNull<Header>) {

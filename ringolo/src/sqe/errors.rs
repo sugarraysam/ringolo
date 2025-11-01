@@ -23,6 +23,9 @@ pub enum IoError {
     #[error("FATAL: Slab allocator is in an invalid state")]
     SlabInvalidState,
 
+    #[error("FATAL: SQE backend is in an invalid state")]
+    SqeBackendInvalidState,
+
     #[error("Opcode error: {0}")]
     Opcode(#[from] OpcodeError),
 

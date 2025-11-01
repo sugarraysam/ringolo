@@ -90,7 +90,16 @@ impl SingleIssuerRing {
             let ts = Timespec::from(duration);
             let args = SubmitArgs::new().timespec(&ts);
 
-            return self.ring.submitter().submit_with_args(num_to_wait, &args);
+            return match self.ring.submitter().submit_with_args(num_to_wait, &args) {
+                Ok(n) => Ok(n),
+
+                // To enable shutdown path, we need to timeout `io_uring_enter` syscall
+                // to avoid blocking indefinitely. Treat timeouts as submit(0) and not
+                // errors.
+                Err(e) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
+
+                Err(e) => Err(e),
+            };
         }
 
         self.ring.submitter().submit_and_wait(num_to_wait)
@@ -160,9 +169,10 @@ impl SingleIssuerRing {
                         continue;
                     }
                     Ok(sqe) => {
-                        // Ignore unknown CQEs which might have valid index in
-                        // the Slab. Can this even happen?
                         if !matches!(sqe.get_state(), RawSqeState::Pending | RawSqeState::Ready) {
+                            // Ignore unknown CQEs which might have valid index in
+                            // the Slab. Can this even happen?
+                            eprintln!("SQE in unexpected state: {:?}", sqe.get_state());
                             continue;
                         }
                         sqe
@@ -198,6 +208,21 @@ mod tests {
     use smallvec::SmallVec;
     use std::pin::pin;
     use std::task::{Context, Poll};
+
+    #[test]
+    fn test_submit_timeout() -> Result<()> {
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+
+        // Submit with empty ring should timeout - timeout is not an error
+        context::with_ring_mut(|ring| {
+            assert!(
+                ring.submit_and_wait(1, Some(Duration::from_millis(5)))
+                    .is_ok()
+            );
+        });
+
+        Ok(())
+    }
 
     #[test]
     fn test_taskrun_flag() -> Result<()> {
@@ -319,7 +344,7 @@ mod tests {
 
                     // We use single SQE even though we use batch API on slab,
                     // anyways a bit messed up but need to count N pending ios.
-                    context::with_core(|core| core.increment_pending_ios(&waker));
+                    context::with_core(|core| core.increment_pending_ios());
                 });
 
                 let _ = batch.commit(raws)?;

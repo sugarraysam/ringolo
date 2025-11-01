@@ -1,18 +1,21 @@
-use crate::context::Shared;
-use crate::runtime::stealing::worker::Worker;
+use crate::context::{self, Shared};
+use crate::runtime::registry::InsertResult;
+use crate::runtime::stealing::pool::{ThreadPool, WorkerRef};
+use crate::runtime::waker::Wake;
 use crate::runtime::{
-    AddMode, OwnedTasks, PanicReason, RuntimeConfig, Schedule, SchedulerPanic, TaskMetadata,
-    TaskOpts, TaskRegistry, YieldReason,
+    AddMode, EventLoop, OwnedTasks, PanicReason, RuntimeConfig, Schedule, SchedulerPanic,
+    TaskMetadata, TaskOpts, TaskRegistry, YieldReason,
 };
-use crate::sqe::IoError;
-use crate::task::{Id, JoinHandle, Notified, Task};
+use crate::task::{JoinHandle, Notified, Task};
+#[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
-use crossbeam_deque::{Injector, Worker as CbWorker};
-use std::collections::HashSet;
+use anyhow::Result;
+use crossbeam_deque::Injector;
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Barrier, OnceLock};
 use std::task::Waker;
+use std::thread;
 
 pub(crate) type StealableTask = Notified<Handle>;
 
@@ -22,13 +25,24 @@ pub struct Scheduler {
 
     pub(crate) default_task_opts: TaskOpts,
 
-    pub(crate) tasks: Arc<OwnedTasks<Handle>>,
-
-    /// The global injector queue for new tasks.
-    pub(crate) injector: Arc<Injector<StealableTask>>,
+    /// The Waker associated with the scheduler can be used to await a JoinHandle.
+    /// This means we need a thread-safe way to interact with `root_woken`.
+    pub(super) root_woken: AtomicBool,
 
     /// Shared context between workers, to be injected in every worker thread.
     pub(crate) shared: Arc<Shared>,
+
+    pub(crate) tasks: Arc<OwnedTasks<Handle>>,
+
+    /// The global injector queue for new tasks.
+    pub(super) injector: Arc<Injector<StealableTask>>,
+
+    /// ThreadPool of workers.
+    pub(super) pool: OnceLock<ThreadPool>,
+
+    /// We use this barrier to coordinate startup of maintenance tasks across
+    /// all workers, including the root worker.
+    pub(super) maintenance_task_barrier: Arc<Barrier>,
 
     #[cfg(test)]
     pub(crate) tracker: Tracker,
@@ -36,55 +50,15 @@ pub struct Scheduler {
 
 impl Scheduler {
     pub(crate) fn new(cfg: &RuntimeConfig) -> Self {
-        let shared = Arc::new(Shared::new(cfg));
-
-        let injector = Arc::new(Injector::new());
-        let mut local_queues = Vec::with_capacity(cfg.worker_threads);
-        let mut stealers = Vec::with_capacity(cfg.worker_threads);
-
-        for _ in 0..cfg.worker_threads {
-            let w = CbWorker::new_lifo();
-            stealers.push(w.stealer());
-            local_queues.push(w);
-        }
-
-        let workers = local_queues
-            .into_iter()
-            .enumerate()
-            .map(|(i, local_queue)| {
-                // Exclude this worker's stealer. Stealer queue is cheap to clone
-                // inner value is behind an Arc so we just increment the ref count.
-                let other_stealers = stealers
-                    .iter()
-                    .enumerate()
-                    .filter(|(j, _)| *j != i)
-                    .map(|(_, s)| s.clone())
-                    .collect::<Vec<_>>();
-
-                Worker::new(cfg.clone(), injector.clone(), local_queue, other_stealers)
-            })
-            .collect::<Vec<_>>();
-
-        // TODO: spawn workers, do something with handles
-        let _handles = workers
-            .into_iter()
-            .map(|w| {
-                let _shared_clone = Arc::clone(&shared);
-
-                std::thread::spawn(move || {
-                    let _worker = w;
-                    // init_stealing_context(shared_clone, &worker);
-                    // worker.event_loop();
-                })
-            })
-            .collect::<Vec<_>>();
-
         Self {
             cfg: cfg.clone(),
             default_task_opts: cfg.default_task_opts(),
+            shared: Arc::new(Shared::new(cfg)),
             tasks: OwnedTasks::new(cfg),
-            injector,
-            shared,
+            injector: Arc::new(Injector::new()),
+            root_woken: AtomicBool::new(true),
+            pool: OnceLock::new(),
+            maintenance_task_barrier: Arc::new(Barrier::new(cfg.worker_threads + 1)),
 
             #[cfg(test)]
             tracker: Tracker::new(),
@@ -95,38 +69,124 @@ impl Scheduler {
         Handle(Arc::new(self))
     }
 
-    // TODO: spawn threads function
+    pub(super) fn set_root_woken(&self) {
+        self.root_woken.store(true, Ordering::Release);
+    }
+
+    pub(super) fn reset_root_woken(&self) -> bool {
+        self.root_woken.swap(false, Ordering::AcqRel)
+    }
+
+    // Small price to pay to get introspection on all scheduler calls during
+    // testing. No op in release builds.
+    #[allow(unused)]
+    #[inline(always)]
+    fn track(&self, method: Method, call: Call) {
+        #[cfg(test)]
+        self.tracker.record(method, call);
+    }
+}
+
+// Safety: Only reason we need this is because we refuse to use an atomic for
+// `root_woken` which is fine as this is the responsibility of a single worker.
+unsafe impl Send for Scheduler {}
+unsafe impl Sync for Scheduler {}
+
+impl Wake for Scheduler {
+    fn wake(arc_self: Arc<Self>) {
+        Wake::wake_by_ref(&arc_self);
+    }
+
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        arc_self.root_woken.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Handle(Arc<Scheduler>);
 
 impl Schedule for Handle {
-    fn schedule(&self, is_new: bool, task: StealableTask) {
-        if is_new {
-            // New tasks go to the global queue to be picked up by any worker.
+    #[track_caller]
+    fn schedule(&self, task: StealableTask) {
+        #[cfg(test)]
+        self.track(Method::Schedule, Call::Schedule { id: task.id() });
+
+        // Tasks spawned on `root_worker` go in the global injector queue.
+        if context::with_core(|c| c.is_polling_root()) {
             self.0.injector.push(task);
+            let _ = self.shared.unpark_one_thread();
         } else {
-            // TODO:
-            // - get_worker from thread_id (workers map in Shared)
-            // with_shared(|shared| {
-            //     let mode = ...;
-            //     shared.get_worker().add_task(task, mode);
-            // });
+            // Otherwise, add task to the local worker.
+            self.add_task_to_current_worker(task, AddMode::Lifo);
         }
     }
 
     fn yield_now(&self, waker: &Waker, reason: YieldReason, mode: Option<AddMode>) {
-        unimplemented!("todo");
+        #[cfg(test)]
+        self.track(Method::YieldNow, Call::YieldNow { reason, mode });
+
+        // Default to adding the task to the back of the queue.
+        let mut mode = mode.unwrap_or(AddMode::Fifo);
+
+        match reason {
+            YieldReason::SqRingFull | YieldReason::SlabFull => {
+                // Reduce scheduler latency, event outside control of task add to
+                // front of queue in this case.
+                mode = AddMode::Lifo;
+
+                if let Err(e) = context::with_slab_and_ring_mut(|slab, ring| -> Result<usize> {
+                    ring.submit_and_wait(1, None)?;
+                    ring.process_cqes(slab, None)
+                }) {
+                    self.panic_on_scheduler_error(
+                        reason.into(),
+                        format!("Unable to submit or process cqes: {:?}", &e),
+                    );
+                }
+            }
+
+            // Nothing to do, keep FIFO order as task should run soon but not next.
+            YieldReason::NoTaskBudget | YieldReason::Unknown | YieldReason::SelfYielded => { /* */ }
+        }
+
+        // If the root_future is yielding, we need to handle it differently.
+        if context::with_core(|c| c.is_polling_root()) {
+            self.set_root_woken();
+        } else {
+            // Safety: there is two flavors of Waker in the codebase, one for
+            // tasks and one for the root_future. We just checked that we are not
+            // currently polling the root future.
+            if let Some(task) = unsafe { Notified::from_waker(waker) } {
+                self.add_task_to_current_worker(task, mode);
+            }
+        }
     }
 
-    fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {
-        unimplemented!("todo");
+    fn release(&self, task: &Task<Self>) -> Option<Task<Self>> {
+        #[cfg(test)]
+        self.track(Method::Release, Call::Release { id: task.id() });
+        self.tasks.remove(&task.id())
     }
 
     /// Polling the task resulted in a panic.
+    #[track_caller]
     fn unhandled_panic(&self, payload: SchedulerPanic) {
-        unimplemented!("todo");
+        #[cfg(test)]
+        self.track(
+            Method::UnhandledPanic,
+            Call::UnhandledPanic {
+                reason: payload.reason,
+            },
+        );
+
+        // TODO:
+        // - tokio uses Panic handlers
+        // - cleanup? drain? clean shutdown?
+
+        panic!(
+            "FATAL: scheduler panic. Reason: {:?}, msg: {:?}",
+            payload.reason, payload.msg
+        );
     }
 
     fn task_registry(&self) -> Arc<dyn TaskRegistry> {
@@ -135,8 +195,33 @@ impl Schedule for Handle {
 }
 
 impl Handle {
-    pub(crate) fn block_on<F: Future>(&self, future: F) -> F::Output {
-        unimplemented!("TODO");
+    pub(crate) fn spawn_workers(&self) {
+        self.pool.get_or_init(|| ThreadPool::new(self));
+    }
+
+    pub(super) fn wait_for_thread_pool(&self) {
+        let _ = self.pool.wait();
+    }
+
+    pub(super) fn wait_for_all_maintenance_tasks(&self) {
+        let _ = self.maintenance_task_barrier.wait();
+    }
+
+    #[track_caller]
+    pub(crate) fn block_on<F: Future>(&self, root_fut: F) -> F::Output {
+        match self.get_pool().root_worker.event_loop(Some(root_fut)) {
+            Ok(Some(res)) => res,
+
+            Ok(None) => self.panic_on_scheduler_error(
+                PanicReason::PollingFuture,
+                "Event loop returned 'None' without an error.",
+            ),
+
+            Err(e) => self.panic_on_scheduler_error(
+                PanicReason::PollingFuture,
+                format!("Failed to drive future to completion: {:?}", &e),
+            ),
+        }
     }
 
     pub(crate) fn spawn<F>(
@@ -154,22 +239,73 @@ impl Handle {
         let (task, notified, join_handle) =
             crate::task::new_task(future, opts, metadata, self.clone());
 
-        // TODO: insert task take ownership
-        // debug_assert!(self.tasks.insert(task).is_none());
-
-        self.schedule(true, notified);
+        match self.tasks.insert(task) {
+            InsertResult::Ok => self.schedule(notified),
+            InsertResult::Shutdown => {
+                // TODO: tracing :: warn but safe to continue
+                eprintln!("Tried to spawn a task after shutdown...");
+            }
+            InsertResult::Duplicate(id) => self.unhandled_panic(SchedulerPanic::new(
+                PanicReason::DuplicateTaskId,
+                format!("Tried to spawn task with duplicate id: {}", id),
+            )),
+        }
 
         join_handle
     }
 
-    pub(crate) fn shutdown(&self) {
-        self.shared.shutdown.store(true, Ordering::Release);
-        self.tasks.shutdown_all();
+    /// Shutdown the stealing scheduler.
+    pub(crate) fn shutdown(&self) -> Result<()> {
+        // Set global shutdown signal - ensure we shutdown once
+        if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
+            // Close the registry and partition tasks by thread_id - this is because
+            // dropping futures has to happen on the thread that owns the task, as
+            // SQE backends use thread-local context in Drop impl.
+            self.tasks.close_and_partition();
 
-        // TODO:
-        // - wake-up parked workers?
-        // - shutdown global injector queue
-        // - do we need signal on shared?
+            // Unpark all workers - important to do *after* partitioning tasks.
+            context::with_shared(|shared| shared.unpark_all_threads());
+
+            // Wait for workers to cancel their tasks.
+            let res = self
+                .pool
+                .get()
+                .expect("thread pool not initialized")
+                .join_all();
+
+            // Cancel all remaining tasks.
+            self.tasks.shutdown_all_partitions();
+
+            res
+        } else {
+            Ok(())
+        }
+    }
+
+    #[track_caller]
+    fn add_task_to_current_worker(&self, task: StealableTask, mode: AddMode) {
+        let thread_id = thread::current().id();
+
+        self.get_pool()
+            .with_worker(&thread_id, |worker| match worker {
+                WorkerRef::Root(w) => w.add_task(task, mode),
+                WorkerRef::NonRoot(w) => w.add_task(task, mode),
+            });
+    }
+
+    #[track_caller]
+    pub(super) fn get_pool(&self) -> &ThreadPool {
+        self.pool.get().expect("thread pool not initialized")
+    }
+
+    #[cold]
+    #[track_caller]
+    fn panic_on_scheduler_error<M>(&self, reason: PanicReason, msg: M) -> !
+    where
+        M: std::fmt::Display,
+    {
+        self.unhandled_panic(SchedulerPanic::new(reason, msg));
+        unreachable!("Scheduler panic");
     }
 }
 

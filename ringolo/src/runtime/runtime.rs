@@ -1,17 +1,20 @@
 use crate as ringolo;
 use crate::context;
+use crate::context::maintenance::OnCleanupError;
 use crate::runtime::Scheduler;
-use crate::runtime::cleanup::OnCleanupError;
 use crate::runtime::local;
 use crate::runtime::stealing;
 use crate::spawn::TaskOpts;
 use crate::task::JoinHandle;
+use crate::utils::thread::set_current_thread_name;
 use anyhow::{Result, anyhow};
 use std::cell::Cell;
 use std::convert::TryFrom;
 use std::fmt;
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::thread;
 
 // Used wherever we rely on SmallVec to store entries on stack first.
@@ -19,11 +22,8 @@ use std::thread;
 // far the largest thing we store here is 64 byte Entry structs.
 pub(crate) const SPILL_TO_HEAP_THRESHOLD: usize = 16;
 
-/// Unimplemented!
-const MAX_BLOCKING_THREADS: usize = 512;
-
 /// Default size for io_uring SQ ring.
-const SQ_RING_SIZE: usize = 64;
+const SQ_RING_SIZE: usize = 1024;
 
 /// Final cq ring size is SQ_RING_SIZE * multipler
 const CQ_RING_SIZE_MULTIPLIER: usize = 2;
@@ -34,6 +34,9 @@ const DIRECT_FDS_PER_RING: u32 = 1024;
 ///
 /// Event Loop policies
 //
+/// Global queue interval default value.
+const GLOBAL_QUEUE_INTERVAL: u32 = 31;
+
 /// Fairly arbitrary, copied from tokio `event_interval`.
 #[cfg(not(test))]
 const PROCESS_CQES_INTERVAL: u32 = 61;
@@ -47,6 +50,9 @@ const SUBMIT_INTERVAL: u32 = PROCESS_CQES_INTERVAL / 4;
 /// Submit if sq ring 33% full
 const MAX_UNSUBMITTED_SQES: usize = SQ_RING_SIZE / 3;
 
+/// Maximum number of stealing attempts.
+const MAX_STEAL_RETRIES: usize = 3;
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Kind {
     Local,
@@ -54,11 +60,15 @@ pub(crate) enum Kind {
 }
 
 #[derive(Clone)]
-pub(crate) struct ThreadNameFn(Arc<dyn Fn() -> String + Send + Sync + 'static>);
+pub(crate) struct ThreadNameFn(pub(crate) Arc<dyn Fn() -> String + Send + Sync + 'static>);
 
-// TODO: add thread_id
 fn default_thread_name_fn() -> ThreadNameFn {
-    ThreadNameFn(Arc::new(move || "ringolo-worker-{}".into()))
+    let worker_count = Arc::new(AtomicUsize::new(0));
+
+    ThreadNameFn(Arc::new(move || {
+        let id = worker_count.fetch_add(1, Ordering::Relaxed);
+        format!("ringolo-{}", id)
+    }))
 }
 
 impl fmt::Debug for ThreadNameFn {
@@ -99,41 +109,36 @@ pub struct Builder {
     /// Runtime type
     kind: Kind,
 
-    /// The number of worker threads, used by Runtime.
-    ///
-    /// Only used when not using the current-thread executor.
-    ///
-    /// Defaults to 1 worker per CPU core.
+    /// The number of worker threads, used by the stealing scheduler. Defaults
+    /// to 1 per core and a `root_worker` to drive the future provided in the
+    /// `block_on` function.
     worker_threads: Option<usize>,
 
-    max_blocking_threads: usize,
-
     /// Name fn used for threads spawned by the runtime.
-    pub(super) thread_name: ThreadNameFn,
+    thread_name: ThreadNameFn,
 
     /// Stack size used for threads spawned by the runtime.
-    pub(super) thread_stack_size: Option<usize>,
+    thread_stack_size: Option<usize>,
 
-    /// How many ticks before pulling a task from the global/remote queue.
-    ///
-    /// When `None`, the value is unspecified and behavior details are left to
-    /// the scheduler. Each scheduler flavor could choose to either pick its own
-    /// default value or use some other strategy to decide when to poll from the
-    /// global queue. For example, the multi-threaded scheduler uses a
-    /// self-tuning strategy based on mean task poll times.
-    pub(super) global_queue_interval: Option<u32>,
-
-    /// Submit SQEs every N ticks
-    pub(super) submit_interval: u32,
+    /// How many ticks before pulling a task from the global injector queue.
+    global_queue_interval: u32,
 
     /// Process CQEs every N ticks
-    pub(super) process_cqes_interval: u32,
+    process_cqes_interval: u32,
+
+    /// Submit SQEs every N ticks
+    submit_interval: u32,
 
     /// Maximum amount of unsubmitted sqes before we force submit
-    pub(super) max_unsubmitted_sqes: usize,
+    max_unsubmitted_sqes: usize,
+
+    /// How many times a worker will loop over the global injector queue and
+    /// other stealable queues to try and find work, before moving on to other
+    /// tasks from event_loop.
+    max_steal_retries: usize,
 
     /// Size of io_uring SQ ring
-    pub(super) sq_ring_size: usize,
+    sq_ring_size: usize,
 
     /// Final size of cq ring will be `sq_ring_size * cq_ring_size_multiplier`.
     /// Default is 2 as per `io_uring`'s own default value. Why? We have SQE primitives
@@ -148,17 +153,17 @@ pub struct Builder {
     ///
     /// In all cases, if the SQ ring goes above capacity, the program should send a
     /// loud signal to the user and runtim configuration needs to be changed ASAP.
-    pub(super) cq_ring_size_multiplier: usize,
+    cq_ring_size_multiplier: usize,
 
     /// Number of direct file descriptors per ring. We use `register_files_sparse`
     /// so make sure you use `KernelFdMode::DirectAuto` for best results.
-    pub(super) direct_fds_per_ring: u32,
+    direct_fds_per_ring: u32,
 
     /// When an async cleanup operation fails, what to do?
-    pub(super) on_cleanup_error: OnCleanupError,
+    on_cleanup_error: OnCleanupError,
 
     /// Defines how to enforce structured concurrency.
-    pub(super) orphan_policy: OrphanPolicy,
+    orphan_policy: OrphanPolicy,
 }
 
 impl Builder {
@@ -166,13 +171,13 @@ impl Builder {
         Self {
             kind,
             worker_threads: None,
-            max_blocking_threads: MAX_BLOCKING_THREADS,
             thread_name: default_thread_name_fn(),
             thread_stack_size: None,
-            global_queue_interval: None,
-            submit_interval: SUBMIT_INTERVAL,
+            global_queue_interval: GLOBAL_QUEUE_INTERVAL,
             process_cqes_interval: PROCESS_CQES_INTERVAL,
+            submit_interval: SUBMIT_INTERVAL,
             max_unsubmitted_sqes: MAX_UNSUBMITTED_SQES,
+            max_steal_retries: MAX_STEAL_RETRIES,
             sq_ring_size: SQ_RING_SIZE,
             cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
             on_cleanup_error: OnCleanupError::default(),
@@ -192,23 +197,28 @@ impl Builder {
         Builder::new(Kind::Stealing)
     }
 
+    /// The number of worker threads, used by the Runtime. Only relevant when
+    /// using a multi-threaded scheduler (i.e.: stealing scheduler).
+    ///
+    /// Defaults to 1 worker per CPU core.
+    ///
+    /// Please note the runtime also has a `root_worker` which *does not count*
+    /// towards the total number of worker threads. This `root_worker` is
+    /// responsible to drive the `root_future` provided to the `block_on` call.
+    #[track_caller]
     pub fn worker_threads(mut self, val: usize) -> Self {
-        assert!(val > 0, "Worker threads cannot be set to 0");
+        assert!(val > 0, "worker_threads must be greater than 0");
         self.worker_threads = Some(val);
         self
     }
 
-    // TODO
-    fn max_blocking_threads(self, _val: usize) -> Self {
-        unimplemented!("TODO");
-        // assert!(val > 0, "Max blocking threads cannot be set to 0");
-        // self.max_blocking_threads = val;
-        // self
-    }
-
     /// Sets name of threads spawned by the `Runtime`'s thread pool.
     ///
-    /// The default name is "ringolo-worker-{thread_id}".
+    /// The default name is "ringolo-{id}", where id is monotonically
+    /// increasing.
+    ///
+    /// Thread names are truncated beyond 15 bytes according to pthread
+    /// limitations.
     pub fn thread_name(mut self, val: impl Into<String>) -> Self {
         let val = val.into();
         self.thread_name = ThreadNameFn(Arc::new(move || val.clone()));
@@ -234,7 +244,12 @@ impl Builder {
     ///
     /// The default stack size for spawned threads is 2 MiB, though this
     /// particular stack size is subject to change in the future.
+    #[track_caller]
     pub fn thread_stack_size(mut self, val: usize) -> Self {
+        assert!(
+            val.is_power_of_two(),
+            "thread_stack_size must be a power of two"
+        );
         self.thread_stack_size = Some(val);
         self
     }
@@ -244,8 +259,6 @@ impl Builder {
     ///
     /// A scheduler "tick" roughly corresponds to one `poll` invocation on a task.
     ///
-    /// By default the global queue interval is 31 for the current-thread scheduler.
-    ///
     /// Schedulers have a local queue of already-claimed tasks, and a global queue of incoming
     /// tasks. Setting the interval to a smaller value increases the fairness of the scheduler,
     /// at the cost of more synchronization overhead. That can be beneficial for prioritizing
@@ -254,43 +267,58 @@ impl Builder {
     /// tasks from the local queue will be executed only if the global queue is empty.
     /// Conversely, a higher value prioritizes existing work, and is a good choice when most
     /// tasks quickly complete polling.
-    ///
-    /// # Panics
-    ///
-    /// This function will panic if 0 is passed as an argument.
     #[track_caller]
     pub fn global_queue_interval(mut self, val: u32) -> Self {
         assert!(val > 0, "global_queue_interval must be greater than 0");
-        self.global_queue_interval = Some(val);
+        self.global_queue_interval = val;
         self
     }
 
-    pub fn submit_interval(mut self, val: u32) -> Self {
-        self.submit_interval = val;
-        self
-    }
-
+    #[track_caller]
     pub fn process_cqes_interval(mut self, val: u32) -> Self {
+        assert!(val > 0, "process_cqes_interval must be greater than 0");
         self.process_cqes_interval = val;
         self
     }
 
+    #[track_caller]
+    pub fn submit_interval(mut self, val: u32) -> Self {
+        assert!(val > 0, "submit_interval must be greater than 0");
+        self.submit_interval = val;
+        self
+    }
+
+    #[track_caller]
     pub fn max_unsubmitted_sqes(mut self, val: usize) -> Self {
+        assert!(val > 0, "max_unsubmitted_sqes must be greater than 0");
         self.max_unsubmitted_sqes = val;
         self
     }
 
+    #[track_caller]
+    pub fn max_steal_retries(mut self, val: usize) -> Self {
+        assert!(val > 0, "max_steal_retries must be greater than 0");
+        self.max_steal_retries = val;
+        self
+    }
+
+    #[track_caller]
     pub fn sq_ring_size(mut self, val: usize) -> Self {
+        assert!(val.is_power_of_two(), "sq_ring_size must be a power of two");
         self.sq_ring_size = val;
         self
     }
 
+    #[track_caller]
     pub fn cq_ring_size_multiplier(mut self, val: usize) -> Self {
+        assert!(val > 0, "cq_ring_size_multiplier must be greater than 0");
         self.cq_ring_size_multiplier = val;
         self
     }
 
+    #[track_caller]
     pub fn direct_fds_per_ring(mut self, val: u32) -> Self {
+        assert!(val > 0, "direct_fds_per_ring must be greater than 0");
         self.direct_fds_per_ring = val;
         self
     }
@@ -344,17 +372,21 @@ impl Builder {
         let cfg = self.try_into()?;
         let scheduler = local::Scheduler::new(&cfg).into_handle();
 
-        if let Err(e) = context::init_local_context(&cfg, scheduler.clone()) {
-            panic!("Failed to initialize local context: {:?}", e);
-        }
+        // There is no way to modify the current thread name using `std::thread`,
+        // so we use `libc::` and platform specific low-level interface.
+        set_current_thread_name(&cfg.thread_name);
+        context::init_local_context(scheduler.clone());
 
         Ok(Runtime::new(Scheduler::Local(scheduler)))
     }
 
     fn try_build_stealing_runtime(self) -> Result<Runtime> {
         let cfg = self.try_into()?;
-        let scheduler = stealing::Scheduler::new(&cfg);
-        Ok(Runtime::new(Scheduler::Stealing(scheduler.into_handle())))
+        let scheduler = stealing::Scheduler::new(&cfg).into_handle();
+
+        scheduler.spawn_workers();
+
+        Ok(Runtime::new(Scheduler::Stealing(scheduler)))
     }
 }
 
@@ -401,7 +433,9 @@ impl Runtime {
                 handle.shutdown();
             }
             Scheduler::Stealing(handle) => {
-                handle.shutdown();
+                if let Err(e) = handle.shutdown() {
+                    eprintln!("error during runtime shutdown: {:?}", e);
+                }
             }
         }
     }
@@ -409,7 +443,6 @@ impl Runtime {
 
 impl Drop for Runtime {
     fn drop(&mut self) {
-        dbg!("runtime dropped..shutting down");
         self.shutdown_inner();
     }
 }
@@ -438,13 +471,13 @@ impl Runtime {
 pub(crate) struct RuntimeConfig {
     pub(crate) kind: Kind,
     pub(crate) worker_threads: usize,
-    pub(crate) max_blocking_threads: usize,
     pub(crate) thread_name: ThreadNameFn,
     pub(crate) thread_stack_size: Option<usize>,
-    pub(crate) global_queue_interval: Option<u32>,
-    pub(crate) submit_interval: u32,
+    pub(crate) global_queue_interval: u32,
     pub(crate) process_cqes_interval: u32,
+    pub(crate) submit_interval: u32,
     pub(crate) max_unsubmitted_sqes: usize,
+    pub(crate) max_steal_retries: usize,
     pub(crate) sq_ring_size: usize,
     pub(crate) cq_ring_size_multiplier: usize,
     pub(crate) direct_fds_per_ring: u32,
@@ -452,16 +485,29 @@ pub(crate) struct RuntimeConfig {
     pub(crate) orphan_policy: OrphanPolicy,
 }
 
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        RuntimeConfig {
+            kind: Kind::Local,
+            worker_threads: 1,
+            thread_name: default_thread_name_fn(),
+            thread_stack_size: None,
+            global_queue_interval: GLOBAL_QUEUE_INTERVAL,
+            process_cqes_interval: PROCESS_CQES_INTERVAL,
+            submit_interval: SUBMIT_INTERVAL,
+            max_unsubmitted_sqes: MAX_UNSUBMITTED_SQES,
+            max_steal_retries: MAX_STEAL_RETRIES,
+            sq_ring_size: SQ_RING_SIZE,
+            cq_ring_size_multiplier: CQ_RING_SIZE_MULTIPLIER,
+            direct_fds_per_ring: DIRECT_FDS_PER_RING,
+            on_cleanup_error: OnCleanupError::default(),
+            orphan_policy: OrphanPolicy::default(),
+        }
+    }
+}
+
 impl RuntimeConfig {
     fn validate(&self) -> Result<()> {
-        if self.sq_ring_size == 0 {
-            return Err(anyhow!("sq_ring_size must be greater than 0"));
-        }
-
-        if self.cq_ring_size_multiplier == 0 {
-            return Err(anyhow!("cq_ring_size_multiplier must be greater than 0"));
-        }
-
         let num_workers = match self.kind {
             Kind::Local => 1,
             Kind::Stealing => self.worker_threads,
@@ -499,13 +545,13 @@ impl TryFrom<Builder> for RuntimeConfig {
         let cfg = RuntimeConfig {
             kind: builder.kind,
             worker_threads,
-            max_blocking_threads: builder.max_blocking_threads,
             thread_name: builder.thread_name,
             thread_stack_size: builder.thread_stack_size,
             global_queue_interval: builder.global_queue_interval,
-            submit_interval: builder.submit_interval,
             process_cqes_interval: builder.process_cqes_interval,
+            submit_interval: builder.submit_interval,
             max_unsubmitted_sqes: builder.max_unsubmitted_sqes,
+            max_steal_retries: builder.max_steal_retries,
             sq_ring_size: builder.sq_ring_size,
             cq_ring_size_multiplier: builder.cq_ring_size_multiplier,
             direct_fds_per_ring: builder.direct_fds_per_ring,

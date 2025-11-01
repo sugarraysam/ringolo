@@ -1,5 +1,5 @@
 // Expose rich API for developers even if unused.
-#![allow(dead_code)]
+// #![allow(dead_code)]
 
 use crate::context::RawSqeSlab;
 use crate::context::SingleIssuerRing;

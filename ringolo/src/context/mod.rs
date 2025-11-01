@@ -1,17 +1,17 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(dead_code)]
 
-use crate::runtime::{RuntimeConfig, Scheduler, local, stealing};
+use crate::runtime::{Scheduler, local, stealing};
 use crate::task::{Id, TaskNode};
-use anyhow::Result;
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
-use std::thread::ThreadId;
 use std::thread_local;
 
 // Exports
 mod core;
 pub(crate) use core::Core;
+
+pub mod maintenance;
 
 pub mod ring;
 pub(crate) use ring::SingleIssuerRing;
@@ -58,19 +58,29 @@ thread_local! {
 }
 
 #[track_caller]
-pub(crate) fn init_local_context(cfg: &RuntimeConfig, scheduler: local::Handle) -> Result<()> {
+pub(crate) fn init_local_context(scheduler: local::Handle) {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
-            let ctx = local::Context::try_new(cfg, &scheduler)
+            let ctx = local::Context::try_new(&scheduler.cfg, &scheduler)
                 .expect("Failed to initialize thread-local context");
+
             RefCell::new(RootContext::new_local(ctx, scheduler))
         });
     });
-
-    Ok(())
 }
 
 #[track_caller]
+pub(crate) fn init_stealing_context(scheduler: stealing::Handle) {
+    CONTEXT.with(|ctx| {
+        ctx.get_or_init(|| {
+            let ctx = stealing::Context::try_new(&scheduler.cfg, Arc::clone(&scheduler.shared))
+                .expect("Failed to initialize stealing context");
+
+            RefCell::new(RootContext::new_stealing(ctx, scheduler))
+        });
+    });
+}
+
 pub(crate) fn expect_local_scheduler<F, R>(f: F) -> R
 where
     F: FnOnce(&local::Context, &local::Handle) -> R,
@@ -85,7 +95,6 @@ where
     })
 }
 
-#[track_caller]
 pub(crate) fn expect_stealing_scheduler<F, R>(f: F) -> R
 where
     F: FnOnce(&stealing::Context, &stealing::Handle) -> R,
@@ -175,11 +184,6 @@ where
 }
 
 #[inline(always)]
-pub(crate) fn current_thread_id() -> ThreadId {
-    with_core(|core| core.thread_id)
-}
-
-#[inline(always)]
 pub(crate) fn current_task_id() -> Option<Id> {
     with_core(|core| core.current_task.borrow().as_ref().map(|t| t.id))
 }
@@ -195,7 +199,6 @@ pub(crate) fn set_current_task(task: Option<Arc<TaskNode>>) -> Option<Arc<TaskNo
 }
 
 // Private helpers.
-#[track_caller]
 #[inline(always)]
 pub(crate) fn with_context<F, R>(f: F) -> R
 where
@@ -207,7 +210,6 @@ where
     })
 }
 
-#[track_caller]
 #[inline(always)]
 pub(crate) fn with_scheduler<F, R>(f: F) -> R
 where
@@ -244,8 +246,8 @@ macro_rules! with_scheduler {
     };
 }
 
-#[cold]
 #[track_caller]
+#[cold]
 fn panic_scheduler_uninitialized() -> ! {
     panic!("Expected scheduler to be initialized.");
 }

@@ -97,6 +97,12 @@ macro_rules! define_any_op {
                     }
                 }
             )*
+
+            // Not all AnyOp<T> are safe to send between threads at all times.
+            // But this bound is required by `ringolo::spawn` so we have to impl.
+            // The runtime prevents most cases where sending tasks between workers
+            // is  dangerous.
+            unsafe impl<T: AsRawOrDirect> Send for $OpEnum<T> {}
         } // end paste!
     };
 }
@@ -117,6 +123,7 @@ define_any_op! {
     op_enum: AnyOp,
     output_enum: AnyOpOutput,
     variants: [
+        AsyncCancel(AsyncCancel) -> i32,
         Accept(Accept<T>) -> (OwnedUringFd, Option<SocketAddr>),
         Bind(Bind<T>) -> (),
         Close(Close) -> i32,
@@ -126,6 +133,7 @@ define_any_op! {
         Socket(Socket) -> OwnedUringFd,
         SetSockOpt(SetSockOpt<T>) -> (),
         Timeout(Timeout) -> (),
+        TimeoutRemove(TimeoutRemove) -> i32,
     ]
 }
 

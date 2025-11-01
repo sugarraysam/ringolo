@@ -1,6 +1,6 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use std::{fmt, num::NonZeroU32, num::NonZeroU64};
+use std::{fmt, num::NonZeroU64};
 
 /// An opaque ID that uniquely identifies a task relative to all other currently
 /// running tasks.
@@ -73,24 +73,6 @@ impl Id {
     /// Get a unique task tracing Id to be used with tracing library.
     pub(crate) fn as_tracing_id(&self) -> tracing::Id {
         tracing::Id::from_non_zero_u64(self.0)
-    }
-}
-
-#[derive(Eq, PartialEq, Clone, Copy, Hash, Debug)]
-pub(crate) struct ThreadId(NonZeroU32);
-
-impl ThreadId {
-    pub(crate) fn next() -> ThreadId {
-        static COUNTER: AtomicU32 = AtomicU32::new(1);
-
-        let id = COUNTER.load(Ordering::Relaxed);
-
-        // Safety: We use U32 which means we can create 4 Billion threads, which
-        // should be more than enough. The reason why we don't use `std::thread::ThreadId`
-        // is explained in `task::header::Header`.
-        ThreadId(
-            NonZeroU32::new(id).expect("failed to generate unique thread ID: bitspace exhausted"),
-        )
     }
 }
 

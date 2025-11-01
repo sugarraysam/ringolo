@@ -47,7 +47,8 @@ impl Stream for Tick {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{self as ringolo, utils::scheduler::Method};
+    use crate as ringolo;
+    use crate::test_utils::*;
     use anyhow::Result;
     use futures::StreamExt;
     use rstest::rstest;
@@ -77,12 +78,15 @@ mod tests {
 
             assert!(ticks.iter().all(Result::is_ok));
             assert_eq!(ticks.len(), take_n);
+
+            crate::context::with_slab(|slab| assert_eq!(slab.len(), 1));
         } // tick cancelled on drop
 
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 1);
-        });
+        assert_inflight_cleanup(1);
+        wait_for_cleanup().await;
+        assert_inflight_cleanup(0);
+
+        crate::context::with_slab(|slab| assert_eq!(slab.len(), 0));
 
         Ok(())
     }

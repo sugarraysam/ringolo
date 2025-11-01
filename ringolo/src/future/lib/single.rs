@@ -474,6 +474,38 @@ impl OpPayload for Timeout {
     }
 }
 
+///
+/// === TimeoutRemove ===
+///
+#[derive(Debug, Clone)]
+pub(crate) struct TimeoutRemove {
+    entry: Option<io_uring::squeue::Entry>,
+}
+
+impl TimeoutRemove {
+    pub(crate) fn new(user_data: u64) -> Self {
+        Self {
+            entry: Some(io_uring::opcode::TimeoutRemove::new(user_data).build()),
+        }
+    }
+}
+
+impl OpPayload for TimeoutRemove {
+    type Output = i32;
+
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        Ok(self.entry.take().expect("only called once"))
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::IpAddr;

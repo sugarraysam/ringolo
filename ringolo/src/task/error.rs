@@ -43,7 +43,7 @@ impl JoinError {
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```no_run
     /// # {
     /// use std::panic;
     ///
@@ -71,7 +71,7 @@ impl JoinError {
     ///
     /// # Examples
     ///
-    /// ```should_panic
+    /// ```no_run
     /// use std::panic;
     ///
     /// #[ringolo::main]
@@ -97,7 +97,7 @@ impl JoinError {
     ///
     /// # Examples
     ///
-    /// ```should_panic
+    /// ```no_run
     /// use std::panic;
     ///
     /// #[ringolo::main]

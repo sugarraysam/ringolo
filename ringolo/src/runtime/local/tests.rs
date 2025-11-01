@@ -1,13 +1,15 @@
 use super::*;
 use crate as ringolo;
 use crate::context;
+use crate::context::maintenance::task::MAINTENANCE_TASK_OPTS;
 use crate::future::lib::{Nop, Op};
 use crate::runtime::waker::Wake;
-use crate::runtime::{Builder, Schedule, TaskRegistry, YieldReason};
+use crate::runtime::{Builder, Schedule, TaskRegistry, YieldReason, get_root};
 use crate::sqe::{IoError, Sqe, SqeCollection};
 use crate::test_utils::*;
-use crate::time::Sleep;
+use crate::time::{Sleep, YieldNow};
 use crate::utils::scheduler::*;
+use crate::utils::thread::get_current_thread_name;
 use crate::with_scheduler;
 use anyhow::Result;
 use static_assertions::assert_impl_all;
@@ -19,7 +21,7 @@ assert_impl_all!(Scheduler: Send, Sync, Wake);
 assert_impl_all!(Handle: Send, Sync, Schedule);
 
 #[test]
-fn test_local_scheduler_single_nop() -> Result<()> {
+fn test_single_nop() -> Result<()> {
     let runtime = Builder::new_local().try_build()?;
     runtime.block_on(async {
         assert!(matches!(Op::new(Nop).await, Ok(_)));
@@ -28,7 +30,7 @@ fn test_local_scheduler_single_nop() -> Result<()> {
 }
 
 #[test]
-fn test_local_scheduler_batch_of_nops() -> Result<()> {
+fn test_batch_of_nops() -> Result<()> {
     let runtime = Builder::new_local().try_build()?;
     runtime.block_on(async {
         let batch = Sqe::new(build_batch(10));
@@ -45,10 +47,10 @@ fn test_local_scheduler_batch_of_nops() -> Result<()> {
 }
 
 #[test]
-fn test_local_scheduler_chain_write_fsync_read_tempfile() -> Result<()> {
+fn test_sqe_chain_backend_file_io() -> Result<()> {
     let runtime = Builder::new_local().try_build()?;
     runtime.block_on(async {
-        let (chain, data_out, mut data_in, _tmp) = build_chain_write_fsync_read_a_tempfile()?;
+        let (chain, data_out, mut data_in, _tmp) = build_chain_write_fsync_read_tempfile();
         let chain = Sqe::new(chain);
         let res = chain.await;
 
@@ -75,7 +77,7 @@ fn test_local_scheduler_chain_write_fsync_read_tempfile() -> Result<()> {
 }
 
 #[test]
-fn test_local_scheduler_sq_batch_too_large() -> Result<()> {
+fn test_sq_batch_too_large() -> Result<()> {
     let sq_ring_size = 8;
     let runtime = Builder::new_local()
         .sq_ring_size(sq_ring_size)
@@ -91,7 +93,7 @@ fn test_local_scheduler_sq_batch_too_large() -> Result<()> {
 }
 
 #[test]
-fn test_local_scheduler_sq_ring_full_recovers() -> Result<()> {
+fn test_sq_ring_full_recovers() -> Result<()> {
     let sq_ring_size = 8;
     let runtime = Builder::new_local()
         .sq_ring_size(sq_ring_size)
@@ -128,7 +130,7 @@ fn test_local_scheduler_sq_ring_full_recovers() -> Result<()> {
 }
 
 #[test]
-fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
+fn test_spawn_before_block_on() -> Result<()> {
     let sq_ring_size = 8;
     let runtime = Builder::new_local()
         .sq_ring_size(sq_ring_size)
@@ -161,7 +163,7 @@ fn test_local_scheduler_spawn_before_block_on() -> Result<()> {
 }
 
 #[test]
-fn test_local_scheduler_spawn_within_block_on() -> Result<()> {
+fn test_spawn_within_block_on() -> Result<()> {
     let runtime = Builder::new_local().try_build()?;
 
     let res = runtime.block_on(async {
@@ -222,7 +224,7 @@ fn test_runtime_shutdown() -> Result<()> {
 
     assert!(shared.shutdown.load(Ordering::Relaxed));
     assert!(scheduler.tasks.is_closed());
-    assert_eq!(scheduler.tasks.len(), n);
+    assert_eq!(scheduler.tasks.len(), n + 1);
 
     // Make sure we did not have to wait for the tasks to complete
     assert!(start.elapsed() < Duration::from_secs(1));
@@ -230,6 +232,43 @@ fn test_runtime_shutdown() -> Result<()> {
         assert!(handle.is_finished());
         assert!(handle.get_result().is_err_and(|e| e.is_cancelled()));
     }
+
+    Ok(())
+}
+
+#[ringolo::test]
+async fn test_default_thread_name() -> Result<()> {
+    let thread_name = get_current_thread_name()?;
+
+    // Parses to `ringolo-{id}`, id monotonically increasing.
+    let parts = thread_name.split("-").collect::<Vec<_>>();
+    assert_eq!(parts[0], "ringolo");
+    assert!(matches!(parts[1].parse::<usize>(), Ok(id) if id == 0));
+
+    Ok(())
+}
+
+#[ringolo::test]
+async fn test_maintenance_task() -> Result<()> {
+    let root_node = get_root();
+    assert_eq!(
+        root_node.num_children(),
+        1,
+        "Maintenance task always running"
+    );
+
+    assert!(
+        root_node
+            .clone_children()
+            .iter()
+            .any(|child| child.is_maintenance_task()
+                && child.opts.contains(*MAINTENANCE_TASK_OPTS))
+    );
+
+    // On local scheduler we need to yield once for the maintenance task to be
+    // polled once and set `is_running` to true.
+    YieldNow::new(None).await?;
+    context::with_core(|core| assert!(core.maintenance_task.is_running()));
 
     Ok(())
 }

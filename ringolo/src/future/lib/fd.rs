@@ -1,5 +1,4 @@
-use crate::future::lib::{Close, OpcodeError};
-use crate::runtime::{CleanupTaskBuilder, spawn_cleanup};
+use crate::future::lib::OpcodeError;
 use either::Either;
 use io_uring::types::{DestinationSlot, Fd, Fixed};
 use std::marker::PhantomData;
@@ -94,8 +93,7 @@ struct SharedUringFdState {
 
 impl Drop for SharedUringFdState {
     fn drop(&mut self) {
-        let task = CleanupTaskBuilder::new(Close::new(self.kind.as_raw_or_direct()));
-        spawn_cleanup(task);
+        crate::async_close(self.kind.as_raw_or_direct());
     }
 }
 
@@ -436,12 +434,11 @@ mod tests {
 
     use super::*;
     use crate as ringolo;
+    use crate::context;
+    use crate::runtime::{Builder, TaskOpts};
     use crate::sqe::IoError;
-    use crate::{
-        runtime::{Builder, TaskOpts},
-        test_utils::*,
-        utils::scheduler::{Call, Method},
-    };
+    use crate::test_utils::*;
+    use crate::utils::scheduler::{Call, Method};
     use anyhow::{Context, Result};
     use rstest::rstest;
 
@@ -474,13 +471,8 @@ mod tests {
             assert_eq!(sockfd2.strong_count(), 1);
         } // last ref dropped - triggers async close
 
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 1);
-            assert!(
-                matches!(spawn_calls[0], Call::Spawn { opts, .. } if opts == TaskOpts::BACKGROUND_TASK | s.default_task_opts)
-            );
-        });
+        assert_inflight_cleanup(1);
+        wait_for_cleanup().await;
 
         Ok(())
     }
@@ -508,11 +500,7 @@ mod tests {
             assert!(fd1.is_raw() && fd2.is_raw());
         } // last ref dropped - does NOT trigger async close
 
-        crate::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 0);
-        });
-
+        assert_inflight_cleanup(0);
         Ok(())
     }
 
@@ -523,7 +511,7 @@ mod tests {
     #[test]
     fn test_fixed_descriptor_exhaustion(#[case] n: u32) -> Result<()> {
         let builder = Builder::new_local().direct_fds_per_ring(n);
-        let (_runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
+        let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder))?;
 
         crate::block_on(async {
             let mut sockets = Vec::with_capacity(n as usize);
@@ -540,10 +528,6 @@ mod tests {
                 matches!(tcp_socket4(KernelFdMode::DirectAuto).await, Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ENFILE))
             );
         });
-
-        // We expect `n` async cleanup operations
-        let spawn_calls = scheduler.tracker.get_calls(&Method::Spawn);
-        assert_eq!(spawn_calls.len(), n as usize);
 
         Ok(())
     }
@@ -580,16 +564,11 @@ mod tests {
             assert_eq!(result, expected);
         }
 
-        // If we successfully leaked the UringFd, expected async cleanup to have spawned.
+        // No cleanup happens if we successfully leaked the UringFd
         if expected.is_ok() {
-            crate::with_scheduler!(|s| {
-                let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-                assert_eq!(
-                    spawn_calls.len(),
-                    0,
-                    "No cleanup task should be spawned on successful ownership transfer"
-                );
-            });
+            assert_inflight_cleanup(0);
+        } else {
+            assert_inflight_cleanup(1);
         }
 
         Ok(())

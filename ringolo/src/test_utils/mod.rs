@@ -1,5 +1,5 @@
 use crate::sqe::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListBuilder, SqeListKind};
-use anyhow::Result;
+use crate::time::YieldNow;
 use io_uring::opcode::{Fsync, Nop, OpenAt, Read, Write};
 use io_uring::squeue::Entry;
 use io_uring::types::Fd;
@@ -8,22 +8,42 @@ use std::fs::File;
 use std::os::fd::AsRawFd;
 
 // Exports
-pub(crate) mod context;
-pub(crate) use context::init_local_runtime_and_context;
+mod context;
+pub(crate) use context::{init_local_runtime_and_context, init_stealing_runtime_and_context};
 
 pub(crate) mod future;
 pub(crate) use future::*;
 
 pub(crate) mod mocks;
-pub(crate) use mocks::{mock_waker, DummyScheduler};
+pub(crate) use mocks::{DummyScheduler, mock_task, mock_waker};
+
+pub(crate) async fn wait_for_cleanup() {
+    while !crate::context::with_core(|core| core.maintenance_task.cleanup_handler.is_empty()) {
+        // We have to yield for `root_future` to let the maintenance task run
+        assert!(YieldNow::new(None).await.is_ok());
+    }
+}
+
+pub(crate) fn assert_inflight_cleanup(expected: usize) {
+    assert_eq!(
+        crate::context::with_core(|core| core.maintenance_task.cleanup_handler.len()),
+        expected
+    );
+}
 
 // Make sure to keep `data` and `File` alive until SQ has been submitted.
 // We write-fsync-read and skip open+close because the tempfile library is
 // already doing this work, so we want to avoid conflicts.
 #[must_use]
-pub(crate) fn build_chain_write_fsync_read_a_tempfile() -> Result<(SqeList, Vec<u8>, Vec<u8>, File)>
-{
-    let tmp = tempfile::tempfile()?;
+pub(crate) fn build_chain_write_fsync_read_tempfile() -> (SqeList, Vec<u8>, Vec<u8>, File) {
+    let tmp = match tempfile::tempfile() {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            assert!(false, "Failed to get tempfile: {:?}", &e);
+            unreachable!("^^");
+        }
+    };
+
     let fd = Fd(tmp.as_raw_fd());
     let data_out = b"I love me some ringolos!\n".to_vec();
     let mut data_in = Vec::with_capacity(data_out.len());
@@ -40,7 +60,7 @@ pub(crate) fn build_chain_write_fsync_read_a_tempfile() -> Result<(SqeList, Vec<
         )
         .build();
 
-    Ok((chain, data_out, data_in, tmp))
+    (chain, data_out, data_in, tmp)
 }
 
 pub(crate) fn build_list_with_entries(kind: SqeListKind, entries: Vec<Entry>) -> SqeList {

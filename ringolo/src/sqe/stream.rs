@@ -1,8 +1,6 @@
 use crate::context;
 use crate::runtime::{Schedule, SchedulerPanic};
-use crate::sqe::{CompletionHandler, IoError, RawSqe, RawSqeState, Submittable};
-use crate::with_scheduler;
-use anyhow::anyhow;
+use crate::sqe::{CompletionHandler, IoError, RawSqe, Submittable};
 use futures::Stream;
 use io_uring::squeue::Entry;
 use std::mem;
@@ -37,7 +35,7 @@ impl SqeStream {
     pub(crate) fn get_idx(&self) -> Result<usize, IoError> {
         match self.state {
             SqeStreamState::Submitted { idx } => Ok(idx),
-            _ => Err(anyhow!("unexpected sqe stream state: {:?}", self.state).into()),
+            _ => Err(IoError::SqeBackendInvalidState),
         }
     }
 
@@ -59,6 +57,11 @@ impl Submittable for SqeStream {
     /// and avoids corrupted state.
     fn submit(&mut self, waker: &Waker) -> Result<(), IoError> {
         match &mut self.state {
+            SqeStreamState::Submitted { .. }
+            | SqeStreamState::Cancelled
+            | SqeStreamState::Completed => {
+                return Err(IoError::SqeBackendInvalidState);
+            }
             SqeStreamState::Unsubmitted { entry, count } => {
                 context::with_slab_and_ring_mut(|slab, ring| {
                     let reserved = slab.reserve_entry()?;
@@ -72,15 +75,17 @@ impl Submittable for SqeStream {
                     Ok(idx)
                 })
             }
-            _ => {
-                return Err(anyhow!("SqeStream already submitted").into());
-            }
         }
         // On successful push, we can transition the state and increment the
         // number of local pending IOs for this task.
         .map(|idx| {
+            // On successful push, we can transition the state and increment the
+            // number of pending IOs at both the thread-level and task-level.
             self.state = SqeStreamState::Submitted { idx };
-            context::with_core(|core| core.increment_pending_ios(waker));
+            context::with_core(|core| {
+                core.increment_pending_ios();
+                core.increment_task_pending_ios(waker);
+            });
         })
     }
 }
@@ -95,20 +100,18 @@ impl Stream for SqeStream {
         loop {
             match self.state {
                 SqeStreamState::Unsubmitted { .. } => {
-                    // TODO: return idx, much cleaner state transition
                     match self.submit(cx.waker()) {
                         Ok(_) => {
-                            // Submission successful, advance state and immediately
-                            // try to poll for a result.
-                            self.state = SqeStreamState::Submitted {
-                                idx: self.get_idx()?,
-                            };
+                            debug_assert!(
+                                matches!(self.state, SqeStreamState::Submitted { .. }),
+                                "Submit should transition SqeStream state to Submitted."
+                            );
                             continue;
                         }
                         Err(e) if e.is_retryable() => {
                             // We were unable to register the waker, and submit our IO to local uring.
                             // Yield to scheduler so we can take corrective action and retry later.
-                            with_scheduler!(|s| {
+                            crate::with_scheduler!(|s| {
                                 s.yield_now(cx.waker(), e.as_yield_reason(), None);
                             });
 
@@ -136,9 +139,22 @@ impl Stream for SqeStream {
                         // stream if there is a bad result. We don't take responsibility
                         // for analyzing stream errors.
                         match raw_sqe.pop_next_result() {
+                            Err(e) => Poll::Ready(Some(Err(e))),
                             Ok(Some(result)) => Poll::Ready(Some(Ok(result))),
                             Ok(None) => {
-                                if matches!(raw_sqe.get_state(), RawSqeState::Completed) {
+                                if raw_sqe.is_completed() {
+                                    // # Important
+                                    // We need to decrement task `pending_ios` *after* dropping the RawSqe
+                                    // to prevent making the task stealable while it still needs to drop this
+                                    // RawSqe from thread-local slab.
+                                    debug_assert!(
+                                        slab.try_remove(idx).is_some(),
+                                        "RawSqe not found in slab."
+                                    );
+                                    context::with_core(|c| {
+                                        c.decrement_task_pending_ios(cx.waker())
+                                    });
+
                                     self.state = SqeStreamState::Completed;
                                     Poll::Ready(None)
                                 } else {
@@ -146,7 +162,6 @@ impl Stream for SqeStream {
                                     Poll::Pending
                                 }
                             }
-                            Err(e) => Poll::Ready(Some(Err(e))),
                         }
                     });
                 }
@@ -158,22 +173,18 @@ impl Stream for SqeStream {
     }
 }
 
-// RAII: free RawSqe from slab.
 impl Drop for SqeStream {
     fn drop(&mut self) {
-        if let SqeStreamState::Cancelled = self.state {
-            // The cancellation task owns the RawSqe now.
-            return;
-        }
-
-        if let Err(e) = self.get_idx().map(|idx| {
+        if let SqeStreamState::Submitted { idx } = &self.state {
+            // If we get here, it means *nothing* will decrement the task pending_ios.
+            // The consequence is the task will *not be stealable*. We can live with that
+            // and there is no way to get access to the underlying task anyways because
+            // the Waker is lost.
             context::with_slab_mut(|slab| {
-                if slab.try_remove(idx).is_none() {
-                    eprintln!("Warning: SQE {} not found in slab during drop", idx);
+                if slab.try_remove(*idx).is_none() {
+                    eprintln!("[SqeStream]: SQE {} not found in slab during drop", idx);
                 }
             })
-        }) {
-            eprintln!("{:?}", e);
         }
     }
 }
@@ -217,6 +228,7 @@ mod tests {
 
             assert!(matches!(stream.as_mut().poll_next(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
+            context::with_core(|core| assert_eq!(core.get_pending_ios(), 1));
             assert_eq!(waker_data.get_pending_ios(), 1);
         }
 
@@ -256,7 +268,8 @@ mod tests {
             // We wake the task N time, and let scheduler handle the Notified
             // state and set the bit appropriately.
             assert_eq!(waker_data.get_count(), count as usize);
-            assert_eq!(waker_data.get_pending_ios(), 0);
+            context::with_core(|core| assert_eq!(core.get_pending_ios(), 0));
+            assert_eq!(waker_data.get_pending_ios(), 1);
 
             if let CompletionHandler::Stream {
                 results,
@@ -286,7 +299,6 @@ mod tests {
         }
 
         assert_eq!(fired, n);
-
         Ok(())
     }
 }

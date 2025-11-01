@@ -210,13 +210,20 @@ impl RawSqe {
         matches!(self.state, RawSqeState::Ready)
     }
 
+    pub(crate) fn is_completed(&self) -> bool {
+        matches!(self.state, RawSqeState::Completed)
+    }
+
     pub(crate) fn wake(&mut self) -> Result<()> {
         let waker = self.take_waker()?;
 
         // Waking by val is a signal that one pending IO resource has successfully
         // completed on the local io_uring. This contract is enforced by all of the SQE
         // primitives, i.e.: SqeSingle, SqeStream, SqeList, etc.
-        context::with_core(|core| core.decrement_pending_ios(self.owned_by_root, &waker));
+        //
+        // We only decrement the thread-level `pending_io`, as the task-level IO can
+        // only be decremented after we release the RawSqe from the slab.
+        context::with_core(|core| core.decrement_pending_ios());
 
         waker.wake();
         Ok(())
@@ -380,7 +387,7 @@ mod tests {
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
-        context::with_core(|core| core.increment_pending_ios(&waker));
+        context::with_core(|core| core.increment_pending_ios());
 
         assert!(sqe.on_completion(res, CompletionFlags::empty())?.is_none());
 
@@ -462,7 +469,7 @@ mod tests {
 
         let (waker, waker_data) = mock_waker();
         sqe.set_waker(&waker);
-        context::with_core(|core| core.increment_pending_ios(&waker));
+        context::with_core(|core| core.increment_pending_ios());
         assert_eq!(sqe.state, RawSqeState::Pending);
 
         for i in 1..=n {
@@ -509,7 +516,7 @@ mod tests {
 
             // Mimick incrementing pending_io API after submit.
             inserted.set_waker(&waker);
-            context::with_core(|core| core.increment_pending_ios(&waker));
+            context::with_core(|core| core.increment_pending_ios());
 
             assert!(inserted.on_completion(0, CompletionFlags::empty()).is_ok());
             assert_eq!(inserted.get_state(), RawSqeState::Ready);

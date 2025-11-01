@@ -115,7 +115,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
                 // We give one of them to a new task and schedule it.
                 self.core()
                     .scheduler
-                    .schedule(false, Notified::new(self.get_new_task()));
+                    .schedule(Notified::new(self.get_new_task()));
 
                 // The remaining ref-count is now dropped. We kept the extra
                 // ref-count until now to ensure that even if the `schedule`

@@ -12,6 +12,7 @@ use crate::runtime::{
     OrphanPolicy, SPILL_TO_HEAP_THRESHOLD, TaskMetadata, TaskOpts, TaskRegistry, get_orphan_root,
     get_root,
 };
+use crate::spawn::TaskOptsInternal;
 use crate::task::Id;
 
 // We implement Structured Concurrency and track the parent<->children relationship
@@ -232,13 +233,20 @@ impl TaskNode {
         self.registry.shutdown(&self.id);
     }
 
+    // Circumstances under which we should release a task.
+    // (1) Never release root
+    // (2) Don't release on shutdown, creates unecessary child/parent operations
+    // (3) Only allowed to release once
+    fn should_release(&self) -> bool {
+        !self.id.is_root()
+            && !self.registry.is_closed()
+            && !self.released.swap(true, Ordering::AcqRel)
+    }
+
     /// Called when we release the underlying `Task<S>`, either through normal task
     /// lifecycle or cancellation.
     pub(super) fn release(&self) {
-        // If this TaskNode was released through one of the cancel APIs, no need
-        // to remove it from the parent, Prevents thundering herd issue when
-        // parent cancels many children.
-        if !self.id.is_root() && !self.released.swap(true, Ordering::AcqRel) {
+        if self.should_release() {
             let parent = self.parent.lock();
 
             if let Some(parent) = parent.as_ref().and_then(|p| p.upgrade()) {
@@ -256,6 +264,11 @@ impl TaskNode {
         let orphan_root = get_orphan_root();
         self.swap_parent(Arc::downgrade(&orphan_root));
         orphan_root.add_child(self.id, Arc::clone(&self));
+    }
+
+    pub(crate) fn is_maintenance_task(&self) -> bool {
+        self.opts
+            .contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
     }
 }
 
@@ -362,6 +375,8 @@ fn recursive_cancel_all(node: &TaskNode) -> CancellationStats {
 
     node.take_all_children()
         .into_iter()
+        // Maintenance task is non cancellable.
+        .filter(|child| !child.is_maintenance_task())
         .fold(CancellationStats::default(), |mut stats, child| {
             stats.visited += 1;
 
@@ -425,6 +440,8 @@ where
 
     children
         .into_iter()
+        // Maintenance task is non cancellable.
+        .filter(|child| !child.is_maintenance_task())
         .fold(CancellationStats::default(), |mut stats, child| {
             stats.visited += 1;
 
@@ -452,7 +469,7 @@ pub(crate) struct TaskNodeGuard {
 }
 
 impl TaskNodeGuard {
-    pub(crate) fn enter_root_node() -> Self {
+    pub(crate) fn enter_root() -> Self {
         let parent_task = context::set_current_task(Some(get_root()));
         debug_assert!(
             parent_task.is_none(),
@@ -543,8 +560,8 @@ mod tests {
     async fn test_children_map_lifecycle(#[case] n: usize) -> Result<()> {
         let node = context::current_task().context("no task node in context")?;
 
-        assert_eq!(node.num_children(), 0);
-        assert!(!node.has_children());
+        assert!(node.id.is_root());
+        assert_eq!(node.num_children(), 1, "Maintenance task");
 
         let handles: Vec<JoinHandle<Result<()>>> = (0..n)
             .into_iter()
@@ -552,13 +569,13 @@ mod tests {
             .collect();
 
         assert!(node.has_children());
-        assert_eq!(node.num_children(), n);
+        assert_eq!(node.num_children(), n + 1);
 
         for handle in handles {
             assert!(handle.await.is_ok());
         }
 
-        assert!(!node.has_children());
+        assert_eq!(node.num_children(), 1, "Maintenance task");
 
         Ok(())
     }
@@ -622,8 +639,11 @@ mod tests {
             })
         }
 
-        let max_tree_size = Arc::new(AtomicUsize::new(1));
-        let curr_tree_size = Arc::new(AtomicUsize::new(1));
+        // Start at 2 because:
+        // (1) Root Node
+        // (2) Maintenance Task
+        let max_tree_size = Arc::new(AtomicUsize::new(2));
+        let curr_tree_size = Arc::new(AtomicUsize::new(2));
 
         let handle = ringolo::spawn(recursive_spawn(
             Arc::clone(&max_tree_size),
@@ -642,7 +662,7 @@ mod tests {
             expected_max_tree_size += branching.pow(i as u32);
         }
         assert_eq!(
-            expected_max_tree_size,
+            expected_max_tree_size + 1, // Tree + Maintenance Task
             max_tree_size.load(Ordering::Relaxed)
         );
 

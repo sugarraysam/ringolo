@@ -1,6 +1,10 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{AddMode, OrphanPolicy, Schedule, SchedulerPanic, TaskRegistry, YieldReason};
+use crate::context;
+use crate::runtime::{
+    AddMode, OrphanPolicy, Schedule, SchedulerPanic, TaskOpts, TaskRegistry, YieldReason,
+};
+use crate::spawn::TaskMetadata;
 use crate::task::layout::vtable;
 use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
@@ -14,41 +18,47 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 pub(crate) struct DummyScheduler;
 
 impl Schedule for DummyScheduler {
-    fn schedule(&self, _is_new: bool, _task: Notified<Self>) {
-        unimplemented!("dummy scheduler");
-    }
+    fn schedule(&self, _task: Notified<Self>) {}
 
-    fn yield_now(&self, _waker: &Waker, _reason: YieldReason, _mode: Option<AddMode>) {
-        unimplemented!("dummy scheduler");
-    }
+    fn yield_now(&self, _waker: &Waker, _reason: YieldReason, _mode: Option<AddMode>) {}
 
     fn release(&self, _task: &Task<Self>) -> Option<Task<Self>> {
-        unimplemented!("dummy scheduler");
+        None
     }
 
-    fn unhandled_panic(&self, _payload: SchedulerPanic) {
-        unimplemented!("dummy scheduler");
-    }
+    fn unhandled_panic(&self, _payload: SchedulerPanic) {}
 
     fn task_registry(&self) -> Arc<dyn TaskRegistry> {
         Arc::new(DummyTaskRegistry)
     }
 }
 
+pub(crate) fn mock_task(
+    opts: Option<TaskOpts>,
+    metadata: Option<TaskMetadata>,
+) -> Task<DummyScheduler> {
+    assert!(
+        std::panic::catch_unwind(|| context::current_task()).is_ok(),
+        "Task creation requires initialized context."
+    );
+
+    let (task, _, _) =
+        crate::task::new_task(std::future::ready(1), opts, metadata, DummyScheduler {});
+    task
+}
+
 #[derive(Debug)]
 pub(crate) struct DummyTaskRegistry;
 
 impl TaskRegistry for DummyTaskRegistry {
-    fn shutdown(&self, _id: &Id) {
-        unimplemented!("dummy task registry");
-    }
+    fn shutdown(&self, _id: &Id) {}
 
     fn is_closed(&self) -> bool {
-        unimplemented!("dummy task registry");
+        false
     }
 
     fn orphan_policy(&self) -> OrphanPolicy {
-        unimplemented!("dummy task registry");
+        OrphanPolicy::default()
     }
 }
 

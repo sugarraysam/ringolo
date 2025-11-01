@@ -7,44 +7,141 @@ use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
 use crate::task::TaskNodeGuard;
 use anyhow::{Result, anyhow};
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
-use std::thread::ThreadId;
+use std::thread;
+use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
-    /// Shared context available in scheduler and worker
-    shared: Arc<Shared>,
-
-    /// ThreadId associated with this worker.
-    thread_id: OnceCell<ThreadId>,
-
-    /// Handle to single local queue.
-    pollable: RefCell<VecDeque<LocalTask>>,
-
     /// Determines how we run the event loop.
     cfg: RefCell<EventLoopConfig>,
 
     /// Event loop ticker.
     ticker: RefCell<Ticker>,
+
+    /// Handle to single local queue.
+    pollable: RefCell<VecDeque<LocalTask>>,
+
+    /// TODO: unused - remove?
+    /// Shared context available in scheduler and worker
+    shared: Arc<Shared>,
 }
 
 impl Worker {
     pub(super) fn new(cfg: &RuntimeConfig, shared: Arc<Shared>) -> Self {
         Self {
-            shared,
-            thread_id: OnceCell::new(),
-            pollable: RefCell::new(VecDeque::new()),
             cfg: RefCell::new(cfg.into()),
             ticker: RefCell::new(Ticker::new()),
+            pollable: RefCell::new(VecDeque::new()),
+            shared,
         }
     }
 
     fn tick<T: TickerData>(&self, ctx: &T::Context, data: &mut T) -> TickerEvents {
         self.ticker.borrow_mut().tick(ctx, data)
+    }
+}
+
+impl EventLoop for Worker {
+    type Task = LocalTask;
+
+    fn add_task(&self, task: Self::Task, mode: AddMode) {
+        task.set_owner_id(thread::current().id());
+
+        let mut q = self.pollable.borrow_mut();
+
+        // We always pop from the back, so the start of the q is the back, and
+        // the end corresponds to the front.
+        match mode {
+            AddMode::Fifo => q.push_front(task),
+            AddMode::Lifo => q.push_back(task),
+        }
+    }
+
+    fn find_task(&self) -> Option<Self::Task> {
+        self.pollable.borrow_mut().pop_back()
+    }
+
+    fn event_loop<F: Future>(&self, root_fut: Option<F>) -> Result<Option<F::Output>> {
+        if let Some(root_fut) = root_fut {
+            context::expect_local_scheduler(|ctx, scheduler| {
+                ctx.with_core(|c| c.spawn_maintenance_task());
+                self.event_loop_inner(ctx, scheduler, root_fut)
+            })
+        } else {
+            Err(anyhow!("Unexpected empty root_future"))
+        }
+    }
+}
+
+const WAIT_NEXT_COMPLETION_TIMEOUT: Duration = Duration::from_millis(100);
+
+impl Worker {
+    fn event_loop_inner<F: Future>(
+        &self,
+        ctx: &local::Context,
+        scheduler: &local::Handle,
+        root_fut: F,
+    ) -> Result<Option<F::Output>> {
+        let mut data = self.cfg.borrow_mut();
+        let mut root_fut = pin!(root_fut);
+
+        let waker = waker_ref(scheduler);
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let mut root_result: Option<F::Output> = None;
+
+        loop {
+            if let Some(task) = self.find_task() {
+                task.run();
+            } else if ctx.with_core(|core| core.get_pending_ios() > 0) {
+                // Block thread waiting for next completion.
+                context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+                    ring.submit_and_wait(1, Some(WAIT_NEXT_COMPLETION_TIMEOUT))?;
+                    ring.process_cqes(slab, None)?;
+                    Ok(())
+                })?;
+            } else {
+                match root_result.is_some() {
+                    true => return Ok(root_result),
+                    false => scheduler.set_root_woken(),
+                }
+            }
+
+            if scheduler.reset_root_woken() && root_result.is_none() {
+                let _guard = TaskNodeGuard::enter_root();
+
+                if let Poll::Ready(v) = root_fut.as_mut().poll(&mut cx) {
+                    root_result = Some(v);
+                }
+            }
+
+            let events = self.tick(ctx, &mut *data);
+            self.process_ticker_events(ctx, events)?;
+        }
+    }
+
+    #[inline(always)]
+    fn process_ticker_events(&self, ctx: &local::Context, events: TickerEvents) -> Result<()> {
+        // Because we use `DEFER_TASKRUN`, we need to make an `io_uring_enter` syscall /w GETEVENTS
+        // to process pending kernel `task_work` and post CQEs. It would be silly to not submit
+        // pending SQEs in same syscall.
+        if events.contains(TickerEvents::PROCESS_CQES) {
+            ctx.with_slab_and_ring_mut(|slab, ring| {
+                ring.submit_and_wait(1, None)?;
+                ring.process_cqes(slab, None)
+            })?;
+
+        // Only submit, no need to wait for anything.
+        } else if events.contains(TickerEvents::SUBMIT_SQES) {
+            ctx.with_ring_mut(|ring| ring.submit_no_wait())?;
+        }
+
+        Ok(())
     }
 }
 
@@ -75,13 +172,13 @@ impl EventLoopConfig {
     #[inline(always)]
     fn should_submit(&self, tick: u32) -> bool {
         self.unsubmitted_sqes > 0
-            && (tick % self.submit_interval == 0
+            && (tick.is_multiple_of(self.submit_interval)
                 || self.unsubmitted_sqes >= self.max_unsubmitted_sqes)
     }
 
     #[inline(always)]
     fn should_process_cqes(&self, tick: u32) -> bool {
-        self.has_ready_cqes && tick % self.process_cqes_interval == 0
+        self.has_ready_cqes && tick.is_multiple_of(self.process_cqes_interval)
     }
 }
 
@@ -117,124 +214,5 @@ impl TickerData for EventLoopConfig {
         }
 
         events
-    }
-}
-
-impl EventLoop for Worker {
-    type Task = LocalTask;
-
-    fn add_task(&self, task: Self::Task, mode: AddMode) {
-        task.set_owner_id(*self.thread_id.get_or_init(context::current_thread_id));
-
-        let mut q = self.pollable.borrow_mut();
-
-        // We always pop from the back, so the start of the q is the back, and
-        // the end corresponds to the front.
-        match mode {
-            AddMode::Fifo => q.push_front(task),
-            AddMode::Lifo => q.push_back(task),
-        }
-    }
-
-    fn find_task(&self) -> Option<Self::Task> {
-        self.pollable.borrow_mut().pop_back()
-    }
-
-    fn event_loop<F: Future>(&self, root_fut: Option<F>) -> Result<F::Output> {
-        if let Some(root_fut) = root_fut {
-            context::expect_local_scheduler(|ctx, scheduler| {
-                self.event_loop_inner(ctx, scheduler, root_fut)
-            })
-        } else {
-            Err(anyhow!("Unexpected empty root_future"))
-        }
-    }
-}
-
-impl Worker {
-    fn event_loop_inner<F: Future>(
-        &self,
-        ctx: &local::Context,
-        scheduler: &local::Handle,
-        root_fut: F,
-    ) -> Result<F::Output> {
-        let mut data = self.cfg.borrow_mut();
-        let mut root_fut = pin!(root_fut);
-
-        let waker = waker_ref(scheduler);
-        let mut cx = std::task::Context::from_waker(&waker);
-
-        let mut root_result: Option<F::Output> = None;
-
-        // Here are a couple of tricky things about the event loop:
-        // - the root future might finish before OR after all tasks are done
-        // - if the root future panics, we propagate to user immediately
-        // - if a spawned task panics, it is handled asynchronously
-        // - weird interactions with SQ ring or Slab can result in corrupted state
-        //   and force scheduler to panic
-        loop {
-            if scheduler.reset_root_woken() && root_result.is_none() {
-                dbg!("polling root future");
-                let _guard = TaskNodeGuard::enter_root_node();
-
-                if let Poll::Ready(v) = root_fut.as_mut().poll(&mut cx) {
-                    root_result = Some(v);
-                }
-            }
-
-            let events = self.tick(ctx, &mut *data);
-            self.process_ticker_events(ctx, events)?;
-
-            if let Some(task) = self.find_task() {
-                dbg!("polling task...");
-                task.run();
-            } else {
-                // No more work to do. This means it is time to poll the root future.
-                if ctx.with_core(|core| core.get_pending_ios() == 0) {
-                    #[cfg(debug_assertions)]
-                    {
-                        // By definition if there are no pending IOs, then we should have no `ready_cqes`
-                        // and no `unsubmitted_sqes` because we have a 1:1 mapping between RawSqe <-> SQE.
-                        data.update(ctx);
-                        assert!(!data.has_ready_cqes);
-                        assert_eq!(data.unsubmitted_sqes, 0);
-                    }
-
-                    match root_result.is_some() {
-                        true => return Ok(root_result.unwrap()),
-                        false => scheduler.set_root_woken(),
-                    }
-                } else {
-                    dbg!("parking thread waiting for completions");
-                    // "Park" the thread waiting for next completion.
-                    context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
-                        ring.submit_and_wait(1, None)?;
-                        ring.process_cqes(slab, None)?;
-                        Ok(())
-                    })?;
-                }
-            }
-        }
-    }
-
-    #[inline(always)]
-    fn process_ticker_events(&self, ctx: &local::Context, events: TickerEvents) -> Result<()> {
-        // Because we use `DEFER_TASKRUN`, we need to make an `io_uring_enter` syscall /w GETEVENTS
-        // to process pending kernel `task_work` and post CQEs. It would be silly to not submit
-        // pending SQEs in same syscall.
-        if events.contains(TickerEvents::PROCESS_CQES) {
-            dbg!("processing cqes");
-            ctx.with_slab_and_ring_mut(|slab, ring| {
-                ring.submit_and_wait(1, None)?;
-                ring.process_cqes(slab, None)
-            })?;
-
-        // Only submit, no need to wait for anything.
-        } else if events.contains(TickerEvents::SUBMIT_SQES) {
-            dbg!("submitting sqes");
-            ctx.with_ring_mut(|ring| ring.submit_no_wait())?;
-        }
-
-        Ok(())
     }
 }

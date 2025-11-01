@@ -5,6 +5,7 @@ pub use ringolo_macros::main;
 pub use ringolo_macros::test;
 
 mod context;
+pub use context::maintenance::cleanup::{async_cancel, async_close, async_timeout_remove};
 
 mod future;
 pub use future::experimental::time;

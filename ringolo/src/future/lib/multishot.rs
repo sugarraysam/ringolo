@@ -1,5 +1,6 @@
 use crate::future::lib::{
-    AsRawOrDirect, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError, OwnedUringFd,
+    AsRawOrDirect, CancelHow, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError,
+    OwnedUringFd,
 };
 use crate::sqe::IoError;
 use io_uring::types::{TimeoutFlags, Timespec};
@@ -41,6 +42,10 @@ impl<T: AsRawOrDirect> AcceptMultishot<T> {
 
 impl<T: AsRawOrDirect> MultishotPayload for AcceptMultishot<T> {
     type Item = OwnedUringFd;
+
+    fn cancel_how(&self) -> CancelHow {
+        CancelHow::AsyncCancel
+    }
 
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError> {
         let mut entry = resolve_fd!(self.sockfd, |fd| io_uring::opcode::AcceptMulti::new(fd));
@@ -94,6 +99,10 @@ impl TimeoutMultishot {
 impl MultishotPayload for TimeoutMultishot {
     type Item = ();
 
+    fn cancel_how(&self) -> CancelHow {
+        CancelHow::TimeoutRemove
+    }
+
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError> {
         let this = self.project();
 
@@ -130,7 +139,7 @@ mod tests {
 
     use super::*;
     use crate::future::lib::{BorrowedUringFd, UringFdKind};
-    use crate::utils::scheduler::Method;
+    use crate::test_utils::*;
     use crate::{self as ringolo, future::lib::Multishot};
     use anyhow::{Context, Result};
     use futures::StreamExt;
@@ -193,13 +202,9 @@ mod tests {
             handle.join().unwrap()?;
         } // stream dropped here, schedules async cancel task
 
-        ringolo::with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 1);
-
-            let unhandled_panic_calls = s.tracker.get_calls(&Method::UnhandledPanic);
-            assert!(unhandled_panic_calls.is_empty());
-        });
+        assert_inflight_cleanup(1);
+        wait_for_cleanup().await;
+        assert_inflight_cleanup(0);
 
         Ok(())
     }

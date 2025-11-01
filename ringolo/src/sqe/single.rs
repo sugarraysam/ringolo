@@ -1,14 +1,13 @@
 use crate::context;
 use crate::sqe::{Completable, CompletionHandler, IoError, RawSqe, Sqe, Submittable};
-use anyhow::anyhow;
 use io_uring::squeue::Entry;
-use std::io::{self, Error};
 use std::task::{Poll, Waker};
 
 #[derive(Debug)]
 pub(crate) enum SqeSingleState {
     Unsubmitted { entry: Entry },
     Submitted { idx: usize },
+    Completed,
 }
 
 #[derive(Debug)]
@@ -23,10 +22,10 @@ impl SqeSingle {
         }
     }
 
-    pub(crate) fn get_idx(&self) -> io::Result<usize> {
+    pub(crate) fn get_idx(&self) -> Result<usize, IoError> {
         match self.state {
             SqeSingleState::Submitted { idx } => Ok(idx),
-            _ => Err(Error::other("sqe single state is not indexed")),
+            _ => Err(IoError::SqeBackendInvalidState),
         }
     }
 }
@@ -38,8 +37,8 @@ impl Submittable for SqeSingle {
     /// and avoids corrupted state.
     fn submit(&mut self, waker: &Waker) -> Result<(), IoError> {
         match &mut self.state {
-            SqeSingleState::Submitted { .. } => {
-                return Err(anyhow!("SqeSingle already submitted").into());
+            SqeSingleState::Submitted { .. } | SqeSingleState::Completed => {
+                return Err(IoError::SqeBackendInvalidState);
             }
             SqeSingleState::Unsubmitted { entry } => {
                 context::with_slab_and_ring_mut(|slab, ring| {
@@ -55,11 +54,14 @@ impl Submittable for SqeSingle {
                 })
             }
         }
-        // On successful push, we can transition the state and increment the
-        // number of local pending IOs for this task.
         .map(|idx| {
+            // On successful push, we can transition the state and increment the
+            // number of pending IOs at both the thread-level and task-level.
             self.state = SqeSingleState::Submitted { idx };
-            context::with_core(|core| core.increment_pending_ios(waker));
+            context::with_core(|core| {
+                core.increment_pending_ios();
+                core.increment_task_pending_ios(waker);
+            });
         })
     }
 }
@@ -74,7 +76,17 @@ impl Completable for SqeSingle {
             let raw = slab.get_mut(idx)?;
 
             if raw.is_ready() {
-                Poll::Ready(raw.take_final_result().map_err(|e| e.into()))
+                let res = raw.take_final_result().map_err(Into::into);
+
+                // # Important
+                // We need to decrement task `pending_ios` *after* dropping the RawSqe
+                // to prevent making the task stealable while it still needs to drop this
+                // RawSqe from thread-local slab.
+                debug_assert!(slab.try_remove(idx).is_some(), "RawSqe not found in slab.");
+                context::with_core(|c| c.decrement_task_pending_ios(waker));
+
+                self.state = SqeSingleState::Completed;
+                Poll::Ready(res)
             } else {
                 raw.set_waker(waker);
                 Poll::Pending
@@ -83,17 +95,18 @@ impl Completable for SqeSingle {
     }
 }
 
-// RAII: free RawSqe from slab.
 impl Drop for SqeSingle {
     fn drop(&mut self) {
-        if let Err(e) = self.get_idx().map(|idx| {
+        if let SqeSingleState::Submitted { idx } = self.state {
+            // If we get here, it means *nothing* will decrement the task pending_ios.
+            // The consequence is the task will *not be stealable*. We can live with that
+            // and there is no way to get access to the underlying task anyways because
+            // the Waker is lost.
             context::with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
-                    eprintln!("Warning: SQE {} not found in slab during drop", idx);
+                    eprintln!("[SqeSingle]: SQE {} not found in slab during drop.", idx,);
                 }
             });
-        }) {
-            eprintln!("{:?}", e);
         }
     }
 }
@@ -130,6 +143,7 @@ mod tests {
             let idx = sqe_fut.get().get_idx()?;
 
             assert_eq!(waker_data.get_count(), 0);
+            context::with_core(|core| assert_eq!(core.get_pending_ios(), 1));
             assert_eq!(waker_data.get_pending_ios(), 1);
 
             with_slab_and_ring_mut(|slab, ring| {
@@ -153,7 +167,8 @@ mod tests {
             // Process CQEs :: wakes up Waker
             assert!(matches!(ring.process_cqes(slab, None), Ok(1)));
             assert_eq!(waker_data.get_count(), 1);
-            assert_eq!(waker_data.get_pending_ios(), 0);
+            context::with_core(|core| assert_eq!(core.get_pending_ios(), 0));
+            assert_eq!(waker_data.get_pending_ios(), 1);
         });
 
         assert!(matches!(
@@ -161,6 +176,7 @@ mod tests {
             Poll::Ready(Ok(_))
         ));
 
+        assert_eq!(waker_data.get_pending_ios(), 0);
         Ok(())
     }
 }

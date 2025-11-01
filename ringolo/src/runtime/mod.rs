@@ -1,7 +1,4 @@
-use crate::{
-    task::{Notified, Task},
-    with_scheduler,
-};
+use crate::task::{Notified, Task};
 use anyhow::Result;
 use std::task::Waker;
 use std::{fmt, sync::Arc};
@@ -20,17 +17,12 @@ pub mod spawn;
 pub use spawn::{TaskMetadata, TaskOpts, spawn, spawn_builder};
 
 // Exports
-pub mod cleanup;
-pub(crate) use cleanup::CleanupTaskBuilder;
-
 pub mod local;
 
 pub mod registry;
 pub(crate) use registry::{OwnedTasks, TaskRegistry, get_orphan_root, get_root};
 
 pub(crate) use runtime::{OrphanPolicy, RuntimeConfig, SPILL_TO_HEAP_THRESHOLD};
-
-pub(crate) use spawn::spawn_cleanup;
 
 pub mod stealing;
 
@@ -42,7 +34,7 @@ mod waker;
 /// Scheduler trait
 pub(crate) trait Schedule: Sync + Sized + 'static + std::fmt::Debug {
     /// Schedule a task to run soon.
-    fn schedule(&self, is_new: bool, task: Notified<Self>);
+    fn schedule(&self, task: Notified<Self>);
 
     /// Mechanism through which a task can suspend itself, with the intention
     /// of running again soon without being woken up. Very useful if a task was
@@ -88,6 +80,16 @@ pub(crate) enum YieldReason {
     Unknown,
 }
 
+impl From<YieldReason> for PanicReason {
+    fn from(val: YieldReason) -> Self {
+        match val {
+            YieldReason::SlabFull => PanicReason::SlabInvalidState,
+            YieldReason::SqRingFull => PanicReason::SqRingInvalidState,
+            _ => PanicReason::Unknown,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum PanicReason {
     SqBatchTooLarge,
@@ -95,7 +97,8 @@ pub(crate) enum PanicReason {
     SlabInvalidState,
     PollingFuture,
     StoringTaskOutput,
-    CleanupTask,
+    FailedCleanup,
+    DuplicateTaskId,
     Unknown,
 }
 
@@ -134,7 +137,7 @@ pub(crate) trait EventLoop {
     //
     // Can't do &mut because scheduler needs access to the worker to schedule
     // tasks. Worker needs interior mutability.
-    fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<F::Output>;
+    fn event_loop<F: Future>(&self, root_future: Option<F>) -> Result<Option<F::Output>>;
 }
 
 /// Boundary value to prevent stack overflow caused by a large-sized
@@ -148,7 +151,7 @@ pub(crate) const BOX_ROOT_FUTURE_THRESHOLD: usize = 16384;
 /// It can stay on the stack if it is small enough, otherwise it gets heap
 /// allocated.
 pub fn block_on<F: Future>(root_fut: F) -> F::Output {
-    with_scheduler!(|s| {
+    crate::with_scheduler!(|s| {
         let fut_size = std::mem::size_of::<F>();
 
         if fut_size > BOX_ROOT_FUTURE_THRESHOLD {

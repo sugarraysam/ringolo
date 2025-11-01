@@ -1,5 +1,5 @@
 use crate::runtime::{AddMode, PanicReason, TaskOpts, YieldReason};
-use crate::spawn::TaskMetadata;
+use crate::spawn::{TaskMetadata, TaskOptsInternal};
 use crate::task::Id;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -16,7 +16,6 @@ pub(crate) enum Method {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
     Schedule {
-        is_new: bool,
         id: Id,
     },
     YieldNow {
@@ -55,6 +54,14 @@ impl Tracker {
     }
 
     pub(crate) fn record(&self, method: Method, call: Call) {
+        // Do not record maintenance task otherwise it is super annoying to keep
+        // track of in tests expectations.
+        if let Call::Spawn { opts, .. } = &call
+            && opts.contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
+        {
+            return;
+        }
+
         self.calls
             .get_mut(&method)
             .expect("method not found")

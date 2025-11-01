@@ -1,6 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::runtime::Schedule;
+use crate::spawn::TaskOpts;
+use crate::task::state::TransitionToNotifiedByRef;
 use crate::task::{Header, Id, RawTask};
 use std::fmt;
 use std::marker::PhantomData;
@@ -66,6 +68,14 @@ impl<S: 'static> Task<S> {
             Header::set_owner_id(self.raw.header_ptr(), owner_id);
         }
     }
+
+    pub(crate) fn get_owner_id(&self) -> ThreadId {
+        unsafe { Header::get_owner_id(self.raw.header_ptr()) }
+    }
+
+    pub(crate) fn get_opts(&self) -> TaskOpts {
+        unsafe { Header::get_opts(self.raw.header_ptr()) }
+    }
 }
 
 impl<S: Schedule> Task<S> {
@@ -109,9 +119,14 @@ impl<S: 'static> Notified<S> {
 
     // The waker carries our Header ptr unless we are currently polling the root
     // future. We can reconstruct a Notified task from this waker data ptr.
-    pub(crate) unsafe fn from_waker(waker: &Waker) -> Notified<S> {
+    pub(crate) unsafe fn from_waker(waker: &Waker) -> Option<Notified<S>> {
         let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
-        Notified::from_raw(RawTask::from_raw(ptr))
+        let raw = RawTask::from_raw(ptr);
+
+        match raw.state().transition_to_notified_by_ref() {
+            TransitionToNotifiedByRef::Submit => Some(Notified::from_raw(raw)),
+            TransitionToNotifiedByRef::DoNothing => None,
+        }
     }
 
     pub(crate) unsafe fn from_raw(ptr: RawTask) -> Notified<S> {
@@ -144,6 +159,14 @@ impl<S: 'static> Notified<S> {
 
     pub(crate) fn set_owner_id(&self, owner_id: ThreadId) {
         self.0.set_owner_id(owner_id)
+    }
+
+    pub(crate) fn get_owner_id(&self) -> ThreadId {
+        self.0.get_owner_id()
+    }
+
+    pub(crate) fn get_opts(&self) -> TaskOpts {
+        self.0.get_opts()
     }
 }
 

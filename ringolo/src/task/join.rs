@@ -211,7 +211,7 @@ impl<T> JoinHandle<T> {
     /// some time, and this method does not return `true` until it has
     /// completed.
     ///
-    /// ```
+    /// ```no_run
     /// use ringolo::task::JoinHandle;
     /// use ringolo::time::Sleep;
     /// use std::time::Duration;

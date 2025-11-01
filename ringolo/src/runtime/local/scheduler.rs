@@ -1,9 +1,10 @@
 use crate::context::{self, Shared};
 use crate::runtime::local::worker::Worker;
+use crate::runtime::registry::InsertResult;
 use crate::runtime::waker::Wake;
 use crate::runtime::{
-    AddMode, EventLoop, OwnedTasks, RuntimeConfig, Schedule, SchedulerPanic, TaskMetadata,
-    TaskOpts, TaskRegistry, YieldReason,
+    AddMode, EventLoop, OwnedTasks, PanicReason, RuntimeConfig, Schedule, SchedulerPanic,
+    TaskMetadata, TaskOpts, TaskRegistry, YieldReason,
 };
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
@@ -56,11 +57,11 @@ impl Scheduler {
         Handle(Arc::new(self))
     }
 
-    pub(crate) fn set_root_woken(&self) {
+    pub(super) fn set_root_woken(&self) {
         self.root_woken.replace(true);
     }
 
-    pub(crate) fn reset_root_woken(&self) -> bool {
+    pub(super) fn reset_root_woken(&self) -> bool {
         self.root_woken.replace(false)
     }
 
@@ -99,15 +100,9 @@ unsafe impl Sync for Handle {}
 
 impl Schedule for Handle {
     /// Schedule a task to run next (i.e.: front of queue).
-    fn schedule(&self, _is_new: bool, task: LocalTask) {
+    fn schedule(&self, task: LocalTask) {
         #[cfg(test)]
-        self.track(
-            Method::Schedule,
-            Call::Schedule {
-                is_new: _is_new,
-                id: task.id(),
-            },
-        );
+        self.track(Method::Schedule, Call::Schedule { id: task.id() });
 
         // We use LIFO because most of the time schedule is called when a task
         // is woken up as part of the scheduler completion/polling routine. We
@@ -134,9 +129,9 @@ impl Schedule for Handle {
                     ring.submit_and_wait(1, None)?;
                     ring.process_cqes(slab, None)
                 }) {
-                    panic_on_scheduler_error(
-                        format!("Unable to submit or process cqes: {reason:?}"),
-                        &e,
+                    self.panic_on_scheduler_error(
+                        reason.into(),
+                        format!("Unable to submit or process cqes: {:?}", &e),
                     );
                 }
             }
@@ -149,11 +144,12 @@ impl Schedule for Handle {
         if context::with_core(|c| c.is_polling_root()) {
             self.set_root_woken();
         } else {
-            // Safety: there is two flavors of Waker in the codebase, one for
+            // Safety: there are two flavors of Waker in the codebase, one for
             // tasks and one for the root_future. We just checked that we are not
             // currently polling the root future.
-            let task = unsafe { Notified::from_waker(waker) };
-            self.worker.add_task(task, mode);
+            if let Some(task) = unsafe { Notified::from_waker(waker) } {
+                self.worker.add_task(task, mode);
+            }
         }
     }
 
@@ -190,8 +186,17 @@ impl Schedule for Handle {
 impl Handle {
     pub(crate) fn block_on<F: Future>(&self, root_fut: F) -> F::Output {
         match self.worker.event_loop(Some(root_fut)) {
-            Ok(res) => res,
-            Err(e) => panic_on_scheduler_error("Failed to drive future to completion", &e),
+            Ok(Some(res)) => res,
+
+            Ok(None) => self.panic_on_scheduler_error(
+                PanicReason::PollingFuture,
+                "Event loop returned 'None' without an error.",
+            ),
+
+            Err(e) => self.panic_on_scheduler_error(
+                PanicReason::PollingFuture,
+                format!("Failed to drive future to completion: {:?}", &e),
+            ),
         }
     }
 
@@ -219,10 +224,18 @@ impl Handle {
         let (task, notified, join_handle) =
             crate::task::new_task(future, opts, metadata, self.clone());
 
-        let existed = self.tasks.insert(task);
-        debug_assert!(existed.is_none());
+        match self.tasks.insert(task) {
+            InsertResult::Ok => self.schedule(notified),
+            InsertResult::Shutdown => {
+                // TODO: tracing :: warn but safe to continue
+                eprintln!("Tried to spawn a task after shutdown...");
+            }
+            InsertResult::Duplicate(id) => self.unhandled_panic(SchedulerPanic::new(
+                PanicReason::DuplicateTaskId,
+                format!("Tried to spawn task with duplicate id: {}", id),
+            )),
+        }
 
-        self.schedule(true, notified);
         join_handle
     }
 
@@ -230,19 +243,20 @@ impl Handle {
         // This is not necessary for single-threaded runtime but we guarantee
         // thread-safe oneshot shutdown.
         if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
-            self.tasks.shutdown_all();
+            self.tasks.close_and_partition();
+            self.tasks.shutdown_all_partitions();
         }
     }
-}
 
-#[cold]
-#[track_caller]
-fn panic_on_scheduler_error<M, E>(msg: M, e: &E) -> !
-where
-    M: std::fmt::Display,
-    E: std::fmt::Debug,
-{
-    panic!("FATAL: scheduler error. {msg}: {e:?}",);
+    #[cold]
+    #[track_caller]
+    fn panic_on_scheduler_error<M>(&self, reason: PanicReason, msg: M) -> !
+    where
+        M: std::fmt::Display,
+    {
+        self.unhandled_panic(SchedulerPanic::new(reason, msg));
+        unreachable!("Scheduler panic");
+    }
 }
 
 impl Deref for Handle {

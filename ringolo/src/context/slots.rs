@@ -1,22 +1,26 @@
 use crate::context::Core;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::thread::ThreadId;
 
 #[derive(Debug, Clone)]
-pub(super) struct WorkerData {
-    pub(super) pending_ios: Arc<AtomicUsize>,
-    pub(super) ring_fd: RawFd,
+pub(crate) struct WorkerData {
+    pub(crate) pending_ios: Arc<AtomicUsize>,
+
+    pub(crate) should_unpark: Arc<AtomicBool>,
+
+    pub(crate) ring_fd: RawFd,
 }
 
 impl WorkerData {
     fn from_core(core: &Core) -> Self {
         Self {
             pending_ios: Arc::new(AtomicUsize::new(0)),
+            should_unpark: Arc::new(AtomicBool::new(false)),
             ring_fd: core.ring_fd,
         }
     }
@@ -31,7 +35,7 @@ impl WorkerData {
 /// program execution. This should be quite rare so let's not bother optimizing that
 /// case.
 #[derive(Debug)]
-pub(super) struct WorkerSlots {
+pub(crate) struct WorkerSlots {
     slots: RwLock<Vec<Option<WorkerData>>>,
 
     /// Maps a `ThreadId` to a slot
@@ -39,19 +43,20 @@ pub(super) struct WorkerSlots {
 }
 
 impl WorkerSlots {
-    pub(super) fn new(num_workers: usize) -> Self {
+    pub(crate) fn new(num_workers: usize) -> Self {
         Self {
             slots: RwLock::new(vec![None; num_workers]),
             mapping: RwLock::new(SlotsMapping::new(num_workers)),
         }
     }
 
-    pub(super) fn with_data<F, R>(&self, thread_id: &ThreadId, f: F) -> Result<R>
+    #[track_caller]
+    pub(crate) fn with_data<F, R>(&self, thread_id: &ThreadId, f: F) -> R
     where
         F: FnOnce(&WorkerData) -> R,
     {
-        let slot = self.get(thread_id)?;
-        Ok(f(&slot))
+        let slot = self.get(thread_id).expect("slot uninitialized");
+        f(&slot)
     }
 
     fn get(&self, thread_id: &ThreadId) -> Result<MappedRwLockReadGuard<'_, WorkerData>> {
@@ -61,8 +66,8 @@ impl WorkerSlots {
             .map_err(|_| anyhow!("ThreadId {:?} not found", thread_id))
     }
 
-    pub(super) fn register(&self, core: &Core) -> Result<WorkerData> {
-        let slot_idx = self.mapping.write().reserve_slot(core.thread_id)?;
+    pub(crate) fn register(&self, thread_id: ThreadId, core: &Core) -> Result<WorkerData> {
+        let slot_idx = self.mapping.write().reserve_slot(thread_id)?;
 
         let worker_data = WorkerData::from_core(core);
         let worker_data_clone = worker_data.clone();
@@ -71,11 +76,15 @@ impl WorkerSlots {
         Ok(worker_data_clone)
     }
 
-    pub(super) fn unregister(&self, core: &Core) -> Result<()> {
-        let slot_idx = self.mapping.write().free_slot(&core.thread_id)?;
+    pub(crate) fn unregister(&self, thread_id: &ThreadId) -> Result<()> {
+        let slot_idx = self.mapping.write().free_slot(thread_id)?;
         self.slots.write()[slot_idx] = None;
 
         Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.slots.read().len()
     }
 }
 

@@ -45,17 +45,13 @@ unsafe impl Send for Header {}
 unsafe impl Sync for Header {}
 
 impl Header {
-    pub(crate) fn new(
-        state: State,
-        vtable: &'static Vtable,
-        task_opts: Option<TaskOpts>,
-    ) -> Header {
+    pub(crate) fn new(state: State, vtable: &'static Vtable, opts: Option<TaskOpts>) -> Header {
         Header {
             state,
             vtable,
             owner_id: Cell::new(std::thread::current().id()),
             pending_ios: Cell::new(0),
-            opts: task_opts.unwrap_or_default(),
+            opts: opts.unwrap_or_default(),
         }
     }
 
@@ -89,6 +85,11 @@ impl Header {
 
     pub(crate) unsafe fn set_owner_id(me: NonNull<Header>, owner_id: ThreadId) {
         me.as_ref().owner_id.set(owner_id);
+    }
+
+    /// Gets the options set on this Task.
+    pub(crate) unsafe fn get_opts(me: NonNull<Header>) -> TaskOpts {
+        me.as_ref().opts
     }
 
     /// Get pending ios on local thread.

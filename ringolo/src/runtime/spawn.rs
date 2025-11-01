@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 
-use crate::runtime::{CleanupTaskBuilder, cleanup::OpCleanupPayload};
 use crate::task::JoinHandle;
 use bitflags::bitflags;
 
@@ -19,21 +18,6 @@ pub fn spawn_builder() -> SpawnBuilder {
     SpawnBuilder::default()
 }
 
-pub(crate) fn spawn_cleanup<T: OpCleanupPayload>(builder: CleanupTaskBuilder<T>) -> JoinHandle<()> {
-    crate::with_scheduler!(|s| {
-        // Copy the runtime OnCleanupError policy into the builder.
-        let task = builder.on_error(s.cfg.on_cleanup_error).build();
-
-        s.spawn(
-            task.into_future(),
-            // Cleanup tasks need to be sticky to the local thread. It does not make sense
-            // to cancel an io_uring operation from another thread.
-            Some(TaskOpts::STICKY | TaskOpts::BACKGROUND_TASK),
-            None,
-        )
-    })
-}
-
 bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
     pub struct TaskOpts: u16 {
@@ -48,6 +32,32 @@ bitflags! {
         /// Recursively cancel all children of this task when it exits. Prevents
         /// any children from outliving the parent.
         const CANCEL_ALL_CHILDREN_ON_EXIT = 1 << 2;
+    }
+
+    // == Not available publicly ==
+    // # Important
+    // The bitspace is *shared* between TaskOpts and TaskOptsInternal as we will
+    // treat TaskOptsInternal as TaskOpts within the codebase. This is simply to
+    // make sure users are unable to use these flags.
+    // - `TaskOpts` => defines flags starting from right-most bit.
+    // - `TaskOptsInternal` => defines flags starting from left-most bit.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+    pub(crate) struct TaskOptsInternal: u16 {
+        /// Special task that is spawned on startup and stays alive until the
+        /// end of the program. Used for cleanup, cancellation and other stuff.
+        const MAINTENANCE_TASK = 1 << 15;
+    }
+}
+
+impl From<TaskOptsInternal> for TaskOpts {
+    fn from(val: TaskOptsInternal) -> Self {
+        TaskOpts::from_bits_retain(val.bits())
+    }
+}
+
+impl TaskOpts {
+    pub(crate) fn contains_internal(&self, other: TaskOptsInternal) -> bool {
+        self.contains(other.into())
     }
 }
 
@@ -111,5 +121,39 @@ impl SpawnBuilder {
         F::Output: Send + 'static,
     {
         crate::with_scheduler!(|s| { s.spawn(future, self.opts, self.metadata) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_task_opts_internal() {
+        let internal = TaskOptsInternal::MAINTENANCE_TASK;
+        let public: TaskOpts = internal.into();
+        assert_eq!(internal.bits(), public.bits());
+        assert!(public.contains_internal(internal));
+
+        let mut combined = TaskOpts::STICKY | TaskOpts::BACKGROUND_TASK;
+        assert!(!combined.contains_internal(internal));
+
+        combined.insert(internal.into());
+        assert!(combined.contains_internal(internal));
+    }
+
+    #[test]
+    fn test_task_opts_bitspace_no_overlap() {
+        let all_public = TaskOpts::all();
+        let all_internal = TaskOptsInternal::all().into();
+
+        let overlap = all_public & all_internal;
+
+        assert_eq!(
+            overlap,
+            TaskOpts::empty(),
+            "Overlap detected between public and internal task options! Overlapping bits: {:#018b}",
+            overlap.bits()
+        );
     }
 }
