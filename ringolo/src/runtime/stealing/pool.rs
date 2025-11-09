@@ -1,7 +1,7 @@
 use crate::context::init_stealing_context;
-use crate::runtime::EventLoop;
 use crate::runtime::stealing::{self, root_worker::RootWorker, worker::Worker};
-use anyhow::{Result, anyhow};
+use crate::runtime::EventLoop;
+use anyhow::{anyhow, Result};
 use crossbeam_deque::Worker as CbWorker;
 use parking_lot::Mutex;
 use std::collections::HashMap;

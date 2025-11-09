@@ -1,7 +1,8 @@
 use crate::task::{Notified, Task};
 use anyhow::Result;
+use std::fmt;
+use std::sync::Arc;
 use std::task::Waker;
-use std::{fmt, sync::Arc};
 
 // Public API
 pub mod cancel;

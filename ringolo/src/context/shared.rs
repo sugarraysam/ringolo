@@ -3,8 +3,8 @@ use crate::context::{Core, PendingIoOp};
 use crate::runtime::RuntimeConfig;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread::{self, Thread, ThreadId};
 
 #[derive(Debug)]

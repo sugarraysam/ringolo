@@ -1,5 +1,6 @@
 use crate::context;
 use crate::context::slab::SlabReservedBatch;
+use std::sync::Arc;
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
@@ -7,7 +8,6 @@ use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
 use std::io::{self};
 use std::iter;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 
@@ -370,7 +370,7 @@ mod tests {
     use crate::runtime::Builder;
     use crate::sqe::RawSqeState;
     use crate::test_utils::*;
-    use anyhow::{Result, anyhow};
+    use anyhow::{anyhow, Result};
     use either::Either;
     use rstest::rstest;
     use std::pin::pin;

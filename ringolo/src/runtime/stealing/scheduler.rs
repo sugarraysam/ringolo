@@ -189,7 +189,7 @@ impl Schedule for Handle {
         );
     }
 
-    fn task_registry(&self) -> Arc<dyn TaskRegistry> {
+    fn task_registry(&self) -> std::sync::Arc<dyn TaskRegistry> {
         self.tasks.clone()
     }
 }

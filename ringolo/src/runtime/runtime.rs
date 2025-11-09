@@ -1,20 +1,20 @@
 use crate as ringolo;
 use crate::context;
 use crate::context::maintenance::OnCleanupError;
-use crate::runtime::Scheduler;
 use crate::runtime::local;
 use crate::runtime::stealing;
+use crate::runtime::Scheduler;
 use crate::spawn::TaskOpts;
 use crate::task::JoinHandle;
 use crate::utils::thread::set_current_thread_name;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::cell::Cell;
 use std::convert::TryFrom;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::thread;
 
 // Used wherever we rely on SmallVec to store entries on stack first.

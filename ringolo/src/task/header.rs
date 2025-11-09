@@ -1,5 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::sync::Arc;
 use crate::runtime::TaskOpts;
 use crate::task::layout::Vtable;
 use crate::task::node::TaskNode;
@@ -7,7 +8,6 @@ use crate::task::state::State;
 use crate::task::trailer::Trailer;
 use std::cell::Cell;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::thread::ThreadId;
 
 /// Headers are accessed all the time and represent thin-pointers to Task (i.e.: future).

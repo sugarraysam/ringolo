@@ -1,8 +1,8 @@
+use std::sync::Arc;
 use crate::runtime::{AddMode, PanicReason, TaskOpts, YieldReason};
 use crate::spawn::{TaskMetadata, TaskOptsInternal};
 use crate::task::Id;
 use dashmap::DashMap;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Method {

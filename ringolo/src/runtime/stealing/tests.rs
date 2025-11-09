@@ -15,7 +15,6 @@ use crate::with_scheduler;
 use anyhow::Result;
 use rstest::rstest;
 use static_assertions::assert_impl_all;
-use std::f64::consts::E;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -89,6 +88,7 @@ fn test_worker_parking_logic() -> Result<()> {
     });
 
     runtime.shutdown();
+
     assert!(start.elapsed() < Duration::from_secs(1));
     Ok(())
 }

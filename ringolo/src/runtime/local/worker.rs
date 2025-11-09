@@ -6,7 +6,7 @@ use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
 use crate::task::TaskNodeGuard;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::pin::pin;

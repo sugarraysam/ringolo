@@ -4,8 +4,8 @@
 use crate::context::RawSqeSlab;
 use crate::context::SingleIssuerRing;
 use crate::context::{Core, Shared};
-use crate::runtime::RuntimeConfig;
 use crate::runtime::local;
+use crate::runtime::RuntimeConfig;
 use anyhow::Result;
 use std::cell::RefCell;
 use std::sync::Arc;

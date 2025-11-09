@@ -158,31 +158,6 @@ impl TaskNode {
         children
     }
 
-    // Same comment as above applies for concurrent inserts.
-    fn take_children_predicate<F>(
-        &self,
-        predicate: F,
-    ) -> SmallVec<[Arc<TaskNode>; SPILL_TO_HEAP_THRESHOLD]>
-    where
-        F: Fn(&TaskNode) -> bool,
-    {
-        let mut children = SmallVec::new();
-
-        self.children.retain(|_, child| {
-            if predicate(child) {
-                children.push(Arc::clone(child));
-                false
-            } else {
-                true
-            }
-        });
-
-        self.child_count
-            .fetch_sub(children.len(), Ordering::Relaxed);
-
-        children
-    }
-
     pub(crate) fn clone_children(&self) -> SmallVec<[Arc<TaskNode>; SPILL_TO_HEAP_THRESHOLD]> {
         self.children
             .iter()
