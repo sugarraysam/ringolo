@@ -57,14 +57,8 @@ mod tests {
 
     fn init_runtime(kind: Kind) -> Result<Runtime> {
         Ok(match kind {
-            Kind::Local => {
-                let builder = Builder::new_local();
-                init_local_runtime_and_context(Some(builder))?.0
-            }
-            Kind::Stealing => {
-                let builder = Builder::new_stealing().worker_threads(WORKER_THREADS);
-                init_stealing_runtime_and_context(Some(builder))?.0
-            }
+            Kind::Local => init_local_runtime_and_context(None)?.0,
+            Kind::Stealing => init_stealing_runtime_and_context(WORKER_THREADS, None)?.0,
         })
     }
 
@@ -81,7 +75,7 @@ mod tests {
             }
             Kind::Stealing => {
                 let builder = Builder::new_stealing().orphan_policy(OrphanPolicy::Permissive);
-                init_stealing_runtime_and_context(Some(builder))?.0
+                init_stealing_runtime_and_context(WORKER_THREADS, Some(builder))?.0
             }
         };
 

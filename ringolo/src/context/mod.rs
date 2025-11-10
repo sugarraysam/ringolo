@@ -1,7 +1,8 @@
 // Keep unused context methods to provide rich API for future developers.
 #![allow(dead_code)]
 
-use crate::runtime::{local, stealing, Scheduler};
+use crate::runtime::{Scheduler, local, stealing};
+use crate::task::ThreadId;
 use crate::task::{Id, TaskNode};
 use std::cell::{OnceCell, RefCell};
 use std::sync::Arc;
@@ -70,11 +71,15 @@ pub(crate) fn init_local_context(scheduler: local::Handle) {
 }
 
 #[track_caller]
-pub(crate) fn init_stealing_context(scheduler: stealing::Handle) {
+pub(crate) fn init_stealing_context(thread_id: ThreadId, scheduler: stealing::Handle) {
     CONTEXT.with(|ctx| {
         ctx.get_or_init(|| {
-            let ctx = stealing::Context::try_new(&scheduler.cfg, Arc::clone(&scheduler.shared))
-                .expect("Failed to initialize stealing context");
+            let ctx = stealing::Context::try_new(
+                thread_id,
+                &scheduler.cfg,
+                Arc::clone(&scheduler.shared),
+            )
+            .expect("Failed to initialize stealing context");
 
             RefCell::new(RootContext::new_stealing(ctx, scheduler))
         });

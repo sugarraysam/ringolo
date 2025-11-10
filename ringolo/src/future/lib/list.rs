@@ -7,6 +7,7 @@ use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::task::Waker;
 use std::task::{Context, Poll, ready};
 
 // Defines a top-level operation enum and its corresponding output enum.
@@ -76,13 +77,14 @@ macro_rules! define_any_op {
 
                 fn into_output(
                     self: Pin<&mut Self>,
+                    waker: &Waker,
                     result: Result<i32, IoError>,
                 ) -> Result<Self::Output, IoError> {
                     match self.project() {
                         $(
                             // Use generated projection and map to the OutputEnum variant
                             [<$OpEnum Proj>]::$Variant(op) => {
-                                op.into_output(result).map($OutputEnum::$Variant)
+                                op.into_output(waker, result).map($OutputEnum::$Variant)
                             }
                         )*
                     }
@@ -224,7 +226,7 @@ impl<T: AsRawOrDirect + Unpin> Future for OpList<T> {
             .map(|(op, res)| -> Result<AnyOpOutput, IoError> {
                 // Safety: same as above.
                 let pinned_op = Pin::new(op);
-                pinned_op.into_output(res.map_err(IoError::from))
+                pinned_op.into_output(cx.waker(), res.map_err(IoError::from))
             })
             .collect::<Vec<_>>();
 

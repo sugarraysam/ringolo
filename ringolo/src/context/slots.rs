@@ -1,11 +1,11 @@
 use crate::context::Core;
-use anyhow::{anyhow, Context, Result};
+use crate::task::ThreadId;
+use anyhow::{Context, Result, anyhow};
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::Arc;
-use std::thread::ThreadId;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerData {
@@ -66,8 +66,8 @@ impl WorkerSlots {
             .map_err(|_| anyhow!("ThreadId {:?} not found", thread_id))
     }
 
-    pub(crate) fn register(&self, thread_id: ThreadId, core: &Core) -> Result<WorkerData> {
-        let slot_idx = self.mapping.write().reserve_slot(thread_id)?;
+    pub(crate) fn register(&self, core: &Core) -> Result<WorkerData> {
+        let slot_idx = self.mapping.write().reserve_slot(core.thread_id)?;
 
         let worker_data = WorkerData::from_core(core);
         let worker_data_clone = worker_data.clone();

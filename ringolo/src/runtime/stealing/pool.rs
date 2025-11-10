@@ -1,12 +1,13 @@
 use crate::context::init_stealing_context;
-use crate::runtime::stealing::{self, root_worker::RootWorker, worker::Worker};
 use crate::runtime::EventLoop;
-use anyhow::{anyhow, Result};
+use crate::runtime::stealing::{self, root_worker::RootWorker, worker::Worker};
+use crate::task::ThreadId;
+use anyhow::{Result, anyhow};
 use crossbeam_deque::Worker as CbWorker;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::{Arc, Barrier};
-use std::thread::{self, ThreadId};
+use std::thread;
 
 /// Abstraction for the scheduler workers and thread pool.
 #[derive(Debug)]
@@ -113,21 +114,22 @@ fn spawn_worker_thread(
         builder = builder.stack_size(stack_size);
     }
 
+    let thread_id = worker.thread_id;
     let handle = builder
         .name(scheduler.cfg.thread_name.0())
         .spawn(move || {
-            init_stealing_context(scheduler);
+            init_stealing_context(worker.thread_id, scheduler);
             barrier.wait();
 
             let res = worker.event_loop::<std::future::Ready<()>>(None);
             if let Err(e) = &res {
-                eprintln!("Worker thread {:?} panicked: {:?}", worker.thread_id(), e);
+                eprintln!("Worker thread {:?} panicked: {:?}", worker.thread_id, e);
                 debug_assert!(false, "Worker thread panicked");
             }
         })
         .expect("failed to spawn worker thread");
 
-    (handle.thread().id(), handle)
+    (thread_id, handle)
 }
 
 // We abstract both workers behind enum dispatch because the EventLoop trait is not

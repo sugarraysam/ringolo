@@ -3,7 +3,7 @@ name = "ringolo"
 version = "0.1.0-alpha.1"
 edition = "2024"
 rust-version = "1.89"
-authors = ["Samuel Blais-Dowdy <samuel.blaisddowdy@protonmail.com>"]
+authors = ["Samuel Blais-Dowdy <samuel.blaisdowdy@protonmail.com>"]
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/sugarraysam/ringolo"
@@ -28,9 +28,7 @@ fastrand = "~2.3.0"
 futures = "~0.3.31"
 io-uring = "^0.7.10"
 libc = { version = "~0.2.98", default-features = false }
-
-
-nix = { version = "~0.30.1", features = ["socket"] }
+nix = { version = "~0.30.1", features = ["fs", "socket"] }
 parking_lot = "~0.12.5"
 paste = "~1.0.15"
 pin-project = "~1.1.10"
@@ -44,3 +42,4 @@ tracing = "~0.1.41"
 rstest = "~0.26.1"
 static_assertions = "~1.1.0"
 tempfile = "~3.23.0"
+uuid = { version = "~1.18.1", features = ["v4"] }

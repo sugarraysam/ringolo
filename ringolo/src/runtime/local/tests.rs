@@ -2,16 +2,21 @@ use super::*;
 use crate as ringolo;
 use crate::context;
 use crate::context::maintenance::task::MAINTENANCE_TASK_OPTS;
+use crate::future::lib::{KernelFdMode, OpenAt};
 use crate::future::lib::{Nop, Op};
 use crate::runtime::waker::Wake;
-use crate::runtime::{Builder, Schedule, TaskRegistry, YieldReason, get_root};
-use crate::sqe::{IoError, Sqe, SqeCollection};
+use crate::runtime::{AddMode, Builder, Schedule, TaskRegistry, YieldReason, get_root};
+use crate::spawn::{TaskMetadata, TaskOpts};
+use crate::sqe::{Sqe, SqeCollection};
+use crate::task::JoinHandle;
 use crate::test_utils::*;
 use crate::time::{Sleep, YieldNow};
 use crate::utils::scheduler::*;
 use crate::utils::thread::get_current_thread_name;
-use crate::with_scheduler;
 use anyhow::Result;
+use nix::fcntl::OFlag;
+use nix::sys::stat::Mode;
+use rstest::rstest;
 use static_assertions::assert_impl_all;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -20,60 +25,51 @@ use std::time::{Duration, Instant};
 assert_impl_all!(Scheduler: Send, Sync, Wake);
 assert_impl_all!(Handle: Send, Sync, Schedule);
 
-#[test]
-fn test_single_nop() -> Result<()> {
-    let runtime = Builder::new_local().try_build()?;
-    runtime.block_on(async {
-        assert!(matches!(Op::new(Nop).await, Ok(_)));
-        Ok(())
-    })
+#[ringolo::test]
+async fn test_single_nop() -> Result<()> {
+    assert!(matches!(Op::new(Nop).await, Ok(_)));
+    Ok(())
 }
 
-#[test]
-fn test_batch_of_nops() -> Result<()> {
-    let runtime = Builder::new_local().try_build()?;
-    runtime.block_on(async {
-        let batch = Sqe::new(build_batch(10));
-        let res = batch.await;
+#[ringolo::test]
+async fn test_batch_of_nops() -> Result<()> {
+    let batch = Sqe::new(build_batch(10));
+    let res = batch.await;
 
+    assert!(res.is_ok());
+    for res in res.unwrap() {
         assert!(res.is_ok());
-        for res in res.unwrap() {
-            assert!(res.is_ok());
-            assert_eq!(res.unwrap(), 0);
-        }
+        assert_eq!(res.unwrap(), 0);
+    }
 
-        Ok(())
-    })
+    Ok(())
 }
 
-#[test]
-fn test_sqe_chain_backend_file_io() -> Result<()> {
-    let runtime = Builder::new_local().try_build()?;
-    runtime.block_on(async {
-        let (chain, data_out, mut data_in, _tmp) = build_chain_write_fsync_read_tempfile();
-        let chain = Sqe::new(chain);
-        let res = chain.await;
+#[ringolo::test]
+async fn test_sqe_chain_backend_file_io() -> Result<()> {
+    let (chain, data_out, mut data_in, _tmp) = build_chain_write_fsync_read_tempfile();
+    let chain = Sqe::new(chain);
+    let res = chain.await;
 
-        assert!(res.is_ok());
+    assert!(res.is_ok());
 
-        let expected: Vec<i32> = vec![data_out.len() as i32, 0, data_out.len() as i32];
-        expected
-            .into_iter()
-            .zip(res.unwrap())
-            .for_each(|(expected, got)| {
-                assert!(got.is_ok());
-                assert_eq!(expected, got.unwrap())
-            });
+    let expected: Vec<i32> = vec![data_out.len() as i32, 0, data_out.len() as i32];
+    expected
+        .into_iter()
+        .zip(res.unwrap())
+        .for_each(|(expected, got)| {
+            assert!(got.is_ok());
+            assert_eq!(expected, got.unwrap())
+        });
 
-        // vec is unaware that data was written as it was through a *mut T
-        unsafe {
-            data_in.set_len(data_out.len());
-        }
+    // vec is unaware that data was written as it was through a *mut T
+    unsafe {
+        data_in.set_len(data_out.len());
+    }
 
-        assert_eq!(data_in, data_out);
+    assert_eq!(data_in, data_out);
 
-        Ok(())
-    })
+    Ok(())
 }
 
 #[test]
@@ -83,21 +79,22 @@ fn test_sq_batch_too_large() -> Result<()> {
         .sq_ring_size(sq_ring_size)
         .try_build()?;
 
-    let res = runtime.block_on(async move {
-        let batch = Sqe::new(build_batch(sq_ring_size + 1));
-        batch.await
-    });
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = runtime.block_on(async move {
+            let batch = Sqe::new(build_batch(sq_ring_size + 1));
+            batch.await
+        });
+    }));
 
-    assert!(matches!(res, Err(IoError::SqBatchTooLarge)));
+    assert!(res.is_err());
     Ok(())
 }
 
 #[test]
 fn test_sq_ring_full_recovers() -> Result<()> {
     let sq_ring_size = 8;
-    let runtime = Builder::new_local()
-        .sq_ring_size(sq_ring_size)
-        .try_build()?;
+    let builder = Builder::new_local().sq_ring_size(sq_ring_size);
+    let (runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
 
     let results = runtime.block_on(async move {
         let batch = SqeCollection::new(vec![build_batch(5), build_batch(4)]);
@@ -114,17 +111,15 @@ fn test_sq_ring_full_recovers() -> Result<()> {
 
     // The first batch of 5 succeeds without error. The second overflows the SQ ring,
     // triggering a `yield_now` + submit from Worker. After we retry it succeeds.
-    with_scheduler!(|s| {
-        let yield_calls = s.tracker.get_calls(&Method::YieldNow);
-        assert_eq!(yield_calls.len(), 1);
-        assert!(matches!(
-            yield_calls[0],
-            Call::YieldNow {
-                reason: YieldReason::SqRingFull,
-                mode: None,
-            }
-        ));
-    });
+    let yield_calls = scheduler.tracker.get_calls(&Method::YieldNow);
+    assert_eq!(yield_calls.len(), 1);
+    assert!(matches!(
+        yield_calls[0],
+        Call::YieldNow {
+            reason: YieldReason::SqRingFull,
+            mode: None,
+        }
+    ));
 
     Ok(())
 }
@@ -136,11 +131,6 @@ fn test_spawn_before_block_on() -> Result<()> {
         .sq_ring_size(sq_ring_size)
         .try_build()?;
 
-    // Default current task ID is ROOT_FUTURE instead of None?
-    // Set default current task ID when starting worker
-    // - stealing creating thread == ROOT_FUTURE
-    // - stealing not creating == None
-    // - local == ROOT_FUTURE
     let handle = runtime.spawn(async move {
         let batch = SqeCollection::new(vec![build_batch(2), build_batch(2)]);
         batch.await
@@ -164,7 +154,7 @@ fn test_spawn_before_block_on() -> Result<()> {
 
 #[test]
 fn test_spawn_within_block_on() -> Result<()> {
-    let runtime = Builder::new_local().try_build()?;
+    let (runtime, scheduler) = init_local_runtime_and_context(None)?;
 
     let res = runtime.block_on(async {
         let res = ringolo::spawn(async {
@@ -181,24 +171,24 @@ fn test_spawn_within_block_on() -> Result<()> {
 
         assert!(res.is_ok());
 
-        with_scheduler!(|s| {
-            let spawn_calls = s.tracker.get_calls(&Method::Spawn);
-            assert_eq!(spawn_calls.len(), 1);
-        });
-
         42
     });
+
+    let spawn_calls = scheduler.tracker.get_calls(&Method::Spawn);
+    assert_eq!(spawn_calls.len(), 1);
 
     assert_eq!(res, 42);
     Ok(())
 }
 
-#[test]
-fn test_runtime_shutdown() -> Result<()> {
+#[rstest]
+#[case::three(3)]
+#[case::seven(7)]
+#[case::eleven(11)]
+fn test_runtime_shutdown(#[case] n: usize) -> Result<()> {
     let start = Instant::now();
-    let runtime = Builder::new_local().try_build()?;
+    let (runtime, scheduler) = init_local_runtime_and_context(None)?;
 
-    let scheduler = runtime.expect_local_scheduler();
     let shared = runtime.block_on(async move {
         context::with_shared(|shared| {
             assert!(!shared.shutdown.load(Ordering::Relaxed));
@@ -207,7 +197,6 @@ fn test_runtime_shutdown() -> Result<()> {
     });
 
     // Spawn tasks on runtime that are very long
-    let n = 3;
     let handles = (0..n)
         .into_iter()
         .map(|_| {
@@ -224,7 +213,9 @@ fn test_runtime_shutdown() -> Result<()> {
 
     assert!(shared.shutdown.load(Ordering::Relaxed));
     assert!(scheduler.tasks.is_closed());
-    assert_eq!(scheduler.tasks.len(), n + 1);
+
+    let maintenance_task = 1;
+    assert_eq!(scheduler.tasks.len(), n + maintenance_task);
 
     // Make sure we did not have to wait for the tasks to complete
     assert!(start.elapsed() < Duration::from_secs(1));
@@ -269,6 +260,94 @@ async fn test_maintenance_task() -> Result<()> {
     // polled once and set `is_running` to true.
     YieldNow::new(None).await?;
     context::with_core(|core| assert!(core.maintenance_task.is_running()));
+
+    Ok(())
+}
+
+#[rstest]
+#[case::three(3)]
+#[case::seven(7)]
+#[case::thirteen(13)]
+#[test]
+fn test_tasks_are_not_stealable(#[case] num_yields: usize) -> Result<()> {
+    let (runtime, scheduler) = init_local_runtime_and_context(None)?;
+
+    runtime.block_on(async {
+        let handle: JoinHandle<Result<()>> = ringolo::spawn(async move {
+            // Owning an fd makes the task not stealable.
+            let _fd = Op::new(OpenAt::try_new(
+                KernelFdMode::DirectAuto,
+                None,
+                gen_tempfile_name(),
+                OFlag::O_RDONLY | OFlag::O_CREAT,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            )?)
+            .await?;
+
+            for _ in 0..num_yields {
+                YieldNow::new(None).await?;
+            }
+
+            Ok(())
+        });
+
+        assert!(handle.await.is_ok());
+    });
+
+    // Yield internally calls schedule
+    assert_eq!(
+        scheduler.tracker.get_calls(&Method::YieldNow).len(),
+        num_yields
+    );
+
+    let schedule_calls = scheduler.tracker.get_calls(&Method::Schedule);
+    assert_eq!(
+        schedule_calls.len(),
+        num_yields + 2 /* initial_spawn + process_cqes */
+    );
+
+    // only initial spawn is stealable
+    assert_eq!(
+        schedule_calls
+            .iter()
+            .filter(|c| matches!(c, Call::Schedule { is_stealable, .. } if *is_stealable))
+            .count(),
+        1,
+    );
+
+    runtime.shutdown();
+
+    Ok(())
+}
+
+#[rstest]
+#[case::lifo(Some(TaskOpts::HINT_SPAWN_LIFO), Some(AddMode::Lifo))]
+#[case::fifo(Some(TaskOpts::HINT_SPAWN_FIFO), Some(AddMode::Fifo))]
+#[case::default(None, None)]
+#[test]
+fn test_hint_spawn_add_mode(
+    #[case] hint_spawn_opt: Option<TaskOpts>,
+    #[case] expected_add_mode: Option<AddMode>,
+) -> Result<()> {
+    let (runtime, scheduler) = init_local_runtime_and_context(None)?;
+
+    runtime.block_on(async {
+        let handle: JoinHandle<Result<()>> = ringolo::spawn_builder()
+            .with_opts(hint_spawn_opt.unwrap_or_default())
+            .spawn(async move { Ok(()) });
+
+        assert!(handle.await.is_ok());
+    });
+
+    let schedule_calls = scheduler.tracker.get_calls(&Method::Schedule);
+    assert_eq!(schedule_calls.len(), 1);
+    assert!(
+        schedule_calls
+            .iter()
+            .all(|c| matches!(c, Call::Schedule { mode, ..} if *mode == expected_add_mode))
+    );
+
+    runtime.shutdown();
 
     Ok(())
 }

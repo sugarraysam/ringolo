@@ -1,14 +1,16 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::sync::Arc;
+use crate::context;
 use crate::runtime::TaskOpts;
+use crate::spawn::TaskOptsInternal;
+use crate::task::ThreadId;
 use crate::task::layout::Vtable;
 use crate::task::node::TaskNode;
 use crate::task::state::State;
 use crate::task::trailer::Trailer;
 use std::cell::Cell;
 use std::ptr::NonNull;
-use std::thread::ThreadId;
+use std::sync::Arc;
 
 /// Headers are accessed all the time and represent thin-pointers to Task (i.e.: future).
 /// We can only store "hot data" in this struct, and we must only add values that are accessed
@@ -18,8 +20,9 @@ use std::thread::ThreadId;
 /// The structure now stands at 30 bytes:
 /// - 8 bytes  :: state (atomic_usize)
 /// - 8 bytes  :: vtable (ptr)
-/// - 8 bytes  :: thread_id (u64)
+/// - 4 bytes  :: thread_id (u32)
 /// - 4 bytes  :: pending_io (u32)
+/// - 4 bytes  :: owned_resources (u32)
 /// - 2 byte   :: task_opts (u16)
 #[repr(C, align(32))]
 pub(crate) struct Header {
@@ -37,6 +40,12 @@ pub(crate) struct Header {
     /// submissions.
     pub(super) pending_ios: Cell<u32>,
 
+    /// We keep track of all locally owned resources (direct descriptor, provided
+    /// buffers, registered buffers) for this task. These resources have no meaning
+    /// on other threads and we use this counter to determine when a task can
+    /// safely be stolen by another worker on a separate thread.
+    pub(super) owned_resources: Cell<u32>,
+
     /// Special task options to modify scheduling behaviour.
     pub(super) opts: TaskOpts,
 }
@@ -49,8 +58,9 @@ impl Header {
         Header {
             state,
             vtable,
-            owner_id: Cell::new(std::thread::current().id()),
+            owner_id: Cell::new(context::with_core(|core| core.thread_id)),
             pending_ios: Cell::new(0),
+            owned_resources: Cell::new(0),
             opts: opts.unwrap_or_default(),
         }
     }
@@ -78,23 +88,8 @@ impl Header {
         (*task_node).clone()
     }
 
-    /// Gets the owner_id of the task containing this `Header`.
-    pub(crate) unsafe fn get_owner_id(me: NonNull<Header>) -> ThreadId {
-        me.as_ref().owner_id.get()
-    }
-
     pub(crate) unsafe fn set_owner_id(me: NonNull<Header>, owner_id: ThreadId) {
         me.as_ref().owner_id.set(owner_id);
-    }
-
-    /// Gets the options set on this Task.
-    pub(crate) unsafe fn get_opts(me: NonNull<Header>) -> TaskOpts {
-        me.as_ref().opts
-    }
-
-    /// Get pending ios on local thread.
-    pub(crate) unsafe fn get_pending_ios(me: NonNull<Header>) -> u32 {
-        me.as_ref().pending_ios.get()
     }
 
     /// Modify pending ios.
@@ -104,6 +99,19 @@ impl Header {
             .update(|x| x.checked_add_signed(delta).expect("underflow"));
     }
 
+    /// Increment owned resources.
+    pub(crate) unsafe fn increment_owned_resources(me: NonNull<Header>) {
+        me.as_ref().owned_resources.update(|x| x + 1);
+    }
+
+    /// Increment owned resources.
+    pub(crate) unsafe fn decrement_owned_resources(me: NonNull<Header>) {
+        me.as_ref().owned_resources.update(|x| x - 1);
+    }
+}
+
+// Non pointer read-only self methods.
+impl Header {
     /// Determines if the task is safe to be stolen by another worker thread.
     ///
     /// A task is considered stealable only if it has no pending `io_uring`
@@ -111,12 +119,52 @@ impl Header {
     /// I/O completions are delivered to the ring of the original submitting thread.
     /// Stealing a task with pending I/O would cause its waker to be invoked on
     /// the wrong worker, leading to undefined behavior.
-    pub(crate) unsafe fn is_stealable(me: NonNull<Header>) -> bool {
-        let ptr = me.as_ref();
+    ///
+    /// Also, a task is not stealable if it owns `io_uring` resources that have no
+    /// meaning outside of the current thread (e.g.: direct file descriptor,
+    /// provided buffer, registered buffers). Trying to use such a resource on
+    /// another thread would also lead to errors.
+    pub(crate) fn is_stealable(&self) -> bool {
+        !(self.is_sticky()
+            || self.is_maintenance_task()
+            || self.has_pending_ios()
+            || self.owns_resources())
+    }
 
-        let is_sticky = ptr.opts.contains(TaskOpts::STICKY);
-        let has_pending_ios = ptr.pending_ios.get() > 0;
+    pub(crate) fn is_maintenance_task(&self) -> bool {
+        self.opts
+            .contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
+    }
 
-        !is_sticky && !has_pending_ios
+    pub(crate) fn is_sticky(&self) -> bool {
+        self.opts.contains(TaskOpts::STICKY)
+    }
+
+    pub(crate) fn has_pending_ios(&self) -> bool {
+        self.pending_ios.get() > 0
+    }
+
+    pub(crate) fn owns_resources(&self) -> bool {
+        self.owned_resources.get() > 0
+    }
+
+    /// Get owned resources on local thread.
+    pub(crate) fn get_owned_resources(&self) -> u32 {
+        self.owned_resources.get()
+    }
+
+    /// Gets the options set on this Task.
+    pub(crate) fn get_opts(&self) -> TaskOpts {
+        self.opts
+    }
+
+    /// Get pending ios on local thread.
+    pub(crate) fn get_pending_ios(&self) -> u32 {
+        self.pending_ios.get()
+    }
+
+    /// Gets the owner_id of the task containing this `Header`.
+    pub(crate) fn get_owner_id(&self) -> ThreadId {
+        self.owner_id.get()
     }
 }

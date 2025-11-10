@@ -1,4 +1,5 @@
 use crate::runtime::{OrphanPolicy, RuntimeConfig, Schedule};
+use crate::task::ThreadId;
 use crate::task::id::{ORPHAN_ROOT_ID, ROOT_ID};
 use crate::task::{Id, Task, TaskNode};
 use dashmap::DashMap;
@@ -6,7 +7,6 @@ use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread::ThreadId;
 
 pub(crate) fn get_root() -> Arc<TaskNode> {
     crate::with_scheduler!(|s| { s.tasks.get_root() })
@@ -242,11 +242,12 @@ impl<S: Schedule> TaskRegistry for OwnedTasks<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context;
     use crate::test_utils::*;
     use anyhow::Result;
     use rstest::rstest;
     use std::sync::Barrier;
-    use std::thread::{self, JoinHandle};
+    use std::thread::JoinHandle;
 
     #[rstest]
     #[case::ten(10)]
@@ -289,7 +290,7 @@ mod tests {
         }
 
         let check_partition = Arc::new(move |registry: Arc<OwnedTasks<DummyScheduler>>| {
-            let thread_id = thread::current().id();
+            let thread_id = context::with_core(|core| core.thread_id);
             let partition = registry.wait_for_shutdown_partition(&thread_id);
             assert!(partition.is_some());
 

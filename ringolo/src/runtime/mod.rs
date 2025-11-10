@@ -35,7 +35,7 @@ mod waker;
 /// Scheduler trait
 pub(crate) trait Schedule: Sync + Sized + 'static + std::fmt::Debug {
     /// Schedule a task to run soon.
-    fn schedule(&self, task: Notified<Self>);
+    fn schedule(&self, task: Notified<Self>, mode: Option<AddMode>);
 
     /// Mechanism through which a task can suspend itself, with the intention
     /// of running again soon without being woken up. Very useful if a task was
@@ -93,13 +93,13 @@ impl From<YieldReason> for PanicReason {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum PanicReason {
+    DuplicateTaskId,
+    FailedCleanup,
+    PollingFuture,
+    SlabInvalidState,
     SqBatchTooLarge,
     SqRingInvalidState,
-    SlabInvalidState,
-    PollingFuture,
     StoringTaskOutput,
-    FailedCleanup,
-    DuplicateTaskId,
     Unknown,
 }
 

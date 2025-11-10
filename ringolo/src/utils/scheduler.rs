@@ -1,8 +1,8 @@
-use std::sync::Arc;
 use crate::runtime::{AddMode, PanicReason, TaskOpts, YieldReason};
 use crate::spawn::{TaskMetadata, TaskOptsInternal};
 use crate::task::Id;
 use dashmap::DashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Method {
@@ -17,6 +17,9 @@ pub(crate) enum Method {
 pub(crate) enum Call {
     Schedule {
         id: Id,
+        is_stealable: bool,
+        opts: TaskOpts,
+        mode: Option<AddMode>,
     },
     YieldNow {
         reason: YieldReason,
@@ -56,7 +59,7 @@ impl Tracker {
     pub(crate) fn record(&self, method: Method, call: Call) {
         // Do not record maintenance task otherwise it is super annoying to keep
         // track of in tests expectations.
-        if let Call::Spawn { opts, .. } = &call
+        if let Call::Spawn { opts, .. } | Call::Schedule { opts, .. } = &call
             && opts.contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
         {
             return;

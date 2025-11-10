@@ -6,16 +6,21 @@ use io_uring::types::Fd;
 use std::ffi::CString;
 use std::fs::File;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 
 // Exports
 mod context;
 pub(crate) use context::{init_local_runtime_and_context, init_stealing_runtime_and_context};
 
-pub(crate) mod future;
+mod future;
 pub(crate) use future::*;
 
-pub(crate) mod mocks;
+mod mocks;
 pub(crate) use mocks::{DummyScheduler, mock_task, mock_waker};
+
+pub(crate) fn gen_tempfile_name() -> PathBuf {
+    std::env::temp_dir().join(uuid::Uuid::new_v4().to_string())
+}
 
 pub(crate) async fn wait_for_cleanup() {
     while !crate::context::with_core(|core| core.maintenance_task.cleanup_handler.is_empty()) {

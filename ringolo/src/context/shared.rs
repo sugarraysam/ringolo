@@ -1,11 +1,12 @@
 use crate::context::slots::WorkerSlots;
 use crate::context::{Core, PendingIoOp};
 use crate::runtime::RuntimeConfig;
+use crate::task::ThreadId;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::thread::{self, Thread, ThreadId};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread::{self, Thread};
 
 #[derive(Debug)]
 pub struct Shared {
@@ -20,7 +21,7 @@ pub struct Shared {
 
     /// LIFO collection of parked threads. We unpark thread in LIFO order as the
     /// latest parked thread is the one where CPU cache will be the hotest.
-    pub(crate) parked_threads: RwLock<VecDeque<Thread>>,
+    pub(crate) parked_threads: RwLock<VecDeque<(Thread, ThreadId)>>,
 }
 
 impl Shared {
@@ -35,9 +36,9 @@ impl Shared {
     }
 
     #[track_caller]
-    pub(super) fn register_worker(&self, thread_id: ThreadId, core: &Core) -> Arc<AtomicUsize> {
+    pub(super) fn register_worker(&self, core: &Core) -> Arc<AtomicUsize> {
         self.worker_slots
-            .register(thread_id, core)
+            .register(core)
             .map(|data| Arc::clone(&data.pending_ios))
             .expect("failed to register worker")
     }
@@ -80,7 +81,11 @@ impl Shared {
     /// it when it judges there is sufficient work to resume the event_loop on
     /// this worker.
     #[track_caller]
-    pub(crate) fn park_current_thread<T>(&self, injector: &Arc<crossbeam_deque::Injector<T>>) {
+    pub(crate) fn park_current_thread<T>(
+        &self,
+        thread_id: &ThreadId,
+        injector: &Arc<crossbeam_deque::Injector<T>>,
+    ) {
         let should_unpark = {
             let mut parked_threads = self.parked_threads.write();
 
@@ -91,12 +96,12 @@ impl Shared {
             }
 
             let thread = thread::current();
-            let should_unpark = self.worker_slots.with_data(&thread.id(), |data| {
+            let should_unpark = self.worker_slots.with_data(thread_id, |data| {
                 data.should_unpark.store(false, Ordering::Release);
                 Arc::clone(&data.should_unpark)
             });
 
-            parked_threads.push_back(thread);
+            parked_threads.push_back((thread, *thread_id));
             should_unpark
         };
 
@@ -109,8 +114,8 @@ impl Shared {
 
     #[track_caller]
     pub(crate) fn unpark_one_thread(&self) -> bool {
-        if let Some(thread) = self.parked_threads.write().pop_back() {
-            self.worker_slots.with_data(&thread.id(), |data| {
+        if let Some((thread, thread_id)) = self.parked_threads.write().pop_back() {
+            self.worker_slots.with_data(&thread_id, |data| {
                 data.should_unpark.store(true, Ordering::Release);
             });
             thread.unpark();
@@ -125,9 +130,9 @@ impl Shared {
         let mut num_unparked = 0;
         let mut parked_threads = self.parked_threads.write();
 
-        while let Some(thread) = parked_threads.pop_back() {
+        while let Some((thread, thread_id)) = parked_threads.pop_back() {
             num_unparked += 1;
-            self.worker_slots.with_data(&thread.id(), |data| {
+            self.worker_slots.with_data(&thread_id, |data| {
                 data.should_unpark.store(true, Ordering::Release);
             });
 

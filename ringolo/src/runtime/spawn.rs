@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
 
+use crate::runtime::AddMode;
 use crate::task::JoinHandle;
 use bitflags::bitflags;
 
@@ -32,6 +33,14 @@ bitflags! {
         /// Recursively cancel all children of this task when it exits. Prevents
         /// any children from outliving the parent.
         const CANCEL_ALL_CHILDREN_ON_EXIT = 1 << 2;
+
+        /// Force scheduler to add at front or back of the queue in certain cases.
+        /// This is not enforced in all cases, and is scheduler specific. But in
+        /// general, the scheduler will try to respect this option. This only
+        /// applies when the task is initially spawned, subsequent call to
+        /// schedule will use the scheduler default (most likely LIFO).
+        const HINT_SPAWN_FIFO = 1 << 3;
+        const HINT_SPAWN_LIFO = 1 << 4;
     }
 
     // == Not available publicly ==
@@ -58,6 +67,15 @@ impl From<TaskOptsInternal> for TaskOpts {
 impl TaskOpts {
     pub(crate) fn contains_internal(&self, other: TaskOptsInternal) -> bool {
         self.contains(other.into())
+    }
+
+    pub(crate) fn initial_spawn_add_mode(&self) -> Option<AddMode> {
+        self.contains(TaskOpts::HINT_SPAWN_LIFO)
+            .then_some(AddMode::Lifo)
+            .or_else(|| {
+                self.contains(TaskOpts::HINT_SPAWN_FIFO)
+                    .then_some(AddMode::Fifo)
+            })
     }
 }
 

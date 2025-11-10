@@ -8,6 +8,7 @@ use nix::sys::socket::SockFlag;
 use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;
+use std::task::Waker;
 use std::time::Duration;
 
 #[derive(Debug)]
@@ -62,10 +63,11 @@ impl<T: AsRawOrDirect> MultishotPayload for AcceptMultishot<T> {
 
     fn into_next(
         self: Pin<&mut Self>,
+        waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Item, IoError> {
         let fd = result?;
-        Ok(OwnedUringFd::from_result(fd, self.mode))
+        Ok(OwnedUringFd::from_result(fd, self.mode, waker))
     }
 }
 
@@ -118,6 +120,7 @@ impl MultishotPayload for TimeoutMultishot {
 
     fn into_next(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Item, IoError> {
         match result {

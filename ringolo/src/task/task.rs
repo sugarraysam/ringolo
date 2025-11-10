@@ -2,6 +2,7 @@
 
 use crate::runtime::Schedule;
 use crate::spawn::TaskOpts;
+use crate::task::ThreadId;
 use crate::task::state::TransitionToNotifiedByRef;
 use crate::task::{Header, Id, RawTask};
 use std::fmt;
@@ -9,7 +10,6 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
 use std::task::Waker;
-use std::thread::ThreadId;
 
 /// An owned handle to the task, tracked by ref count.
 #[repr(transparent)]
@@ -60,7 +60,7 @@ impl<S: 'static> Task<S> {
     // We keep track of inflight IO operations through the waker, and
     // the Submittable interface.
     pub(crate) fn is_stealable(&self) -> bool {
-        unsafe { Header::is_stealable(self.raw.header_ptr()) }
+        self.header().is_stealable()
     }
 
     pub(crate) fn set_owner_id(&self, owner_id: ThreadId) {
@@ -70,11 +70,19 @@ impl<S: 'static> Task<S> {
     }
 
     pub(crate) fn get_owner_id(&self) -> ThreadId {
-        unsafe { Header::get_owner_id(self.raw.header_ptr()) }
+        self.header().get_owner_id()
     }
 
     pub(crate) fn get_opts(&self) -> TaskOpts {
-        unsafe { Header::get_opts(self.raw.header_ptr()) }
+        self.header().get_opts()
+    }
+
+    pub(crate) fn is_maintenance_task(&self) -> bool {
+        self.header().is_maintenance_task()
+    }
+
+    pub(crate) fn is_sticky(&self) -> bool {
+        self.header().is_sticky()
     }
 }
 
@@ -155,6 +163,10 @@ impl<S: 'static> Notified<S> {
 
     pub(crate) fn is_stealable(&self) -> bool {
         self.0.is_stealable()
+    }
+
+    pub(crate) fn is_maintenance_task(&self) -> bool {
+        self.0.is_maintenance_task()
     }
 
     pub(crate) fn set_owner_id(&self, owner_id: ThreadId) {

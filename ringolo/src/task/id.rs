@@ -1,6 +1,7 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use std::{fmt, num::NonZeroU64};
+use std::fmt;
+use std::num::{NonZeroU32, NonZeroU64};
 
 /// An opaque ID that uniquely identifies a task relative to all other currently
 /// running tasks.
@@ -76,8 +77,37 @@ impl Id {
     }
 }
 
+/// A 4 bytes version for thread id to optimize Header layout.
+#[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
+pub struct ThreadId(pub(crate) NonZeroU32);
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl ThreadId {
+    pub(crate) fn next() -> ThreadId {
+        static COUNTER: AtomicU32 = AtomicU32::new(1);
+
+        let thread_id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        // Safety: we can create 4 billion + threads
+        ThreadId(
+            NonZeroU32::new(thread_id)
+                .expect("failed to generate unique task ID: bitspace exhausted"),
+        )
+    }
+
+    pub(crate) fn as_u32(&self) -> u32 {
+        self.0.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::test_utils::*;
     use anyhow::Result;
     use std::collections::HashSet;
@@ -102,5 +132,15 @@ mod tests {
 
         assert_eq!(all_ids.len(), n);
         Ok(())
+    }
+
+    #[test]
+    fn test_new_thread_id() {
+        let n = 13;
+        let thread_ids = (1..=n)
+            .into_iter()
+            .map(|_| ThreadId::next())
+            .collect::<HashSet<_>>();
+        assert_eq!(thread_ids.len(), n);
     }
 }

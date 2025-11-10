@@ -1,5 +1,6 @@
 use crate::context::{Core, RawSqeSlab, Shared, SingleIssuerRing};
 use crate::runtime::RuntimeConfig;
+use crate::task::ThreadId;
 use anyhow::Result;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -11,9 +12,13 @@ pub(crate) struct Context {
 }
 
 impl Context {
-    pub(crate) fn try_new(cfg: &RuntimeConfig, shared: Arc<Shared>) -> Result<Self> {
+    pub(crate) fn try_new(
+        thread_id: ThreadId,
+        cfg: &RuntimeConfig,
+        shared: Arc<Shared>,
+    ) -> Result<Self> {
         Ok(Self {
-            core: RefCell::new(Core::try_new(cfg, &shared)?),
+            core: RefCell::new(Core::try_new(thread_id, cfg, &shared)?),
             shared,
         })
     }

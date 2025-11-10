@@ -18,7 +18,7 @@ use std::task::{RawWaker, RawWakerVTable, Waker};
 pub(crate) struct DummyScheduler;
 
 impl Schedule for DummyScheduler {
-    fn schedule(&self, _task: Notified<Self>) {}
+    fn schedule(&self, _task: Notified<Self>, _mode: Option<AddMode>) {}
 
     fn yield_now(&self, _waker: &Waker, _reason: YieldReason, _mode: Option<AddMode>) {}
 
@@ -90,7 +90,7 @@ impl WakerData {
     pub(crate) fn get_pending_ios(&self) -> u32 {
         unsafe {
             let ptr = ptr::addr_of!(self.header) as *mut Header;
-            Header::get_pending_ios(NonNull::new_unchecked(ptr))
+            NonNull::new_unchecked(ptr).as_ref().get_pending_ios()
         }
     }
 }
@@ -167,9 +167,9 @@ mod tests {
         let (waker, _) = mock_waker();
 
         unsafe {
-            let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
-            assert_eq!(Header::get_pending_ios(ptr), 0);
-            assert!(Header::is_stealable(ptr));
+            let h = NonNull::new_unchecked(waker.data() as *mut Header).as_ref();
+            assert_eq!(h.get_pending_ios(), 0);
+            assert!(h.is_stealable());
         }
 
         Ok(())

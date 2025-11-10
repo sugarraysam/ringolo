@@ -90,11 +90,14 @@ mod tests {
     use super::*;
     use crate as ringolo;
     use crate::test_utils::*;
+    use anyhow::Result;
     use std::future::Future;
     use std::pin::pin;
 
     #[test]
-    fn test_queue_lifecycle() {
+    fn test_queue_lifecycle() -> Result<()> {
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+
         let (waker, waker_data) = mock_waker();
         let mut cx = Context::from_waker(&waker);
         let queue = AsyncLocalQueue::<i32>::new();
@@ -112,6 +115,8 @@ mod tests {
 
         // Pop items
         assert!(matches!(pin!(queue.drain()).poll(&mut cx), Poll::Pending));
+
+        Ok(())
     }
 
     #[test]

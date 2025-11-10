@@ -12,8 +12,8 @@ use crate::utils::scheduler::{Call, Method, Tracker};
 use anyhow::Result;
 use std::cell::RefCell;
 use std::ops::Deref;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::Waker;
 
 pub(crate) type LocalTask = Notified<Handle>;
@@ -100,14 +100,22 @@ unsafe impl Sync for Handle {}
 
 impl Schedule for Handle {
     /// Schedule a task to run next (i.e.: front of queue).
-    fn schedule(&self, task: LocalTask) {
+    fn schedule(&self, task: LocalTask, mode: Option<AddMode>) {
         #[cfg(test)]
-        self.track(Method::Schedule, Call::Schedule { id: task.id() });
+        self.track(
+            Method::Schedule,
+            Call::Schedule {
+                id: task.id(),
+                is_stealable: task.is_stealable(),
+                opts: task.get_opts(),
+                mode,
+            },
+        );
 
         // We use LIFO because most of the time schedule is called when a task
         // is woken up as part of the scheduler completion/polling routine. We
         // want these *hot tasks* to run next.
-        self.worker.add_task(task, AddMode::Lifo);
+        self.worker.add_task(task, mode.unwrap_or(AddMode::Lifo));
     }
 
     /// Schedule a task to run soon.
@@ -148,7 +156,7 @@ impl Schedule for Handle {
             // tasks and one for the root_future. We just checked that we are not
             // currently polling the root future.
             if let Some(task) = unsafe { Notified::from_waker(waker) } {
-                self.worker.add_task(task, mode);
+                self.schedule(task, Some(mode));
             }
         }
     }
@@ -225,7 +233,9 @@ impl Handle {
             crate::task::new_task(future, opts, metadata, self.clone());
 
         match self.tasks.insert(task) {
-            InsertResult::Ok => self.schedule(notified),
+            InsertResult::Ok => {
+                self.schedule(notified, opts.and_then(|o| o.initial_spawn_add_mode()))
+            }
             InsertResult::Shutdown => {
                 // TODO: tracing :: warn but safe to continue
                 eprintln!("Tried to spawn a task after shutdown...");

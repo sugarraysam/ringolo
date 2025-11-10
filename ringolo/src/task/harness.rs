@@ -108,7 +108,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
                 // We give one of them to a new task and schedule it.
                 self.core()
                     .scheduler
-                    .schedule(Notified::new(self.get_new_task()));
+                    .schedule(Notified::new(self.get_new_task()), None);
 
                 // The remaining ref-count is now dropped. We kept the extra
                 // ref-count until now to ensure that even if the `schedule`
@@ -265,7 +265,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
 
     /// Cancels the task and store the appropriate error in the stage field.
     fn cancel_task(&self) {
-        let header_ptr = self.header_ptr();
+        let header = self.header();
         let core = self.core();
 
         // Since we are cancelling the task, we need to manually decrement
@@ -285,11 +285,11 @@ impl<T: Future, S: Schedule> Harness<T, S> {
         // context because cancellation might have been initiated by the parent
         // task on a separate thread, and we need to make sure we decrement pending
         // IOs on the thread that owns this task.
-        context::with_shared(|shared| unsafe {
+        context::with_shared(|shared| {
             shared.modify_pending_ios(
-                &Header::get_owner_id(header_ptr),
+                &header.get_owner_id(),
                 PendingIoOp::Decrement,
-                Header::get_pending_ios(header_ptr) as usize,
+                header.get_pending_ios() as usize,
             );
         });
 

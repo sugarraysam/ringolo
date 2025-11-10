@@ -6,6 +6,7 @@ use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop, RuntimeConfig};
 use crate::spawn::TaskOptsInternal;
 use crate::task::TaskNodeGuard;
+use crate::task::ThreadId;
 use crate::utils::thread::set_current_thread_name;
 use anyhow::Result;
 use std::cell::RefCell;
@@ -13,13 +14,12 @@ use std::collections::VecDeque;
 use std::pin::pin;
 use std::sync::atomic::Ordering;
 use std::task::Poll;
-use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct RootWorker {
-    /// ThreadId where the root worker is running
-    pub(super) thread_id: ThreadId,
+    /// ThreadId used to set the owner id on tasks.
+    pub(crate) thread_id: ThreadId,
 
     /// Determines how we run the event loop.
     cfg: RefCell<EventLoopConfig>,
@@ -34,13 +34,15 @@ pub(crate) struct RootWorker {
 
 impl RootWorker {
     pub(super) fn new(scheduler: &stealing::Handle) -> Self {
+        let thread_id = ThreadId::next();
+
         // There is no way to modify the current thread name using `std::thread`,
         // so we use `libc::` and platform specific low-level interface.
         set_current_thread_name(&scheduler.cfg.thread_name);
-        init_stealing_context(scheduler.clone());
+        init_stealing_context(thread_id, scheduler.clone());
 
         Self {
-            thread_id: thread::current().id(),
+            thread_id,
             cfg: RefCell::new((&scheduler.cfg).into()),
             ticker: RefCell::new(Ticker::new()),
             pollable: RefCell::new(VecDeque::with_capacity(1 /* only maintenance task */)),

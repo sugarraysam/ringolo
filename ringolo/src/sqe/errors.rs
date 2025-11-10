@@ -55,7 +55,10 @@ impl IoError {
     }
 
     pub fn is_fatal(&self) -> bool {
-        matches!(self, IoError::SlabInvalidState)
+        matches!(
+            self,
+            IoError::SlabInvalidState | IoError::SqBatchTooLarge | IoError::SqeBackendInvalidState
+        )
     }
 
     pub(crate) fn as_yield_reason(&self) -> YieldReason {

@@ -3,22 +3,21 @@ use crate::runtime::stealing;
 use crate::runtime::stealing::scheduler::StealableTask;
 use crate::runtime::ticker::{Ticker, TickerData, TickerEvents};
 use crate::runtime::{AddMode, EventLoop, RuntimeConfig};
+use crate::task::ThreadId;
 use anyhow::Result;
 use crossbeam_deque::{Injector, Stealer, Worker as CbWorker};
-use std::cell::{OnceCell, RefCell};
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::iter;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::thread::{self, ThreadId};
 use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
-    /// Optimization to avoid TLS read to get thread_id when calling
-    /// `task.set_owner_id()`;
-    thread_id: OnceCell<thread::ThreadId>,
+    /// ThreadId used to set the owner id on tasks.
+    pub(crate) thread_id: ThreadId,
 
     /// Determines how we run the event loop.
     cfg: RefCell<EventLoopConfig>,
@@ -60,7 +59,7 @@ impl Worker {
         fastrand::shuffle(&mut stealers);
 
         Self {
-            thread_id: OnceCell::new(),
+            thread_id: ThreadId::next(),
             cfg: RefCell::new(cfg.into()),
             ticker: RefCell::new(Ticker::new()),
             pop_global_queue: RefCell::new(false),
@@ -74,10 +73,6 @@ impl Worker {
     fn tick<T: TickerData>(&self, ctx: &T::Context, data: &mut T) -> TickerEvents {
         self.ticker.borrow_mut().tick(ctx, data)
     }
-
-    pub(super) fn thread_id(&self) -> &ThreadId {
-        self.thread_id.get_or_init(|| thread::current().id())
-    }
 }
 
 // Safety: we store worker in `Arc<Worker>` on scheduler, but will guarantee we
@@ -89,7 +84,7 @@ impl EventLoop for Worker {
     type Task = StealableTask;
 
     fn add_task(&self, task: Self::Task, mode: AddMode) {
-        task.set_owner_id(*self.thread_id());
+        task.set_owner_id(self.thread_id);
         let mut pollable = self.pollable.borrow_mut();
 
         // # Fast path
@@ -104,9 +99,10 @@ impl EventLoop for Worker {
         }
 
         match mode {
-            // A task is stealable if it has no pending IO on the local `io_uring`.
-            // This is why we have a separate `stealable` queue from which other
-            // workers can steal tasks from.
+            // A task is stealable if it has no pending IO on the local `io_uring`
+            // and also does not own any `io_uring` thread local resource. This
+            // is why we have a separate `stealable` queue from which other workers
+            // can steal tasks from.
             AddMode::Lifo => {
                 if !task.is_stealable() {
                     pollable.push_back(task);
@@ -196,7 +192,8 @@ impl Worker {
             } else {
                 // Park the thread, and wait for new tasks to be scheduled on the global injector and
                 // an unpark signal from the scheduler.
-                ctx.shared.park_current_thread(&self.global);
+                ctx.shared
+                    .park_current_thread(&self.thread_id, &self.global);
             }
 
             let events = self.tick(ctx, &mut *self.cfg.borrow_mut());
@@ -241,7 +238,7 @@ impl Worker {
 
     fn shutdown(&self) {
         crate::with_scheduler!(|s| {
-            if let Some(tasks) = s.tasks.wait_for_shutdown_partition(self.thread_id()) {
+            if let Some(tasks) = s.tasks.wait_for_shutdown_partition(&self.thread_id) {
                 for task in tasks {
                     task.shutdown();
                 }

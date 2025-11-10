@@ -6,17 +6,20 @@ use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop};
 use crate::runtime::{Ticker, TickerData, TickerEvents};
 use crate::task::TaskNodeGuard;
-use anyhow::{anyhow, Result};
+use crate::task::ThreadId;
+use anyhow::{Result, anyhow};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::pin::pin;
 use std::sync::Arc;
 use std::task::Poll;
-use std::thread;
 use std::time::Duration;
 
 #[derive(Debug)]
 pub(crate) struct Worker {
+    /// ThreadId to set owner_id on task
+    pub(crate) thread_id: ThreadId,
+
     /// Determines how we run the event loop.
     cfg: RefCell<EventLoopConfig>,
 
@@ -34,6 +37,7 @@ pub(crate) struct Worker {
 impl Worker {
     pub(super) fn new(cfg: &RuntimeConfig, shared: Arc<Shared>) -> Self {
         Self {
+            thread_id: ThreadId::next(),
             cfg: RefCell::new(cfg.into()),
             ticker: RefCell::new(Ticker::new()),
             pollable: RefCell::new(VecDeque::new()),
@@ -50,7 +54,7 @@ impl EventLoop for Worker {
     type Task = LocalTask;
 
     fn add_task(&self, task: Self::Task, mode: AddMode) {
-        task.set_owner_id(thread::current().id());
+        task.set_owner_id(self.thread_id);
 
         let mut q = self.pollable.borrow_mut();
 

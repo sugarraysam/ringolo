@@ -3,6 +3,7 @@
 use crate::context::maintenance::task::MaintenanceTask;
 use crate::context::{RawSqeSlab, Shared};
 use crate::runtime::RuntimeConfig;
+use crate::task::ThreadId;
 use crate::task::{Header, TaskNode};
 use anyhow::Result;
 use std::cell::RefCell;
@@ -11,7 +12,6 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Waker;
-use std::thread;
 
 use crate::context::ring::SingleIssuerRing;
 
@@ -20,6 +20,8 @@ use crate::context::ring::SingleIssuerRing;
 /// multiple fields as mut in the same context. Otherwise we will run in borrow
 /// checker issues.
 pub(crate) struct Core {
+    pub(crate) thread_id: ThreadId,
+
     // Tracks pending I/O operations at two distinct levels:
     //
     // 1. Per-Thread (via `self.pending_ios`):
@@ -56,10 +58,15 @@ pub(crate) struct Core {
 }
 
 impl Core {
-    pub(crate) fn try_new(cfg: &RuntimeConfig, shared: &Arc<Shared>) -> Result<Self> {
+    pub(crate) fn try_new(
+        thread_id: ThreadId,
+        cfg: &RuntimeConfig,
+        shared: &Arc<Shared>,
+    ) -> Result<Self> {
         let ring = SingleIssuerRing::try_new(cfg)?;
 
         let mut core = Core {
+            thread_id,
             pending_ios: Arc::new(AtomicUsize::new(0)),
             slab: RefCell::new(RawSqeSlab::new(
                 cfg.sq_ring_size * cfg.cq_ring_size_multiplier,
@@ -74,7 +81,7 @@ impl Core {
         // *hot path* will access the atomic on Core directly. The *cold path*
         // will use the shared context. This is required to support cross-thread
         // cancellation.
-        core.pending_ios = shared.register_worker(thread::current().id(), &core);
+        core.pending_ios = shared.register_worker(&core);
 
         Ok(core)
     }
@@ -89,6 +96,10 @@ impl Core {
             .borrow()
             .as_ref()
             .is_some_and(|task| task.id.is_root())
+    }
+
+    pub(crate) fn is_pre_block_on(&self, root_thread_id: &ThreadId) -> bool {
+        self.current_task.borrow().is_none() && self.thread_id == *root_thread_id
     }
 
     pub(crate) fn get_pending_ios(&self) -> usize {
@@ -112,7 +123,8 @@ impl Core {
     }
 
     fn modify_task_pending_ios(&self, waker: &Waker, delta: i32) {
-        // Don't track pending_ios for the root_future.
+        // Don't track owned_resources for the root_future. The reason is because it
+        // *is not backed* by a regular task and is never stealable by other threads.
         if !self.is_polling_root() {
             unsafe {
                 let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
@@ -120,24 +132,40 @@ impl Core {
             }
         }
     }
+
+    pub(crate) fn increment_task_owned_resources(&self, waker: &Waker) -> Option<NonNull<Header>> {
+        // Don't track owned_resources for the root_future. The reason is because it
+        // *is not backed* by a regular task and is never stealable by other threads.
+        if !self.is_polling_root() {
+            unsafe {
+                let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+                Header::increment_owned_resources(ptr);
+                Some(ptr)
+            }
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use crate as ringolo;
-    use crate::context::{self, PendingIoOp};
+    use crate::context::{self, PendingIoOp, init_stealing_context};
+    use crate::runtime::runtime::Kind;
+    use crate::test_utils::{init_local_runtime_and_context, init_stealing_runtime_and_context};
     use anyhow::Result;
+    use rstest::rstest;
 
     #[ringolo::test]
     async fn test_pending_io_on_core_and_shared() -> Result<()> {
-        let thread_id = std::thread::current().id();
-
-        context::with_core(|core| {
+        let thread_id = context::with_core(|core| {
             core.increment_pending_ios();
             core.decrement_pending_ios();
             core.increment_pending_ios();
 
             assert_eq!(core.get_pending_ios(), 1);
+            core.thread_id
         });
 
         context::with_shared(|shared| {

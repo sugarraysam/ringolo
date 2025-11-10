@@ -6,6 +6,7 @@ use crate::runtime::{
     AddMode, EventLoop, OwnedTasks, PanicReason, RuntimeConfig, Schedule, SchedulerPanic,
     TaskMetadata, TaskOpts, TaskRegistry, YieldReason,
 };
+use crate::task::ThreadId;
 use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
@@ -15,7 +16,6 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, OnceLock};
 use std::task::Waker;
-use std::thread;
 
 pub(crate) type StealableTask = Notified<Handle>;
 
@@ -107,17 +107,31 @@ pub struct Handle(Arc<Scheduler>);
 
 impl Schedule for Handle {
     #[track_caller]
-    fn schedule(&self, task: StealableTask) {
+    fn schedule(&self, task: StealableTask, mode: Option<AddMode>) {
         #[cfg(test)]
-        self.track(Method::Schedule, Call::Schedule { id: task.id() });
+        self.track(
+            Method::Schedule,
+            Call::Schedule {
+                id: task.id(),
+                is_stealable: task.is_stealable(),
+                opts: task.get_opts(),
+                mode,
+            },
+        );
 
-        // Tasks spawned on `root_worker` go in the global injector queue.
-        if context::with_core(|c| c.is_polling_root()) {
+        // Maintenance tasks never go on the injector. Otherwise, tasks spawned
+        // while polling `root_future` OR spawned before the user calls `block_on`
+        // are added to the injector.
+        if !task.is_maintenance_task()
+            && context::with_core(|core| {
+                core.is_polling_root() || core.is_pre_block_on(&self.root_thread_id())
+            })
+        {
             self.0.injector.push(task);
             let _ = self.shared.unpark_one_thread();
         } else {
             // Otherwise, add task to the local worker.
-            self.add_task_to_current_worker(task, AddMode::Lifo);
+            self.add_task_to_current_worker(task, mode.unwrap_or(AddMode::Lifo));
         }
     }
 
@@ -146,7 +160,7 @@ impl Schedule for Handle {
             }
 
             // Nothing to do, keep FIFO order as task should run soon but not next.
-            YieldReason::NoTaskBudget | YieldReason::Unknown | YieldReason::SelfYielded => { /* */ }
+            YieldReason::SelfYielded | YieldReason::NoTaskBudget | YieldReason::Unknown => { /* */ }
         }
 
         // If the root_future is yielding, we need to handle it differently.
@@ -157,7 +171,7 @@ impl Schedule for Handle {
             // tasks and one for the root_future. We just checked that we are not
             // currently polling the root future.
             if let Some(task) = unsafe { Notified::from_waker(waker) } {
-                self.add_task_to_current_worker(task, mode);
+                self.schedule(task, Some(mode));
             }
         }
     }
@@ -236,11 +250,22 @@ impl Handle {
     {
         let opts = opts.map(|opt| opt | self.default_task_opts);
 
+        #[cfg(test)]
+        self.track(
+            Method::Spawn,
+            Call::Spawn {
+                opts: opts.clone().unwrap_or_default(),
+                metadata: metadata.clone(),
+            },
+        );
+
         let (task, notified, join_handle) =
             crate::task::new_task(future, opts, metadata, self.clone());
 
         match self.tasks.insert(task) {
-            InsertResult::Ok => self.schedule(notified),
+            InsertResult::Ok => {
+                self.schedule(notified, opts.and_then(|o| o.initial_spawn_add_mode()))
+            }
             InsertResult::Shutdown => {
                 // TODO: tracing :: warn but safe to continue
                 eprintln!("Tried to spawn a task after shutdown...");
@@ -284,18 +309,31 @@ impl Handle {
 
     #[track_caller]
     fn add_task_to_current_worker(&self, task: StealableTask, mode: AddMode) {
-        let thread_id = thread::current().id();
+        let thread_id = context::with_core(|core| core.thread_id);
 
         self.get_pool()
             .with_worker(&thread_id, |worker| match worker {
-                WorkerRef::Root(w) => w.add_task(task, mode),
                 WorkerRef::NonRoot(w) => w.add_task(task, mode),
+
+                // We are only allowed to schedule the maintenance task on the
+                // root_worker. Everything else goes in the pool.
+                WorkerRef::Root(w) => {
+                    debug_assert!(
+                        task.is_maintenance_task(),
+                        "Can only schedule maintenance task on root_worker"
+                    );
+                    w.add_task(task, mode)
+                }
             });
     }
 
     #[track_caller]
     pub(super) fn get_pool(&self) -> &ThreadPool {
         self.pool.get().expect("thread pool not initialized")
+    }
+
+    fn root_thread_id(&self) -> ThreadId {
+        self.get_pool().root_worker.thread_id
     }
 
     #[cold]

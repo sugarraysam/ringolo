@@ -1,10 +1,14 @@
+use crate::context;
 use crate::future::lib::OpcodeError;
+use crate::task::Header;
 use either::Either;
 use io_uring::types::{DestinationSlot, Fd, Fixed};
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 use std::sync::Arc;
+use std::task::Waker;
 
 /// Instructs how we want to retrieve file descriptors from the kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,6 +86,8 @@ pub struct OwnedUringFd {
 #[derive(Debug, Copy, Clone)]
 pub struct BorrowedUringFd<'a> {
     kind: UringFdKindInner,
+
+    // Safety: We use a lifetime to bound BorrowedUringFd to the OwningUringFd.
     _lifetime: PhantomData<&'a ()>,
 }
 
@@ -89,10 +95,33 @@ pub struct BorrowedUringFd<'a> {
 #[derive(Debug)]
 struct SharedUringFdState {
     kind: UringFdKindInner,
+
+    // Pointer to the associated task where this OwnedUringFd was created. Only
+    // used for Fixed descriptor, and the purpose is to keep track of locally
+    // owned resources.
+    task: Option<NonNull<Header>>,
 }
+
+// Safety: has to be Send/Sync because all futures on the runtime have this requirement.
+// We prevent leaking local `iouring` fixed descriptors through the `owned_resources`
+// per-task counter,
+unsafe impl Send for SharedUringFdState {}
+unsafe impl Sync for SharedUringFdState {}
 
 impl Drop for SharedUringFdState {
     fn drop(&mut self) {
+        if let Some(task) = self.task {
+            // Safety: per encapsulation, if we drop the OwnedUringFd, we can assume
+            // the future where it was created is still alive, and by the same logic
+            // the task that owns this future is also still alive.
+            unsafe {
+                Header::decrement_owned_resources(task);
+            }
+        }
+
+        // We are handing this FD off to the maintenance task to be closed. To
+        // ensure correct accounting, we decrement the original task's `owned_resources`
+        // count *before* transferring ownership of the FD to the maintenance task.
         crate::async_close(self.kind.as_raw_or_direct());
     }
 }
@@ -103,28 +132,35 @@ impl OwnedUringFd {
         Self {
             state: Arc::new(SharedUringFdState {
                 kind: UringFdKindInner::Raw(fd),
+                task: None,
             }),
         }
     }
 
     /// Creates a new `OwnedUringFd` from a fixed slot index.
-    pub fn new_fixed(slot: u32) -> Self {
+    pub fn new_fixed(waker: &Waker, slot: u32) -> Self {
+        // A fixed descriptor is only valid on the current thread. Increment the
+        // task counter for locally owned resources to prevent task from moving
+        // to another thread while we hold this descriptor.
+        let task = context::with_core(|core| core.increment_task_owned_resources(waker));
+
         Self {
             state: Arc::new(SharedUringFdState {
                 kind: UringFdKindInner::Fixed(slot),
+                task,
             }),
         }
     }
 
     /// Take the result from an `io_uring` opcode, and convert it back to an **owned** `UringFd`.
     /// Results from opcodes that create new file descriptors are always owned by us.
-    pub fn from_result(res: i32, mode: KernelFdMode) -> Self {
+    pub fn from_result(res: i32, mode: KernelFdMode, waker: &Waker) -> Self {
         match mode {
             KernelFdMode::Legacy => Self::new_raw(res),
             // Kernel generates 0 on success in this mode, we must re-use the
             // slot given by the user.
-            KernelFdMode::Direct(slot) => Self::new_fixed(slot),
-            KernelFdMode::DirectAuto => Self::new_fixed(res as u32),
+            KernelFdMode::Direct(slot) => Self::new_fixed(waker, slot),
+            KernelFdMode::DirectAuto => Self::new_fixed(waker, res as u32),
         }
     }
 
@@ -384,9 +420,6 @@ impl<'a> PartialEq for BorrowedUringFd<'a> {
 /// Trait for integration with the `io_uring` crate to easily create Entry from
 /// Owned or Borrowed uring fd. This API is *unsafe* as you have the possibility
 /// of leaking resources.
-//
-// TODO: this is really garbage, bothers me to no end but can't think of a better
-// way to be able to integrate with `io_uring` Entry builder methods...
 pub trait AsRawOrDirect {
     unsafe fn as_raw_or_direct(&self) -> Either<Fd, Fixed>;
 }
@@ -416,18 +449,6 @@ macro_rules! resolve_fd {
     };
 }
 
-impl From<Fd> for OwnedUringFd {
-    fn from(fd: Fd) -> Self {
-        OwnedUringFd::new_raw(fd.0)
-    }
-}
-
-impl From<Fixed> for OwnedUringFd {
-    fn from(fd: Fixed) -> Self {
-        OwnedUringFd::new_fixed(fd.0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{net::TcpListener, os::fd::AsRawFd};
@@ -435,12 +456,17 @@ mod tests {
     use super::*;
     use crate as ringolo;
     use crate::context;
+    use crate::future::lib::{Op, OpenAt};
     use crate::runtime::{Builder, TaskOpts};
     use crate::sqe::IoError;
     use crate::test_utils::*;
     use crate::utils::scheduler::{Call, Method};
-    use anyhow::{Context, Result};
+    use anyhow::{Context, Result, anyhow};
+    use nix::fcntl::OFlag;
+    use nix::sys::stat::Mode;
     use rstest::rstest;
+    use std::pin::pin;
+    use std::task::Poll;
 
     #[ringolo::test]
     async fn test_owned_uringfd() -> Result<()> {
@@ -570,6 +596,74 @@ mod tests {
         } else {
             assert_inflight_cleanup(1);
         }
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::two(2)]
+    #[case::five(5)]
+    #[case::ten(10)]
+    fn test_owned_resources_tracking(#[case] num_fds: usize) -> Result<()> {
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, _) = mock_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+
+        let header = unsafe { NonNull::new_unchecked(waker.data() as *mut Header).as_ref() };
+
+        let mut ops = Vec::with_capacity(num_fds);
+        for _ in 0..num_fds {
+            let mut op = Box::pin(Op::new(OpenAt::try_new(
+                KernelFdMode::DirectAuto,
+                None,
+                gen_tempfile_name(),
+                OFlag::O_RDONLY | OFlag::O_CREAT,
+                Mode::S_IRUSR | Mode::S_IWUSR,
+            )?));
+
+            assert!(matches!(op.as_mut().poll(&mut cx), Poll::Pending));
+            ops.push(op);
+        }
+
+        // Submit and complete
+        context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
+            ring.submit_and_wait(num_fds, None)?;
+            ring.process_cqes(slab, None)?;
+            Ok(())
+        })?;
+
+        let mut fds = Vec::with_capacity(num_fds);
+        for mut op in ops {
+            match op.as_mut().poll(&mut cx) {
+                Poll::Ready(Ok(fd)) => fds.push(fd),
+                _ => return Err(anyhow!("Failed to open one of the tempfiles")),
+            }
+        }
+
+        let assert_owned_dropped = |num_owned: u32, num_dropped: usize| {
+            assert_eq!(header.is_stealable(), num_owned == 0,);
+            assert_eq!(header.get_owned_resources(), num_owned);
+            assert_eq!(
+                context::with_core(|c| c.maintenance_task.cleanup_handler.len()),
+                num_dropped
+            );
+        };
+
+        assert_owned_dropped(num_fds as u32, 0);
+
+        // Borrowing has no impact on resource tracking
+        let borrowed = fds
+            .iter()
+            .take(num_fds / 2)
+            .map(|fd| fd.borrow())
+            .collect::<Vec<_>>();
+        assert_owned_dropped(num_fds as u32, 0);
+        drop(borrowed);
+        assert_owned_dropped(num_fds as u32, 0);
+
+        // Dropping frees resources
+        drop(fds);
+        assert_owned_dropped(0, num_fds);
 
         Ok(())
     }

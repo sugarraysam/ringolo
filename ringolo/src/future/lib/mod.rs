@@ -31,7 +31,7 @@ use io_uring::squeue::Entry;
 use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::task::{Context, Poll, ready};
+use std::task::{Context, Poll, Waker, ready};
 
 pub(crate) mod errors;
 pub(crate) use errors::OpcodeError;
@@ -64,8 +64,17 @@ pub(crate) trait OpPayload {
 
     // Safety: This method should only be called once, when the operation is complete.
     // It is allowed to "consume the pin" so we can return owned data without copies.
+    //
+    // The reason we pass the waker to reconstruct the output is because it allows
+    // reconstructing a handle to the underlying ringolo runtime Task that owns this
+    // future. We keep track of thread-local iouring resources (e.g.: registered
+    // file descriptor, provided buffer, registered buffer), that are owned by each
+    // tasks. This information is used to determine when it is safe for a worker
+    // on another thread to steal the task without leaking or creating dangling
+    // resources.
     fn into_output(
         self: Pin<&mut Self>,
+        waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError>;
 }
@@ -122,7 +131,7 @@ impl<T: OpPayload> Future for Op<T> {
         let backend = Pin::new(unsafe { this.backend.assume_init_mut() });
 
         let res = ready!(backend.poll(cx));
-        let output = this.data.as_mut().into_output(res);
+        let output = this.data.as_mut().into_output(cx.waker(), res);
         Poll::Ready(output)
     }
 }
@@ -156,8 +165,13 @@ pub(crate) trait MultishotPayload {
 
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError>;
 
-    fn into_next(self: Pin<&mut Self>, result: Result<i32, IoError>)
-    -> Result<Self::Item, IoError>;
+    // See comment on `OpPayload::into_result` for why we are passing the Waker
+    // to reconstruct the next_item.
+    fn into_next(
+        self: Pin<&mut Self>,
+        waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Item, IoError>;
 }
 
 #[derive(Debug)]
@@ -250,7 +264,7 @@ impl<T: MultishotPayload> Stream for Multishot<T> {
 
         match ready!(backend.poll_next(cx)) {
             Some(res) => {
-                let next = this.data.as_mut().into_next(res);
+                let next = this.data.as_mut().into_next(cx.waker(), res);
                 Poll::Ready(Some(next))
             }
             None => Poll::Ready(None),

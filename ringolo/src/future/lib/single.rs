@@ -4,15 +4,22 @@ use crate::future::lib::{
     parse,
 };
 use crate::sqe::IoError;
+use anyhow::anyhow;
 use either::Either;
 use io_uring::squeue::Entry;
-use io_uring::types::{Fd, Fixed, TimeoutFlags, Timespec};
+use io_uring::types::{Fd, Fixed, OpenHow, TimeoutFlags, Timespec};
+use nix::fcntl::OFlag;
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
+use nix::sys::stat::Mode;
 use pin_project::pin_project;
+use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::pin::Pin;
+use std::task::Waker;
 use std::time::Duration;
 
 ///
@@ -23,7 +30,7 @@ use std::time::Duration;
 pub struct Accept<T: AsRawOrDirect> {
     sockfd: T,
     flags: SockFlag,
-    mode: KernelFdMode,
+    fd_mode: KernelFdMode,
     with_addr: bool,
 
     // Safety: we have T from MaybeUninit<T> as POD so don't need manual drop.
@@ -35,13 +42,13 @@ pub struct Accept<T: AsRawOrDirect> {
 }
 
 impl<T: AsRawOrDirect> Accept<T> {
-    pub fn new(sockfd: T, mode: KernelFdMode, with_addr: bool, flags: Option<SockFlag>) -> Self {
+    pub fn new(sockfd: T, fd_mode: KernelFdMode, with_addr: bool, flags: Option<SockFlag>) -> Self {
         let mut addrlen = MaybeUninit::uninit();
         if with_addr {
             addrlen.write(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
         }
 
-        let flags = match mode {
+        let flags = match fd_mode {
             KernelFdMode::Legacy => SockFlag::SOCK_CLOEXEC | flags.unwrap_or(SockFlag::empty()),
             // The ring itself is CLOEXEC, no need to set for direct descriptor. In fact it
             // triggers -EINVAL (22) invalid argument if you do.
@@ -52,7 +59,7 @@ impl<T: AsRawOrDirect> Accept<T> {
             sockfd,
             flags,
             with_addr,
-            mode,
+            fd_mode,
             addr: MaybeUninit::uninit(),
             addrlen,
         }
@@ -76,7 +83,7 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
 
         let entry = resolve_fd!(this.sockfd, |fd| {
             io_uring::opcode::Accept::new(fd, addr_ptr, addrlen_ptr)
-                .file_index(this.mode.try_into_slot()?)
+                .file_index(this.fd_mode.try_into_slot()?)
                 .flags(this.flags.bits())
         });
 
@@ -85,6 +92,7 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
 
     fn into_output(
         self: Pin<&mut Self>,
+        waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let this = self.project();
@@ -107,7 +115,10 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
             None
         };
 
-        Ok((OwnedUringFd::from_result(fd, *this.mode), addr_info))
+        Ok((
+            OwnedUringFd::from_result(fd, *this.fd_mode, waker),
+            addr_info,
+        ))
     }
 }
 
@@ -136,6 +147,7 @@ impl OpPayload for AsyncCancel {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
@@ -183,6 +195,7 @@ impl<T: AsRawOrDirect> OpPayload for Bind<T> {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let _ = result?;
@@ -220,6 +233,7 @@ impl OpPayload for Close {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
@@ -267,6 +281,7 @@ impl<T: AsRawOrDirect> OpPayload for Connect<T> {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let _ = result?;
@@ -302,10 +317,144 @@ impl<T: AsRawOrDirect> OpPayload for Listen<T> {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let _ = result?;
         Ok(())
+    }
+}
+
+///
+/// === OpenAt ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct OpenAt {
+    fd_mode: KernelFdMode,
+    dirfd: Option<RawFd>,
+
+    #[pin]
+    pathname: CString,
+
+    flags: OFlag,
+    mode: Mode,
+}
+
+impl OpenAt {
+    pub fn try_new(
+        fd_mode: KernelFdMode,
+        dirfd: Option<RawFd>,
+        pathname: impl AsRef<Path>,
+        flags: OFlag,
+        mode: Mode,
+    ) -> Result<Self, OpcodeError> {
+        if dirfd.is_none() && !pathname.as_ref().is_absolute() {
+            return Err(anyhow!("DirFd can only be ignored for absolute pathnames.").into());
+        }
+
+        if flags.contains(OFlag::O_CREAT) && mode.is_empty() {
+            return Err(anyhow!("Mode can't be empty if O_CREAT is set.").into());
+        }
+
+        let pathname = CString::new(pathname.as_ref().as_os_str().as_bytes())
+            .map_err(|e| anyhow!("Invalid pathname: {:?}", e))?;
+
+        Ok(Self {
+            fd_mode,
+            dirfd,
+            pathname,
+            flags,
+            mode,
+        })
+    }
+}
+
+impl OpPayload for OpenAt {
+    type Output = OwnedUringFd;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        let dirfd = io_uring::types::Fd(this.dirfd.unwrap_or(libc::AT_FDCWD));
+
+        Ok(io_uring::opcode::OpenAt::new(dirfd, this.pathname.as_ptr())
+            .flags(this.flags.bits())
+            .mode(this.mode.bits())
+            .file_index(this.fd_mode.try_into_slot()?)
+            .build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        Ok(OwnedUringFd::from_result(result?, self.fd_mode, waker))
+    }
+}
+
+///
+/// === OpenAt2 ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct OpenAt2 {
+    fd_mode: KernelFdMode,
+    dirfd: Option<RawFd>,
+
+    #[pin]
+    pathname: CString,
+
+    #[pin]
+    how: OpenHow,
+}
+
+impl OpenAt2 {
+    pub fn try_new(
+        fd_mode: KernelFdMode,
+        dirfd: Option<RawFd>,
+        pathname: impl AsRef<Path>,
+        how: OpenHow,
+    ) -> Result<Self, OpcodeError> {
+        if dirfd.is_none() && !pathname.as_ref().is_absolute() {
+            return Err(anyhow!("DirFd can only be ignored for absolute pathnames.").into());
+        }
+
+        let pathname = CString::new(pathname.as_ref().as_os_str().as_bytes())
+            .map_err(|e| anyhow!("Invalid pathname: {:?}", e))?;
+
+        Ok(Self {
+            fd_mode,
+            dirfd,
+            pathname,
+            how,
+        })
+    }
+}
+
+impl OpPayload for OpenAt2 {
+    type Output = OwnedUringFd;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        let dirfd = io_uring::types::Fd(this.dirfd.unwrap_or(libc::AT_FDCWD));
+        let how_addr = std::ptr::from_ref(&*this.how).cast();
+
+        Ok(
+            io_uring::opcode::OpenAt2::new(dirfd, this.pathname.as_ptr(), how_addr)
+                .file_index(this.fd_mode.try_into_slot()?)
+                .build(),
+        )
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        Ok(OwnedUringFd::from_result(result?, self.fd_mode, waker))
     }
 }
 
@@ -324,6 +473,7 @@ impl OpPayload for Nop {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let _ = result?;
@@ -336,7 +486,7 @@ impl OpPayload for Nop {
 ///
 #[derive(Debug)]
 pub struct Socket {
-    mode: KernelFdMode,
+    fd_mode: KernelFdMode,
     addr_family: AddressFamily,
     sock_type: SockType,
     protocol: SockProtocol,
@@ -344,13 +494,13 @@ pub struct Socket {
 
 impl Socket {
     pub fn new(
-        mode: KernelFdMode,
+        fd_mode: KernelFdMode,
         addr_family: AddressFamily,
         sock_type: SockType,
         protocol: SockProtocol,
     ) -> Self {
         Self {
-            mode,
+            fd_mode,
             addr_family,
             sock_type,
             protocol,
@@ -367,15 +517,16 @@ impl OpPayload for Socket {
             self.sock_type as i32,
             self.protocol as i32,
         )
-        .file_index(self.mode.try_into_slot()?)
+        .file_index(self.fd_mode.try_into_slot()?)
         .build())
     }
 
     fn into_output(
         self: Pin<&mut Self>,
+        waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        Ok(OwnedUringFd::from_result(result?, self.mode))
+        Ok(OwnedUringFd::from_result(result?, self.fd_mode, waker))
     }
 }
 
@@ -413,6 +564,7 @@ impl<T: AsRawOrDirect> OpPayload for SetSockOpt<T> {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let _ = result?;
@@ -463,6 +615,7 @@ impl OpPayload for Timeout {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         match result {
@@ -499,6 +652,7 @@ impl OpPayload for TimeoutRemove {
 
     fn into_output(
         self: Pin<&mut Self>,
+        _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;

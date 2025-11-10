@@ -4,8 +4,8 @@
 use crate::context::RawSqeSlab;
 use crate::context::SingleIssuerRing;
 use crate::context::{Core, Shared};
-use crate::runtime::local;
 use crate::runtime::RuntimeConfig;
+use crate::runtime::local;
 use anyhow::Result;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ pub(crate) struct Context {
 
 impl Context {
     pub(crate) fn try_new(cfg: &RuntimeConfig, scheduler: &local::Handle) -> Result<Self> {
-        let core = Core::try_new(cfg, &scheduler.shared)?;
+        let core = Core::try_new(scheduler.worker.thread_id, cfg, &scheduler.shared)?;
 
         Ok(Self {
             core: RefCell::new(core),

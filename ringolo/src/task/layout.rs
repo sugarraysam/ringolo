@@ -375,7 +375,7 @@ unsafe fn schedule<S: Schedule>(ptr: NonNull<Header>) {
     let scheduler = Header::get_scheduler::<S>(ptr);
     scheduler
         .as_ref()
-        .schedule(Notified::new(Task::from_raw(ptr.cast())));
+        .schedule(Notified::new(Task::from_raw(ptr.cast())), None);
 }
 
 unsafe fn dealloc<T: Future, S: Schedule>(ptr: NonNull<Header>) {
