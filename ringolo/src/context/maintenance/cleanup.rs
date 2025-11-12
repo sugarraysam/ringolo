@@ -3,9 +3,8 @@ use std::cell::RefCell;
 use crate::context;
 use crate::context::maintenance::OnCleanupError;
 use crate::context::maintenance::queue::AsyncLocalQueue;
-use crate::future::lib::OwnedUringFd;
 use crate::future::lib::list::{AnyOp, OpList};
-use crate::future::lib::{AsRawOrDirect, AsyncCancel, Close, TimeoutRemove};
+use crate::future::lib::{AsyncCancel, Close, TimeoutRemove};
 use crate::runtime::{PanicReason, SchedulerPanic};
 use crate::sqe::IoError;
 use anyhow::Result;
@@ -47,7 +46,7 @@ pub(crate) struct CleanupOp {
 }
 
 impl CleanupOp {
-    pub(crate) fn new_cancel(builder: CancelBuilder, user_data: usize) -> Self {
+    fn new_cancel(builder: CancelBuilder, user_data: usize) -> Self {
         Self {
             op: CleanupOpcode::AsyncCancel(AsyncCancel::new(builder)),
             num_retries: 0,
@@ -55,7 +54,7 @@ impl CleanupOp {
         }
     }
 
-    pub(crate) fn new_close(fd: Either<Fd, Fixed>) -> Self {
+    fn new_close(fd: Either<Fd, Fixed>) -> Self {
         Self {
             op: CleanupOpcode::Close(Close::new(fd)),
             num_retries: 0,
@@ -63,7 +62,7 @@ impl CleanupOp {
         }
     }
 
-    pub(crate) fn new_timeout_remove(user_data: u64) -> Self {
+    fn new_timeout_remove(user_data: u64) -> Self {
         Self {
             op: CleanupOpcode::TimeoutRemove(TimeoutRemove::new(user_data)),
             num_retries: 0,
@@ -178,11 +177,11 @@ impl CleanupHandler {
     }
 }
 
-fn cvt(ops: &Vec<CleanupOp>) -> Vec<AnyOp<OwnedUringFd>> {
+fn cvt(ops: &Vec<CleanupOp>) -> Vec<AnyOp<'_>> {
     ops.iter().map(|op| op.into()).collect()
 }
 
-impl<T: AsRawOrDirect + Unpin> From<&CleanupOp> for AnyOp<T> {
+impl<'a> From<&CleanupOp> for AnyOp<'a> {
     fn from(val: &CleanupOp) -> Self {
         match val.op.clone() {
             CleanupOpcode::AsyncCancel(op) => op.into(),
@@ -267,33 +266,31 @@ mod tests {
         Ok(())
     }
 
-    // TODO: how to make this work if we dont fail on ENOENT?
-    // #[test]
-    // fn test_on_cleanup_error_panic() -> Result<()> {
-    //     let builder = Builder::new_local().on_cleanup_error(OnCleanupError::Panic);
-    //     let (_runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
+    #[test]
+    fn test_on_cleanup_error_panic() -> Result<()> {
+        let builder = Builder::new_local().on_cleanup_error(OnCleanupError::Panic);
+        let (_runtime, scheduler) = init_local_runtime_and_context(Some(builder))?;
 
-    //     let root_res = std::panic::catch_unwind(|| {
-    //         ringolo::block_on(async {
-    //             let user_data = 333;
-    //             let builder = CancelBuilder::user_data(user_data as u64);
-    //             ringolo::async_cancel(builder, user_data);
+        let root_res = std::panic::catch_unwind(|| {
+            ringolo::block_on(async {
+                let invalid_fd = -424242;
+                ringolo::async_close(Either::Left(Fd(invalid_fd)));
 
-    //             wait_for_cleanup().await;
-    //         });
-    //     });
+                wait_for_cleanup().await;
+            });
+        });
 
-    //     assert!(root_res.is_err());
+        assert!(root_res.is_err());
 
-    //     let unhandled_panic_calls = scheduler.tracker.get_calls(&Method::UnhandledPanic);
-    //     assert_eq!(unhandled_panic_calls.len(), 1);
-    //     assert_eq!(
-    //         unhandled_panic_calls.first(),
-    //         Some(&Call::UnhandledPanic {
-    //             reason: PanicReason::FailedCleanup
-    //         })
-    //     );
+        let unhandled_panic_calls = scheduler.tracker.get_calls(&Method::UnhandledPanic);
+        assert_eq!(unhandled_panic_calls.len(), 1);
+        assert_eq!(
+            unhandled_panic_calls.first(),
+            Some(&Call::UnhandledPanic {
+                reason: PanicReason::FailedCleanup
+            })
+        );
 
-    //     Ok(())
-    // }
+        Ok(())
+    }
 }

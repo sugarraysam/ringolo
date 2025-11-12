@@ -1,5 +1,6 @@
+use crate::future::lib::fd::AsRawOrDirect;
 use crate::future::lib::{
-    AsRawOrDirect, CancelHow, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError,
+    BorrowedUringFd, CancelHow, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError,
     OwnedUringFd,
 };
 use crate::sqe::IoError;
@@ -12,14 +13,18 @@ use std::task::Waker;
 use std::time::Duration;
 
 #[derive(Debug)]
-pub struct AcceptMultishot<T: AsRawOrDirect> {
-    sockfd: T,
+pub struct AcceptMultishot<'a> {
+    sockfd: BorrowedUringFd<'a>,
     mode: KernelFdMode,
     flags: SockFlag,
 }
 
-impl<T: AsRawOrDirect> AcceptMultishot<T> {
-    pub fn try_new(sockfd: T, mode: KernelFdMode, flags: Option<SockFlag>) -> io::Result<Self> {
+impl<'a> AcceptMultishot<'a> {
+    pub fn try_new(
+        sockfd: BorrowedUringFd<'a>,
+        mode: KernelFdMode,
+        flags: Option<SockFlag>,
+    ) -> io::Result<Self> {
         let flags = match mode {
             KernelFdMode::Direct(_) => {
                 return Err(io::Error::new(
@@ -41,7 +46,7 @@ impl<T: AsRawOrDirect> AcceptMultishot<T> {
     }
 }
 
-impl<T: AsRawOrDirect> MultishotPayload for AcceptMultishot<T> {
+impl<'a> MultishotPayload for AcceptMultishot<'a> {
     type Item = OwnedUringFd;
 
     fn cancel_how(&self) -> CancelHow {

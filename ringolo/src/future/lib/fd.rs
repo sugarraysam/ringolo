@@ -420,7 +420,9 @@ impl<'a> PartialEq for BorrowedUringFd<'a> {
 /// Trait for integration with the `io_uring` crate to easily create Entry from
 /// Owned or Borrowed uring fd. This API is *unsafe* as you have the possibility
 /// of leaking resources.
-pub trait AsRawOrDirect {
+///
+/// *Internal use only* - mostly to power `resolve_fd!` macro.
+pub(super) trait AsRawOrDirect {
     unsafe fn as_raw_or_direct(&self) -> Either<Fd, Fixed>;
 }
 
@@ -430,7 +432,7 @@ impl AsRawOrDirect for OwnedUringFd {
     }
 }
 
-impl<'a> AsRawOrDirect for BorrowedUringFd<'a> {
+impl AsRawOrDirect for BorrowedUringFd<'_> {
     unsafe fn as_raw_or_direct(&self) -> Either<Fd, Fixed> {
         self.kind.as_raw_or_direct()
     }

@@ -1,7 +1,8 @@
-use crate::future::lib::{AsRawOrDirect, OpcodeError, OwnedUringFd};
 use crate::future::lib::{OpPayload, single::*};
+use crate::future::lib::{OpcodeError, OwnedUringFd};
 use crate::sqe::list::{SqeBatchBuilder, SqeChainBuilder, SqeListBuilder};
 use crate::sqe::{IoError, Sqe, SqeList, SqeListKind};
+use nix::sys::epoll::EpollEvent;
 use paste::paste;
 use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
@@ -56,14 +57,14 @@ macro_rules! define_any_op {
             #[allow(dead_code)]
             #[derive(Debug)]
             #[pin_project(project = [<$OpEnum Proj>])] // e.g., creates `AnyOpProj`
-            pub enum $OpEnum<T: AsRawOrDirect> {
+            pub enum $OpEnum<'a> {
                 $(
                     $Variant(#[pin] $VariantType),
                 )*
             }
 
             // OpPayload generated impl.
-            impl<T: AsRawOrDirect> OpPayload for $OpEnum<T> {
+            impl<'a> OpPayload for $OpEnum<'a> {
                 type Output = $OutputEnum;
 
                 fn create_entry(self: Pin<&mut Self>) -> Result<io_uring::squeue::Entry, OpcodeError> {
@@ -93,7 +94,7 @@ macro_rules! define_any_op {
 
             // Generated From impls.
             $(
-                impl<T: AsRawOrDirect + Unpin> From<$VariantType> for $OpEnum<T> {
+                impl<'a> From<$VariantType> for $OpEnum<'a> {
                     fn from(op: $VariantType) -> Self {
                         $OpEnum::$Variant(op)
                     }
@@ -104,7 +105,7 @@ macro_rules! define_any_op {
             // But this bound is required by `ringolo::spawn` so we have to impl.
             // The runtime prevents most cases where sending tasks between workers
             // is  dangerous.
-            unsafe impl<T: AsRawOrDirect> Send for $OpEnum<T> {}
+            unsafe impl<'a> Send for $OpEnum<'a> {}
         } // end paste!
     };
 }
@@ -126,23 +127,35 @@ define_any_op! {
     output_enum: AnyOpOutput,
     variants: [
         AsyncCancel(AsyncCancel) -> i32,
-        Accept(Accept<T>) -> (OwnedUringFd, Option<SocketAddr>),
-        Bind(Bind<T>) -> (),
+        Accept(Accept<'a>) -> (OwnedUringFd, Option<SocketAddr>),
+        Bind(Bind<'a>) -> i32,
         Close(Close) -> i32,
-        Connect(Connect<T>) -> (),
-        Listen(Listen<T>) -> (),
-        Nop(Nop) -> (),
+        Connect(Connect<'a>) -> i32,
+        EpollCtl(EpollCtl<'a>) -> i32,
+        EpollWait(EpollWait<'a>) -> (i32, Vec<EpollEvent>),
+        FGetXattr(FGetXattr<'a>) -> (i32, Vec<u8>),
+        FSetXattr(FSetXattr<'a>) -> i32,
+        Fadvise(Fadvise<'a>) -> i32,
+        Fallocate(Fallocate<'a>) -> i32,
+        FixedFdInstall(FixedFdInstall) -> OwnedUringFd,
+        Fsync(Fsync<'a>) -> i32,
+        Ftruncate(Ftruncate<'a>) -> i32,
+        FutexWait(FutexWait) -> i32,
+        OpenAt(OpenAt) -> OwnedUringFd,
+        OpenAt2(OpenAt2) -> OwnedUringFd,
+        Listen(Listen<'a>) -> i32,
+        Nop(Nop) -> i32,
         Socket(Socket) -> OwnedUringFd,
-        SetSockOpt(SetSockOpt<T>) -> (),
-        Timeout(Timeout) -> (),
+        SetSockOpt(SetSockOpt<'a>) -> i32,
+        Timeout(Timeout) -> i32,
         TimeoutRemove(TimeoutRemove) -> i32,
     ]
 }
 
 #[pin_project(PinnedDrop)]
-pub(crate) struct OpList<T: AsRawOrDirect + Unpin> {
+pub(crate) struct OpList<'a> {
     #[pin]
-    ops: Vec<AnyOp<T>>,
+    ops: Vec<AnyOp<'a>>,
     kind: SqeListKind,
 
     #[pin]
@@ -152,16 +165,16 @@ pub(crate) struct OpList<T: AsRawOrDirect + Unpin> {
     dropped: bool,
 }
 
-impl<T: AsRawOrDirect + Unpin> OpList<T> {
-    pub fn new_batch(ops: Vec<AnyOp<T>>) -> Self {
+impl<'a> OpList<'a> {
+    pub fn new_batch(ops: Vec<AnyOp<'a>>) -> Self {
         Self::new(ops, SqeListKind::Batch)
     }
 
-    pub fn new_chain(ops: Vec<AnyOp<T>>) -> Self {
+    pub fn new_chain(ops: Vec<AnyOp<'a>>) -> Self {
         Self::new(ops, SqeListKind::Chain)
     }
 
-    fn new(ops: Vec<AnyOp<T>>, kind: SqeListKind) -> Self {
+    fn new(ops: Vec<AnyOp<'a>>, kind: SqeListKind) -> Self {
         Self {
             ops,
             kind,
@@ -197,7 +210,7 @@ impl<T: AsRawOrDirect + Unpin> OpList<T> {
     }
 }
 
-impl<T: AsRawOrDirect + Unpin> Future for OpList<T> {
+impl<'a> Future for OpList<'a> {
     type Output = Result<Vec<Result<AnyOpOutput, IoError>>, IoError>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -235,7 +248,7 @@ impl<T: AsRawOrDirect + Unpin> Future for OpList<T> {
 }
 
 #[pinned_drop]
-impl<T: AsRawOrDirect + Unpin> PinnedDrop for OpList<T> {
+impl<'a> PinnedDrop for OpList<'a> {
     fn drop(mut self: Pin<&mut Self>) {
         let mut this = self.project();
         let dropped = std::mem::replace(this.dropped, true);
@@ -291,7 +304,7 @@ mod tests {
             // We have to loop as we will get ECONNREFUSED until Listen
             loop {
                 match Op::new(Connect::new(sockfd_ref, &sock_addr)).await {
-                    Ok(()) => break,
+                    Ok(_) => break,
                     Err(e) => {
                         if e.raw_os_error() == Some(libc::ECONNREFUSED) {
                             max_retries -= 1;

@@ -37,9 +37,9 @@ pub(crate) mod errors;
 pub(crate) use errors::OpcodeError;
 
 #[macro_use]
-pub mod fd;
+mod fd;
 #[allow(unused)]
-pub use fd::{AsRawOrDirect, BorrowedUringFd, KernelFdMode, OwnedUringFd, UringFdKind};
+pub use fd::{BorrowedUringFd, KernelFdMode, OwnedUringFd, UringFdKind};
 
 #[macro_use]
 pub mod list_macros;
@@ -53,8 +53,10 @@ pub(super) mod parse;
 pub mod single;
 pub use single::*;
 
-pub mod sockopt;
+mod sockopt;
 pub use sockopt::*;
+
+mod types;
 
 /// Traits and structs for one-shot `io_uring` operation (i.e.: SqeSingle).
 pub(crate) trait OpPayload {

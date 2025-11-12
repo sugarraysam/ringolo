@@ -1,17 +1,21 @@
 #![allow(dead_code)]
+use crate::future::lib::fd::AsRawOrDirect;
+use crate::future::lib::types::OpenHow;
 use crate::future::lib::{
-    AnySockOpt, AsRawOrDirect, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, SetSockOptIf,
+    AnySockOpt, BorrowedUringFd, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, SetSockOptIf,
     parse,
 };
 use crate::sqe::IoError;
 use anyhow::anyhow;
 use either::Either;
 use io_uring::squeue::Entry;
-use io_uring::types::{Fd, Fixed, OpenHow, TimeoutFlags, Timespec};
-use nix::fcntl::OFlag;
+use io_uring::types::{Fd, Fixed, FsyncFlags, TimeoutFlags, Timespec};
+use nix::fcntl::{FallocateFlags, OFlag, PosixFadviseAdvice};
+use nix::sys::epoll::{EpollEvent, EpollOp};
 use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
 use nix::sys::stat::Mode;
 use pin_project::pin_project;
+use rustix::thread::futex::WaitFlags;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
@@ -27,22 +31,25 @@ use std::time::Duration;
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct Accept<T: AsRawOrDirect> {
-    sockfd: T,
+pub struct Accept<'a> {
+    sockfd: BorrowedUringFd<'a>,
     flags: SockFlag,
     fd_mode: KernelFdMode,
     with_addr: bool,
-
     // Safety: we have T from MaybeUninit<T> as POD so don't need manual drop.
     #[pin]
     addr: MaybeUninit<libc::sockaddr_storage>, // Can fit Ipv4 or Ipv6
-
     #[pin]
     addrlen: MaybeUninit<libc::socklen_t>,
 }
 
-impl<T: AsRawOrDirect> Accept<T> {
-    pub fn new(sockfd: T, fd_mode: KernelFdMode, with_addr: bool, flags: Option<SockFlag>) -> Self {
+impl<'a> Accept<'a> {
+    pub fn new(
+        sockfd: BorrowedUringFd<'a>,
+        fd_mode: KernelFdMode,
+        with_addr: bool,
+        flags: Option<SockFlag>,
+    ) -> Self {
         let mut addrlen = MaybeUninit::uninit();
         if with_addr {
             addrlen.write(std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t);
@@ -66,7 +73,7 @@ impl<T: AsRawOrDirect> Accept<T> {
     }
 }
 
-impl<T: AsRawOrDirect> OpPayload for Accept<T> {
+impl<'a> OpPayload for Accept<'a> {
     type Output = (OwnedUringFd, Option<SocketAddr>);
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
@@ -74,15 +81,15 @@ impl<T: AsRawOrDirect> OpPayload for Accept<T> {
 
         let (addr_ptr, addrlen_ptr) = if *this.with_addr {
             (
-                this.addr.get_mut().as_mut_ptr().cast(),
-                this.addrlen.get_mut().as_mut_ptr().cast(),
+                this.addr.get_mut().as_mut_ptr(),
+                this.addrlen.get_mut().as_mut_ptr(),
             )
         } else {
             (std::ptr::null_mut(), std::ptr::null_mut())
         };
 
         let entry = resolve_fd!(this.sockfd, |fd| {
-            io_uring::opcode::Accept::new(fd, addr_ptr, addrlen_ptr)
+            io_uring::opcode::Accept::new(fd, addr_ptr.cast(), addrlen_ptr)
                 .file_index(this.fd_mode.try_into_slot()?)
                 .flags(this.flags.bits())
         });
@@ -160,16 +167,15 @@ impl OpPayload for AsyncCancel {
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct Bind<T: AsRawOrDirect> {
-    sockfd: T,
-
+pub struct Bind<'a> {
+    sockfd: BorrowedUringFd<'a>,
     #[pin]
     addr: parse::SocketAddrCRepr,
     addr_len: libc::socklen_t,
 }
 
-impl<T: AsRawOrDirect> Bind<T> {
-    pub fn new(sockfd: T, addr: &SocketAddr) -> Self {
+impl<'a> Bind<'a> {
+    pub fn new(sockfd: BorrowedUringFd<'a>, addr: &SocketAddr) -> Self {
         let (addr, addr_len) = parse::socket_addr_to_c(addr);
 
         Self {
@@ -180,8 +186,8 @@ impl<T: AsRawOrDirect> Bind<T> {
     }
 }
 
-impl<T: AsRawOrDirect> OpPayload for Bind<T> {
-    type Output = ();
+impl<'a> OpPayload for Bind<'a> {
+    type Output = i32;
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
@@ -198,8 +204,8 @@ impl<T: AsRawOrDirect> OpPayload for Bind<T> {
         _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        let _ = result?;
-        Ok(())
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -246,16 +252,16 @@ impl OpPayload for Close {
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct Connect<T: AsRawOrDirect> {
-    sockfd: T,
+pub struct Connect<'a> {
+    sockfd: BorrowedUringFd<'a>,
 
     #[pin]
     addr: parse::SocketAddrCRepr,
     addr_len: libc::socklen_t,
 }
 
-impl<T: AsRawOrDirect> Connect<T> {
-    pub fn new(sockfd: T, addr: &SocketAddr) -> Self {
+impl<'a> Connect<'a> {
+    pub fn new(sockfd: BorrowedUringFd<'a>, addr: &SocketAddr) -> Self {
         let (addr, addr_len) = parse::socket_addr_to_c(addr);
 
         Self {
@@ -266,8 +272,8 @@ impl<T: AsRawOrDirect> Connect<T> {
     }
 }
 
-impl<T: AsRawOrDirect> OpPayload for Connect<T> {
-    type Output = ();
+impl<'a> OpPayload for Connect<'a> {
+    type Output = i32;
 
     fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.as_mut().project();
@@ -284,8 +290,518 @@ impl<T: AsRawOrDirect> OpPayload for Connect<T> {
         _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        let _ = result?;
-        Ok(())
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === EpollCtl ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct EpollCtl<'a> {
+    epfd: BorrowedUringFd<'a>,
+    fd: RawFd,
+    op: EpollOp,
+    #[pin]
+    event: EpollEvent,
+}
+
+impl<'a> EpollCtl<'a> {
+    pub fn try_new(
+        epfd: BorrowedUringFd<'a>,
+        fd: RawFd,
+        op: EpollOp,
+        event: Option<EpollEvent>,
+    ) -> Result<Self, OpcodeError> {
+        if event.is_none() && op != EpollOp::EpollCtlDel {
+            Err(anyhow!("Event is required when op is not EpollCtlDel").into())
+        } else {
+            Ok(Self {
+                epfd,
+                fd,
+                op,
+                event: event.unwrap_or(EpollEvent::empty()),
+            })
+        }
+    }
+}
+
+impl<'a> OpPayload for EpollCtl<'a> {
+    type Output = i32;
+
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.as_mut().project();
+
+        let event_ptr = std::ptr::from_ref(&*this.event);
+
+        let entry = resolve_fd!(this.epfd, |epfd| {
+            io_uring::opcode::EpollCtl::new(
+                epfd,
+                io_uring::types::Fd(*this.fd),
+                *this.op as i32,
+                event_ptr.cast(),
+            )
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === EpollWait ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct EpollWait<'a> {
+    epfd: BorrowedUringFd<'a>,
+    #[pin]
+    events: Vec<EpollEvent>,
+    max_events: usize,
+    timeout_ms: isize,
+}
+
+impl<'a> EpollWait<'a> {
+    pub fn new(epfd: BorrowedUringFd<'a>, max_events: usize, timeout_ms: isize) -> Self {
+        Self {
+            epfd,
+            // Make sure we initialize memory region to avoid UB. Can't use
+            // `with_capacity` because len would be zero.
+            events: vec![EpollEvent::empty(); max_events],
+            max_events,
+            timeout_ms,
+        }
+    }
+}
+
+impl<'a> OpPayload for EpollWait<'a> {
+    type Output = (i32, Vec<EpollEvent>);
+
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let mut this = self.as_mut().project();
+
+        let entry = resolve_fd!(this.epfd, |epfd| {
+            io_uring::opcode::EpollWait::new(
+                epfd,
+                this.events.as_mut_ptr().cast(),
+                *this.max_events as u32,
+            )
+            // TODO: pretty sure this is a bug and should be i32, otherwise we can't
+            // use `timeout_ms == -1` to wait indefinitely.
+            .flags(*this.timeout_ms as u32)
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        let mut this = self.project();
+        Ok((res, std::mem::take(&mut this.events)))
+    }
+}
+
+///
+/// === FGetXattr ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct FGetXattr<'a> {
+    fd: BorrowedUringFd<'a>,
+    #[pin]
+    name: CString,
+    #[pin]
+    value: Vec<u8>,
+    len: u32,
+}
+
+impl<'a> FGetXattr<'a> {
+    pub fn try_new(
+        fd: BorrowedUringFd<'a>,
+        name: impl Into<Vec<u8>>,
+        len: u32,
+    ) -> Result<Self, OpcodeError> {
+        let name = CString::new(name.into()).map_err(|e| anyhow!("Invalid name: {:?}", e))?;
+
+        Ok(Self {
+            fd,
+            name,
+            value: vec![0u8; len as usize],
+            len,
+        })
+    }
+}
+
+impl<'a> OpPayload for FGetXattr<'a> {
+    type Output = (i32, Vec<u8>);
+
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let mut this = self.as_mut().project();
+
+        let name_ptr = std::ptr::from_ref(&*this.name);
+
+        let entry = resolve_fd!(this.fd, |fd| {
+            io_uring::opcode::FGetXattr::new(
+                fd,
+                name_ptr.cast(),
+                this.value.as_mut_ptr().cast(),
+                *this.len,
+            )
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let mut this = self.project();
+        let res = result?;
+        Ok((res, std::mem::take(&mut this.value)))
+    }
+}
+
+///
+/// === FSetXattr ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct FSetXattr<'a> {
+    fd: BorrowedUringFd<'a>,
+    #[pin]
+    name: CString,
+    #[pin]
+    value: Vec<u8>,
+    flags: i32,
+}
+
+impl<'a> FSetXattr<'a> {
+    pub fn try_new(
+        fd: BorrowedUringFd<'a>,
+        name: impl Into<Vec<u8>>,
+        value: Vec<u8>,
+        flags: Option<i32>,
+    ) -> Result<Self, OpcodeError> {
+        let name = CString::new(name.into()).map_err(|e| anyhow!("Invalid name: {:?}", e))?;
+
+        Ok(Self {
+            fd,
+            name,
+            value,
+            flags: flags.unwrap_or(0),
+        })
+    }
+}
+
+impl<'a> OpPayload for FSetXattr<'a> {
+    type Output = i32;
+
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.as_mut().project();
+
+        let name_ptr = std::ptr::from_ref(&*this.name);
+        let value_ptr = std::ptr::from_ref(&*this.value);
+
+        let entry = resolve_fd!(this.fd, |fd| {
+            io_uring::opcode::FSetXattr::new(
+                fd,
+                name_ptr.cast(),
+                value_ptr.cast(),
+                this.value.len() as u32,
+            )
+            .flags(*this.flags)
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === Fadvise ===
+///
+#[derive(Debug)]
+pub struct Fadvise<'a> {
+    fd: BorrowedUringFd<'a>,
+    offset: libc::off_t,
+    len: libc::off_t,
+    advice: PosixFadviseAdvice,
+}
+
+impl<'a> Fadvise<'a> {
+    pub fn new(
+        fd: BorrowedUringFd<'a>,
+        offset: libc::off_t,
+        len: libc::off_t,
+        advice: PosixFadviseAdvice,
+    ) -> Self {
+        Self {
+            fd,
+            offset,
+            len,
+            advice,
+        }
+    }
+}
+
+impl<'a> OpPayload for Fadvise<'a> {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let entry = resolve_fd!(self.fd, |fd| {
+            io_uring::opcode::Fadvise::new(fd, self.len, self.advice as i32)
+                .offset(self.offset as u64)
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === Fallocate ===
+///
+#[derive(Debug)]
+pub struct Fallocate<'a> {
+    fd: BorrowedUringFd<'a>,
+    offset: libc::off_t,
+    len: libc::off_t,
+    mode: FallocateFlags,
+}
+
+impl<'a> Fallocate<'a> {
+    pub fn new(
+        fd: BorrowedUringFd<'a>,
+        offset: libc::off_t,
+        len: libc::off_t,
+        mode: FallocateFlags,
+    ) -> Self {
+        Self {
+            fd,
+            offset,
+            len,
+            mode,
+        }
+    }
+}
+
+impl<'a> OpPayload for Fallocate<'a> {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let entry = resolve_fd!(self.fd, |fd| {
+            io_uring::opcode::Fallocate::new(fd, self.len as u64)
+                .offset(self.offset as u64)
+                .mode(self.mode.bits())
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === FixedFdInstall ===
+///
+#[derive(Debug)]
+pub struct FixedFdInstall {
+    fixed: Fixed,
+    flags: u32,
+}
+
+impl FixedFdInstall {
+    pub fn try_new(fd: OwnedUringFd, flags: Option<u32>) -> Result<Self, OpcodeError> {
+        Ok(Self {
+            // Safety: we are transferring ownership of this fd.
+            fixed: Fixed(unsafe { fd.leak_fixed()? }),
+            flags: flags.unwrap_or(0),
+        })
+    }
+}
+
+impl OpPayload for FixedFdInstall {
+    type Output = OwnedUringFd;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let entry = io_uring::opcode::FixedFdInstall::new(self.fixed, self.flags);
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        // Return a new legacy OwnedUringFd, i.e.: a Raw descriptor. We still enforce
+        // proper ownership semantics, with RAII to close the descriptor.
+        Ok(OwnedUringFd::from_result(
+            result?,
+            KernelFdMode::Legacy,
+            waker,
+        ))
+    }
+}
+
+///
+/// === Fsync ===
+///
+#[derive(Debug)]
+pub struct Fsync<'a> {
+    fd: BorrowedUringFd<'a>,
+    flags: FsyncFlags,
+}
+
+impl<'a> Fsync<'a> {
+    pub fn new(fd: BorrowedUringFd<'a>, flags: Option<FsyncFlags>) -> Self {
+        Self {
+            fd,
+            flags: flags.unwrap_or(FsyncFlags::empty()),
+        }
+    }
+}
+
+impl<'a> OpPayload for Fsync<'a> {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let entry = resolve_fd!(self.fd, |fd| {
+            io_uring::opcode::Fsync::new(fd).flags(self.flags)
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === Ftruncate ===
+///
+#[derive(Debug)]
+pub struct Ftruncate<'a> {
+    fd: BorrowedUringFd<'a>,
+    len: libc::off_t,
+}
+
+impl<'a> Ftruncate<'a> {
+    pub fn new(fd: BorrowedUringFd<'a>, len: libc::off_t) -> Self {
+        Self { fd, len }
+    }
+}
+
+impl<'a> OpPayload for Ftruncate<'a> {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let entry = resolve_fd!(self.fd, |fd| {
+            io_uring::opcode::Ftruncate::new(fd, self.len as u64)
+        });
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+///
+/// === FutexWait ===
+///
+#[derive(Debug)]
+#[pin_project]
+pub struct FutexWait {
+    #[pin]
+    futex: u32,
+    val: u64,
+    mask: u64,
+    flags: WaitFlags,
+}
+
+impl FutexWait {
+    pub fn new(futex: u32, val: u64, mask: u64, flags: WaitFlags) -> Self {
+        Self {
+            futex,
+            val,
+            mask,
+            flags,
+        }
+    }
+}
+
+impl OpPayload for FutexWait {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        let futex_ptr = std::ptr::from_ref(&*this.futex);
+        let entry =
+            io_uring::opcode::FutexWait::new(futex_ptr, *this.val, *this.mask, this.flags.bits());
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -293,19 +809,19 @@ impl<T: AsRawOrDirect> OpPayload for Connect<T> {
 /// === Listen ===
 ///
 #[derive(Debug)]
-pub struct Listen<T: AsRawOrDirect> {
-    sockfd: T,
+pub struct Listen<'a> {
+    sockfd: BorrowedUringFd<'a>,
     backlog: i32,
 }
 
-impl<T: AsRawOrDirect> Listen<T> {
-    pub fn new(sockfd: T, backlog: i32) -> Self {
+impl<'a> Listen<'a> {
+    pub fn new(sockfd: BorrowedUringFd<'a>, backlog: i32) -> Self {
         Self { sockfd, backlog }
     }
 }
 
-impl<T: AsRawOrDirect> OpPayload for Listen<T> {
-    type Output = ();
+impl<'a> OpPayload for Listen<'a> {
+    type Output = i32;
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let entry = resolve_fd!(self.sockfd, |fd| {
@@ -320,8 +836,8 @@ impl<T: AsRawOrDirect> OpPayload for Listen<T> {
         _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        let _ = result?;
-        Ok(())
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -333,10 +849,8 @@ impl<T: AsRawOrDirect> OpPayload for Listen<T> {
 pub struct OpenAt {
     fd_mode: KernelFdMode,
     dirfd: Option<RawFd>,
-
     #[pin]
     pathname: CString,
-
     flags: OFlag,
     mode: Mode,
 }
@@ -350,7 +864,7 @@ impl OpenAt {
         mode: Mode,
     ) -> Result<Self, OpcodeError> {
         if dirfd.is_none() && !pathname.as_ref().is_absolute() {
-            return Err(anyhow!("DirFd can only be ignored for absolute pathnames.").into());
+            return Err(anyhow!("DirFd can only be ignored for absolute pathname.").into());
         }
 
         if flags.contains(OFlag::O_CREAT) && mode.is_empty() {
@@ -402,12 +916,10 @@ impl OpPayload for OpenAt {
 pub struct OpenAt2 {
     fd_mode: KernelFdMode,
     dirfd: Option<RawFd>,
-
     #[pin]
     pathname: CString,
-
     #[pin]
-    how: OpenHow,
+    how: io_uring::types::OpenHow,
 }
 
 impl OpenAt2 {
@@ -418,7 +930,7 @@ impl OpenAt2 {
         how: OpenHow,
     ) -> Result<Self, OpcodeError> {
         if dirfd.is_none() && !pathname.as_ref().is_absolute() {
-            return Err(anyhow!("DirFd can only be ignored for absolute pathnames.").into());
+            return Err(anyhow!("DirFd can only be ignored for absolute pathname.").into());
         }
 
         let pathname = CString::new(pathname.as_ref().as_os_str().as_bytes())
@@ -428,7 +940,7 @@ impl OpenAt2 {
             fd_mode,
             dirfd,
             pathname,
-            how,
+            how: how.into(),
         })
     }
 }
@@ -440,10 +952,10 @@ impl OpPayload for OpenAt2 {
         let this = self.project();
 
         let dirfd = io_uring::types::Fd(this.dirfd.unwrap_or(libc::AT_FDCWD));
-        let how_addr = std::ptr::from_ref(&*this.how).cast();
+        let how_ptr = std::ptr::from_ref(&*this.how);
 
         Ok(
-            io_uring::opcode::OpenAt2::new(dirfd, this.pathname.as_ptr(), how_addr)
+            io_uring::opcode::OpenAt2::new(dirfd, this.pathname.as_ptr(), how_ptr)
                 .file_index(this.fd_mode.try_into_slot()?)
                 .build(),
         )
@@ -465,7 +977,7 @@ impl OpPayload for OpenAt2 {
 pub struct Nop;
 
 impl OpPayload for Nop {
-    type Output = ();
+    type Output = i32;
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         Ok(io_uring::opcode::Nop::new().build())
@@ -476,8 +988,8 @@ impl OpPayload for Nop {
         _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        let _ = result?;
-        Ok(())
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -535,8 +1047,8 @@ impl OpPayload for Socket {
 ///
 #[derive(Debug)]
 #[pin_project]
-pub struct SetSockOpt<T: AsRawOrDirect> {
-    sockfd: T,
+pub struct SetSockOpt<'a> {
+    sockfd: BorrowedUringFd<'a>,
 
     /// The opt is a self-contained struct that generates stable c ptrs when
     /// we unpack it on first poll. We use it as an entry generator and it's
@@ -545,8 +1057,8 @@ pub struct SetSockOpt<T: AsRawOrDirect> {
     opt: AnySockOpt,
 }
 
-impl<T: AsRawOrDirect> SetSockOpt<T> {
-    pub fn new<O: Into<AnySockOpt>>(sockfd: T, opt: O) -> Self {
+impl<'a> SetSockOpt<'a> {
+    pub fn new<O: Into<AnySockOpt>>(sockfd: BorrowedUringFd<'a>, opt: O) -> Self {
         Self {
             sockfd,
             opt: opt.into(),
@@ -554,12 +1066,12 @@ impl<T: AsRawOrDirect> SetSockOpt<T> {
     }
 }
 
-impl<T: AsRawOrDirect> OpPayload for SetSockOpt<T> {
-    type Output = ();
+impl<'a> OpPayload for SetSockOpt<'a> {
+    type Output = i32;
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
-        this.opt.create_entry(this.sockfd)
+        this.opt.create_entry(*this.sockfd)
     }
 
     fn into_output(
@@ -567,8 +1079,8 @@ impl<T: AsRawOrDirect> OpPayload for SetSockOpt<T> {
         _waker: &Waker,
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
-        let _ = result?;
-        Ok(())
+        let res = result?;
+        Ok(res)
     }
 }
 
@@ -600,14 +1112,14 @@ impl Timeout {
 }
 
 impl OpPayload for Timeout {
-    type Output = ();
+    type Output = i32;
 
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
 
-        let timespec_addr = std::ptr::from_ref(&*this.timespec).cast();
+        let timespec_ptr = std::ptr::from_ref(&*this.timespec);
 
-        Ok(io_uring::opcode::Timeout::new(timespec_addr)
+        Ok(io_uring::opcode::Timeout::new(timespec_ptr)
             .count(1)
             .flags(*this.flags)
             .build())
@@ -619,9 +1131,9 @@ impl OpPayload for Timeout {
         result: Result<i32, IoError>,
     ) -> Result<Self::Output, IoError> {
         match result {
-            Ok(_) => Ok(()),
+            Ok(res) => Ok(res),
             // Expired timeout yield -ETIME but this is a success case.
-            Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Ok(()),
+            Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
             Err(e) => Err(e),
         }
     }
@@ -727,7 +1239,7 @@ mod tests {
                 .await
                 .expect("client socket creation failed");
 
-            let connect_op = Op::new(Connect::new(sockfd, &sock_addr));
+            let connect_op = Op::new(Connect::new(sockfd.borrow(), &sock_addr));
             connect_op.await.context("connect failed")?;
 
             Ok(())

@@ -3,11 +3,12 @@
 //! Copied from `nix` crate and adapted for `io_uring` and async world.
 //! Omitted many of the platform dependent options and focused on Linux.
 
-use crate::future::lib::{AsRawOrDirect, OpcodeError};
+use crate::future::lib::fd::AsRawOrDirect;
+use crate::future::lib::{BorrowedUringFd, OpcodeError};
 use io_uring::squeue::Entry;
 
 pub trait SetSockOptIf: Into<AnySockOpt> {
-    fn create_entry(&self, fd: &impl AsRawOrDirect) -> Result<Entry, OpcodeError>;
+    fn create_entry(&self, fd: BorrowedUringFd<'_>) -> Result<Entry, OpcodeError>;
 }
 
 /// Static dispatch enum for all concrete `SetSockOptIf` implementors.
@@ -36,7 +37,7 @@ pub enum AnySockOpt {
 }
 
 impl SetSockOptIf for AnySockOpt {
-    fn create_entry(&self, fd: &impl AsRawOrDirect) -> Result<Entry, OpcodeError> {
+    fn create_entry(&self, fd: BorrowedUringFd<'_>) -> Result<Entry, OpcodeError> {
         match self {
             AnySockOpt::ReuseAddr(op) => op.create_entry(fd),
             AnySockOpt::ReusePort(op) => op.create_entry(fd),
@@ -112,7 +113,7 @@ macro_rules! setsockopt_impl {
         impl $crate::future::lib::sockopt::SetSockOptIf for $name {
             fn create_entry(
                 &self,
-                fd: &impl $crate::future::lib::fd::AsRawOrDirect,
+                fd: BorrowedUringFd<'_>,
             ) -> Result<io_uring::squeue::Entry, $crate::future::lib::OpcodeError> {
                 let entry = resolve_fd!(fd, |fd| {
                     io_uring::opcode::SetSockOpt::new(
@@ -425,7 +426,7 @@ mod tests {
         let before = getsockopt(&sockfd, nix_opt);
         assert_eq!(before, false);
 
-        Op::new(SetSockOpt::new(sockfd.clone(), ringolo_opt))
+        Op::new(SetSockOpt::new(sockfd.borrow(), ringolo_opt))
             .await
             .context("failed to set opt")?;
 
@@ -449,9 +450,9 @@ mod tests {
 
         let before = getsockopt(&sockfd, nix_opt);
         if recv_buf {
-            Op::new(SetSockOpt::new(sockfd.clone(), RcvBuf::new(before * 2))).await
+            Op::new(SetSockOpt::new(sockfd.borrow(), RcvBuf::new(before * 2))).await
         } else {
-            Op::new(SetSockOpt::new(sockfd.clone(), SndBuf::new(before * 2))).await
+            Op::new(SetSockOpt::new(sockfd.borrow(), SndBuf::new(before * 2))).await
         }
         .context("failed to setopt")?;
 
@@ -478,7 +479,7 @@ mod tests {
         );
 
         Op::new(SetSockOpt::new(
-            sockfd.clone(),
+            sockfd.borrow(),
             Linger::new(libc::linger {
                 l_onoff: 1,
                 l_linger: 10,
