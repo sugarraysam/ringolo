@@ -1,19 +1,23 @@
-use io_uring::cqueue::CompletionFlags;
+use crate::utils::io_uring::CompletionFlags;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::Waker;
 
 use crate::context;
 use crate::sqe::IoError;
 
+/// The raw state stored inside the `RawSqeSlab`.
+///
+/// This struct acts as the "glue" between the `io_uring` user_data pointer
+/// and the Rust task system. When a CQE arrives, the `user_data` field is cast
+/// to an index into the slab to find this struct.
+///
+/// It holds the `Waker` needed to notify the high-level `Future` that the
+/// kernel operation has completed.
 #[derive(Debug)]
 pub(crate) struct RawSqe {
-    // Indicates if this RawSqe is owned by the root future. See note on
-    // pending_io tracking on `context::core::Core::modify_pending_ios`.
-    pub(crate) owned_by_root: bool,
-
     pub(crate) waker: Option<Waker>,
 
     pub(crate) state: RawSqeState,
@@ -24,7 +28,6 @@ pub(crate) struct RawSqe {
 impl Default for RawSqe {
     fn default() -> Self {
         Self {
-            owned_by_root: false,
             waker: None,
             state: RawSqeState::Pending,
             handler: CompletionHandler::new_single(),
@@ -35,7 +38,6 @@ impl Default for RawSqe {
 impl RawSqe {
     pub(crate) fn new(handler: CompletionHandler) -> Self {
         Self {
-            owned_by_root: context::with_core(|core| core.is_polling_root()),
             handler,
             waker: None,
             state: RawSqeState::Pending,
@@ -128,7 +130,7 @@ impl RawSqe {
                     StreamCompletion::ByFlag { done } => {
                         // If we have the `IORING_CQE_F_MORE` flags set, it means we are
                         // expecting more results, otherwise this was the final result.
-                        let has_more = io_uring::cqueue::more(cqe_flags);
+                        let has_more = cqe_flags.contains(CompletionFlags::MORE);
                         *done = !has_more;
                         *done
                     }
@@ -325,9 +327,6 @@ pub(crate) enum CompletionEffect {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum RawSqeState {
-    // Up for grabs
-    Available,
-
     // Waiting to be submitted and completed
     Pending,
 
@@ -344,7 +343,6 @@ mod tests {
     use crate::context;
     use crate::test_utils::*;
     use anyhow::Result;
-    use io_uring::cqueue::CompletionFlags;
     use rstest::rstest;
     use smallvec::SmallVec;
     use std::io::{self, ErrorKind};

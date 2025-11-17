@@ -1,25 +1,56 @@
 use crate::future::lib::fd::AsRawOrDirect;
+use crate::future::lib::types::SockFlag;
 use crate::future::lib::{
     BorrowedUringFd, CancelHow, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError,
     OwnedUringFd,
 };
 use crate::sqe::IoError;
 use io_uring::types::{TimeoutFlags, Timespec};
-use nix::sys::socket::SockFlag;
 use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;
 use std::task::Waker;
 use std::time::Duration;
 
+/// A multishot operation for accepting incoming network connections.
+///
+/// This stream yields an [`OwnedUringFd`] for each new connection. It leverages
+/// the `IORING_OP_ACCEPT` opcode with the `IORING_ACCEPT_MULTISHOT` flag, allowing
+/// the kernel to generate multiple Completion Queue Events (CQEs) from a single
+/// Submission Queue Entry (SQE).
+///
+/// # Man Page
+///
+/// - [`io_uring_prep_multishot_accept`](https://man.archlinux.org/man/io_uring_prep_multishot_accept.3)
+/// - [`accept(2)`](https://man.archlinux.org/man/accept.2)
 #[derive(Debug)]
 pub struct AcceptMultishot<'a> {
+    /// The listening socket file descriptor.
     sockfd: BorrowedUringFd<'a>,
+
+    /// The mode for the *newly accepted* file descriptors (e.g., Raw vs Direct).
     mode: KernelFdMode,
+
+    /// Socket flags to apply to the new file descriptors (e.g., `SOCK_CLOEXEC`).
     flags: SockFlag,
 }
 
 impl<'a> AcceptMultishot<'a> {
+    /// Creates a new multishot accept operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `sockfd` - A borrowed handle to the listening socket.
+    /// * `mode` - Determines if the accepted sockets should be standard file descriptors
+    ///   or direct descriptors.
+    /// * `flags` - Optional flags (like `SOCK_NONBLOCK` or `SOCK_CLOEXEC`) to apply
+    ///   atomically to accepted sockets.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `mode` is set to `KernelFdMode::Direct(_)`. Multishot accept
+    /// requires the kernel to allocate fixed indices dynamically (`DirectAuto`), as a single
+    /// static index cannot hold multiple concurrent connections.
     pub fn try_new(
         sockfd: BorrowedUringFd<'a>,
         mode: KernelFdMode,
@@ -76,22 +107,44 @@ impl<'a> MultishotPayload for AcceptMultishot<'a> {
     }
 }
 
+/// A multishot operation that triggers completions after a specific duration.
+///
+/// This acts as an interval timer. Unlike a standard timeout which fires once,
+/// this operation remains active in the kernel and posts a CQE every time the
+/// duration elapses.
+///
+/// # Man Page
+///
+/// - [`io_uring_prep_timeout`](https://man.archlinux.org/man/io_uring_prep_timeout.3)
 #[derive(Debug)]
 #[pin_project]
 pub struct TimeoutMultishot {
+    /// The duration of the timeout. Pinned because the kernel reads this struct
+    /// directly via pointer.
     #[pin]
     timespec: Timespec,
+
+    /// The number of repetitions requested.
     count: u32,
+
+    /// Flags modifying the timeout behavior.
     flags: TimeoutFlags,
 }
 
 impl TimeoutMultishot {
     /// Create a new multishot timeout operation.
-    /// - If `count` is `n`, the timeout will fire n times.
-    /// - If `count` is `0`, it will fire indefinitely.
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - The duration between each tick.
+    /// * `count` - The number of times to fire. If `0`, it fires indefinitely.
+    /// * `flags` - Optional flags.
+    ///
+    /// # Default Flags
     ///
     /// The `IORING_TIMEOUT_MULTISHOT` and `IORING_TIMEOUT_ETIME_SUCCESS` flags
-    /// are added by default.
+    /// are added automatically. `ETIME_SUCCESS` ensures that a timeout expiration
+    /// is treated as a valid CQE rather than an error code.
     pub fn new(interval: Duration, count: u32, flags: Option<TimeoutFlags>) -> Self {
         Self {
             timespec: Timespec::from(interval),
@@ -200,7 +253,7 @@ mod tests {
                             new_sockfd.leak_raw().context("cant leak raw fd")?,
                         )
                     },
-                    UringFdKind::Fixed => panic!("should not be fixed"),
+                    UringFdKind::Direct => panic!("should not be fixed"),
                 };
 
                 stream.write_all(hello)?;

@@ -1,38 +1,83 @@
-#![allow(dead_code)]
-
-//! Copied from `nix` crate and adapted for `io_uring` and async world.
+//! All supported socket operations.
+//!
+//! Copied from [`nix`] crate and adapted for `io_uring` and async world.
 //! Omitted many of the platform dependent options and focused on Linux.
+//!
+//! [`nix`]: https://docs.rs/nix/latest/nix/sys/socket/trait.SetSockOpt.html
 
 use crate::future::lib::fd::AsRawOrDirect;
 use crate::future::lib::{BorrowedUringFd, OpcodeError};
 use io_uring::squeue::Entry;
 
+/// A trait implemented by all concrete socket option types (e.g., [`TcpNoDelay`], [`ReuseAddr`]).
+///
+/// This trait serves two purposes:
+/// 1. It allows specific options to be converted into the generic [`AnySockOpt`] enum.
+/// 2. It provides the logic to construct the raw `io_uring` submission entry (SQE) for the specific option.
 pub trait SetSockOptIf: Into<AnySockOpt> {
+    /// Constructs an `io_uring` submission entry for this socket option.
+    ///
+    /// This method is called by the runtime when preparing the operation for submission.
+    /// It takes a borrowed file descriptor and returns the configured SQE.
     fn create_entry(&self, fd: BorrowedUringFd<'_>) -> Result<Entry, OpcodeError>;
 }
 
-/// Static dispatch enum for all concrete `SetSockOptIf` implementors.
-/// This allows us to store any socket option in a concrete struct like OpList,
+/// Static dispatch enum for all concrete [`SetSockOptIf`] implementors.
+///
+/// This allows us to store any socket option in a concrete struct like [`OpList`](crate::future::lib::OpList),
 /// to create heterogenous chains and batches with static dispatch and no heap
 /// allocations.
 #[derive(Debug, Copy, Clone)]
 pub enum AnySockOpt {
+    /// See [`ReuseAddr`].
     ReuseAddr(ReuseAddr),
+
+    /// See [`ReusePort`].
     ReusePort(ReusePort),
+
+    /// See [`TcpNoDelay`].
     TcpNoDelay(TcpNoDelay),
+
+    /// See [`Linger`].
     Linger(Linger),
+
+    /// See [`ReceiveTimeout`].
     ReceiveTimeout(ReceiveTimeout),
+
+    /// See [`SendTimeout`].
     SendTimeout(SendTimeout),
+
+    /// See [`Broadcast`].
     Broadcast(Broadcast),
+
+    /// See [`OobInline`].
     OobInline(OobInline),
+
+    /// See [`DontRoute`].
     DontRoute(DontRoute),
+
+    /// See [`KeepAlive`].
     KeepAlive(KeepAlive),
+
+    /// See [`RcvBuf`].
     RcvBuf(RcvBuf),
+
+    /// See [`SndBuf`].
     SndBuf(SndBuf),
+
+    /// See [`ReceiveTimestamp`].
     ReceiveTimestamp(ReceiveTimestamp),
+
+    /// See [`Mark`].
     Mark(Mark),
+
+    /// See [`TxTime`].
     TxTime(TxTime),
+
+    /// See [`Ipv6V6Only`].
     Ipv6V6Only(Ipv6V6Only),
+
+    /// See [`AttachReusePortCbpf`].
     AttachReusePortCbpf(AttachReusePortCbpf),
 }
 
@@ -68,7 +113,7 @@ macro_rules! setsockopt_impl {
             $level,
             $flag,
             bool,
-            $crate::future::lib::sockopt::SetBool
+            $crate::future::lib::ops::sockopt::SetBool
         );
     };
 
@@ -79,7 +124,7 @@ macro_rules! setsockopt_impl {
             $level,
             $flag,
             usize,
-            $crate::future::lib::sockopt::SetUsize
+            $crate::future::lib::ops::sockopt::SetUsize
         );
     };
 
@@ -90,7 +135,7 @@ macro_rules! setsockopt_impl {
             $level,
             $flag,
             $ty,
-            $crate::future::lib::sockopt::SetStruct<$ty>
+            $crate::future::lib::ops::sockopt::SetStruct<$ty>
         );
     };
 
@@ -102,6 +147,7 @@ macro_rules! setsockopt_impl {
         }
 
         impl $name {
+            /// Create a new option with the given value.
             pub fn new(val: $ty) -> Self {
                 Self {
                     setter: <$setter>::new(val),
@@ -110,7 +156,7 @@ macro_rules! setsockopt_impl {
         }
 
         // Impl SetSockOptIf for Op.
-        impl $crate::future::lib::sockopt::SetSockOptIf for $name {
+        impl $crate::future::lib::ops::sockopt::SetSockOptIf for $name {
             fn create_entry(
                 &self,
                 fd: BorrowedUringFd<'_>,
@@ -386,7 +432,8 @@ mod tests {
     use std::os::fd::BorrowedFd;
 
     use super::*;
-    use crate::future::lib::{Op, OwnedUringFd, SetSockOpt};
+    use crate::future::lib::ops::SetSockOpt;
+    use crate::future::lib::{Op, OwnedUringFd};
     use crate::test_utils::*;
     use crate::{self as ringolo, future::lib::KernelFdMode};
     use anyhow::{Context, Result};

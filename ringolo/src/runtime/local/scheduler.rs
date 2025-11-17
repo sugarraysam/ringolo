@@ -44,7 +44,7 @@ impl Scheduler {
             cfg: cfg.clone(),
             default_task_opts: cfg.default_task_opts(),
             tasks: OwnedTasks::new(cfg),
-            worker: Worker::new(cfg, Arc::clone(&shared)),
+            worker: Worker::new(cfg),
             shared,
             root_woken: RefCell::new(true),
 
@@ -269,6 +269,7 @@ impl Handle {
     }
 }
 
+#[doc(hidden)]
 impl Deref for Handle {
     type Target = Arc<Scheduler>;
     fn deref(&self) -> &Self::Target {

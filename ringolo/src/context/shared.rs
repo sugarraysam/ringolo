@@ -8,19 +8,28 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread::{self, Thread};
 
+/// Global state shared across all worker threads.
+///
+/// `Shared` handles the coordination aspects of the runtime. Unlike [`Core`],
+/// all fields here must be thread-safe (Sync). This context is primarily used
+/// for work-stealing, parking logic, and shutdown coordination.
 #[derive(Debug)]
-pub struct Shared {
+pub(crate) struct Shared {
+    /// Configuration for the runtime (ring sizes, worker counts, etc.).
     pub(crate) cfg: RuntimeConfig,
 
+    /// A global signal indicating if the runtime is in the process of shutting down.
     pub(crate) shutdown: Arc<AtomicBool>,
 
-    /// Used to store per-worker data. We panic on any errors coming from the
-    /// slots as it would mean the runtime is in an unexpected and unrecoverable
-    /// state.
+    /// A registry of all active workers, mapping `ThreadId` to their specific atomic states.
+    /// Used for cross-thread lookups (e.g., "Does thread X have pending I/O?").
     pub(crate) worker_slots: WorkerSlots,
 
-    /// LIFO collection of parked threads. We unpark thread in LIFO order as the
-    /// latest parked thread is the one where CPU cache will be the hotest.
+    /// LIFO (Last-In, First-Out) queue of parked threads.
+    ///
+    /// **Why LIFO?** The thread that parked most recently is the most likely to still
+    /// have its working set in the CPU cache (hot), making it the best candidate
+    /// to wake up next.
     pub(crate) parked_threads: RwLock<VecDeque<(Thread, ThreadId)>>,
 }
 

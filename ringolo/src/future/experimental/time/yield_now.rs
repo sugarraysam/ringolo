@@ -3,6 +3,32 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+/// A future that yields execution back to the scheduler.
+///
+/// # Cooperative Multitasking
+///
+/// `ringolo` uses cooperative scheduling. If a task runs a long computation
+/// without awaiting any I/O, it can starve other tasks on the same thread.
+/// `YieldNow` allows a task to voluntarily suspend itself, giving the scheduler
+/// a chance to run other pending tasks before returning to this one.
+///
+/// # Examples
+///
+/// ```
+/// use ringolo::time::YieldNow;
+///
+/// # async fn doc() {
+/// for i in 0..1_000_000 {
+///     // Heavy computation...
+///
+///     if i % 100 == 0 {
+///         // Let other tasks run every 100 iterations
+///         let res = YieldNow::new(None).await;
+///         assert!(res.is_ok());
+///     }
+/// }
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct YieldNow {
     awaiting_first_poll: bool,
@@ -10,14 +36,12 @@ pub struct YieldNow {
 }
 
 impl YieldNow {
-    /// Mechanism through which a task can suspend itself, with the intention
-    /// of running again soon without being woken up. Very useful if a task was
-    /// unable to register the waker for example, can fallback to yielding and
-    /// try to register the waker again.
+    /// Creates a new `YieldNow` future.
     ///
-    /// By default, the scheduler will figure out the optimal AddMode and decide
-    /// if task should be run again next (Lifo :: front of queue) or run again
-    /// soon (Fifo :: back of queue). Only override if you have special insights.
+    /// * `mode`: Optionally specify where to place the task in the run queue.
+    ///     * `None`: The scheduler decides (default).
+    ///     * `Some(AddMode::Lifo)`: Reschedule at the front (run again ASAP).
+    ///     * `Some(AddMode::Fifo)`: Reschedule at the back (run after others).
     pub fn new(mode: Option<AddMode>) -> Self {
         Self {
             awaiting_first_poll: true,

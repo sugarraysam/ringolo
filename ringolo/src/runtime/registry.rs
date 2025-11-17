@@ -51,7 +51,24 @@ pub(crate) struct OwnedTasks<S: 'static> {
 
     /// Used to allow workers to drop the tasks they own and ensure underlying future
     /// Drop impl can use the corresponding thread-local context.
-    shutdown_partitions: Arc<(Mutex<Option<HashMap<ThreadId, Vec<Task<S>>>>>, Condvar)>,
+    shutdown_state: Arc<ShutdownState<S>>,
+}
+
+type PartitionMap<S> = HashMap<ThreadId, Vec<Task<S>>>;
+
+#[derive(Debug)]
+struct ShutdownState<S: 'static> {
+    lock: Mutex<Option<PartitionMap<S>>>,
+    cvar: Condvar,
+}
+
+impl<S: 'static> ShutdownState<S> {
+    fn new() -> Self {
+        Self {
+            lock: Mutex::new(None),
+            cvar: Condvar::new(),
+        }
+    }
 }
 
 impl<S: Schedule> OwnedTasks<S> {
@@ -63,7 +80,7 @@ impl<S: Schedule> OwnedTasks<S> {
             closed: Arc::new(AtomicBool::new(false)),
             root: OnceLock::new(),
             orphan_root: OnceLock::new(),
-            shutdown_partitions: Arc::new((Mutex::new(None), Condvar::new())),
+            shutdown_state: Arc::new(ShutdownState::new()),
         });
 
         registry
@@ -99,6 +116,7 @@ impl<S: Schedule> OwnedTasks<S> {
         self.size.load(Ordering::Relaxed)
     }
 
+    #[allow(unused)]
     pub(crate) fn is_empty(&self) -> bool {
         self.size.load(Ordering::Relaxed) == 0
     }
@@ -109,23 +127,20 @@ impl<S: Schedule> OwnedTasks<S> {
     pub(crate) fn close_and_partition(&self) {
         self.close();
 
-        let (lock, cvar) = &*self.shutdown_partitions;
-
-        let mut partitions = lock.lock();
+        let mut partitions = self.shutdown_state.lock.lock();
         *partitions = Some(self.partition_by_thread_id());
 
-        cvar.notify_all();
+        self.shutdown_state.cvar.notify_all();
     }
 
     /// Waits for registry partition to be created by shutdown process.
     pub(crate) fn wait_for_shutdown_partition(&self, thread_id: &ThreadId) -> Option<Vec<Task<S>>> {
-        let (lock, cvar) = &*self.shutdown_partitions;
-        let mut partitions = lock.lock();
+        let mut partitions = self.shutdown_state.lock.lock();
 
         // Safety: ok to use if instead of while because parking_lot's Condvar will never
         // spuriously wake up.
         if partitions.is_none() {
-            cvar.wait(&mut partitions);
+            self.shutdown_state.cvar.wait(&mut partitions);
         }
 
         // Safety: we know the Option is not None anymore.
@@ -136,7 +151,7 @@ impl<S: Schedule> OwnedTasks<S> {
     pub(crate) fn shutdown_all_partitions(&self) {
         self.close();
 
-        let mut partitions = self.shutdown_partitions.0.lock();
+        let mut partitions = self.shutdown_state.lock.lock();
         debug_assert!(
             partitions.is_some(),
             "OwnedTasks was not partitioned on shutdown."
@@ -212,7 +227,7 @@ impl<S: Schedule> OwnedTasks<S> {
 }
 
 /// Expose functionality of the TaskRegistry common to any scheduler.
-pub trait TaskRegistry: Send + Sync + std::fmt::Debug {
+pub(crate) trait TaskRegistry: Send + Sync + std::fmt::Debug {
     /// Allow shutting down a specific task.
     fn shutdown(&self, id: &Id);
 

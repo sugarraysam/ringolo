@@ -4,7 +4,6 @@ use crate::runtime::stealing::scheduler::StealableTask;
 use crate::runtime::ticker::{Ticker, TickerData, TickerEvents};
 use crate::runtime::waker::waker_ref;
 use crate::runtime::{AddMode, EventLoop, RuntimeConfig};
-use crate::spawn::TaskOptsInternal;
 use crate::task::TaskNodeGuard;
 use crate::task::ThreadId;
 use crate::utils::thread::set_current_thread_name;
@@ -59,8 +58,7 @@ impl EventLoop for RootWorker {
 
     fn add_task(&self, task: Self::Task, _mode: AddMode) {
         debug_assert!(
-            task.get_opts()
-                .contains_internal(TaskOptsInternal::MAINTENANCE_TASK),
+            task.is_maintenance_task(),
             "Only maintenance task can be scheduled on root_worker."
         );
         task.set_owner_id(self.thread_id);
@@ -104,8 +102,7 @@ impl RootWorker {
         loop {
             if let Some(task) = self.find_task() {
                 debug_assert!(
-                    task.get_opts()
-                        .contains_internal(TaskOptsInternal::MAINTENANCE_TASK),
+                    task.is_maintenance_task(),
                     "Only maintenance task should be running on root_worker"
                 );
                 task.run();

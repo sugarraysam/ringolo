@@ -1,8 +1,7 @@
-#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unsafe_op_in_unsafe_fn, unused)]
 
 use crate::context;
 use crate::runtime::TaskOpts;
-use crate::spawn::TaskOptsInternal;
 use crate::task::ThreadId;
 use crate::task::layout::Vtable;
 use crate::task::node::TaskNode;
@@ -26,12 +25,14 @@ use std::sync::Arc;
 /// - 2 byte   :: task_opts (u16)
 #[repr(C, align(32))]
 pub(crate) struct Header {
-    /// Task state.
+    /// Task state (Lifecycle, Running, Complete, etc.).
     pub(super) state: State,
 
     /// Table of function pointers for executing actions on the task.
     pub(super) vtable: &'static Vtable,
 
+    /// The ID of the worker thread that currently "owns" this task.
+    /// Completions for this task must be processed by this thread.
     pub(super) owner_id: Cell<ThreadId>,
 
     /// We keep track of all locally scheduled IOs on io_uring as a signal to
@@ -131,13 +132,12 @@ impl Header {
             || self.owns_resources())
     }
 
-    pub(crate) fn is_maintenance_task(&self) -> bool {
-        self.opts
-            .contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
+    pub(crate) fn is_sticky(&self) -> bool {
+        self.opts.is_sticky()
     }
 
-    pub(crate) fn is_sticky(&self) -> bool {
-        self.opts.contains(TaskOpts::STICKY)
+    pub(crate) fn is_maintenance_task(&self) -> bool {
+        self.opts.is_maintenance_task()
     }
 
     pub(crate) fn has_pending_ios(&self) -> bool {

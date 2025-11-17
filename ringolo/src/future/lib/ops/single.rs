@@ -1,21 +1,24 @@
-#![allow(dead_code)]
+//! Single-shot `io_uring` opcodes.
+//!
+//! These types reflect the opcodes available in the `io_uring` submission queue.
+//! See the [`io_uring` crate documentation](https://docs.rs/io-uring/latest/io_uring/opcode/index.html)
+//! for all supported opcodes.
+
 use crate::future::lib::fd::AsRawOrDirect;
-use crate::future::lib::types::OpenHow;
+use crate::future::lib::ops::sockopt::{AnySockOpt, SetSockOptIf};
+use crate::future::lib::types::{
+    AddressFamily, EpollEvent, EpollOp, FallocateFlags, Futex2Flags, FutexWaiter, Mode, OFlag,
+    OpenHow, PosixFadviseAdvice, SockFlag, SockProtocol, SockType,
+};
 use crate::future::lib::{
-    AnySockOpt, BorrowedUringFd, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, SetSockOptIf,
-    parse,
+    BorrowedUringFd, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, parse,
 };
 use crate::sqe::IoError;
 use anyhow::anyhow;
 use either::Either;
 use io_uring::squeue::Entry;
 use io_uring::types::{Fd, Fixed, FsyncFlags, TimeoutFlags, Timespec};
-use nix::fcntl::{FallocateFlags, OFlag, PosixFadviseAdvice};
-use nix::sys::epoll::{EpollEvent, EpollOp};
-use nix::sys::socket::{AddressFamily, SockFlag, SockProtocol, SockType};
-use nix::sys::stat::Mode;
 use pin_project::pin_project;
-use rustix::thread::futex::WaitFlags;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
@@ -26,9 +29,9 @@ use std::pin::Pin;
 use std::task::Waker;
 use std::time::Duration;
 
+/// Accept a new connection on a socket.
 ///
-/// === Accept ===
-///
+/// Corresponds to [`io_uring_prep_accept`](https://man.archlinux.org/man/io_uring_prep_accept.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct Accept<'a> {
@@ -44,6 +47,7 @@ pub struct Accept<'a> {
 }
 
 impl<'a> Accept<'a> {
+    /// Create a new `Accept` operation.
     pub fn new(
         sockfd: BorrowedUringFd<'a>,
         fd_mode: KernelFdMode,
@@ -129,16 +133,17 @@ impl<'a> OpPayload for Accept<'a> {
     }
 }
 
+/// Cancel a previously submitted request.
 ///
-/// === AsyncCancel ===
-///
+/// Corresponds to [`io_uring_prep_cancel`](https://man.archlinux.org/man/io_uring_prep_cancel.3.en).
 #[derive(Debug, Clone)]
-pub(crate) struct AsyncCancel {
+pub struct AsyncCancel {
     entry: Option<io_uring::squeue::Entry>,
 }
 
 impl AsyncCancel {
-    pub(crate) fn new(builder: io_uring::types::CancelBuilder) -> Self {
+    /// Create a new `AsyncCancel` operation.
+    pub fn new(builder: io_uring::types::CancelBuilder) -> Self {
         Self {
             entry: Some(io_uring::opcode::AsyncCancel2::new(builder).build()),
         }
@@ -162,9 +167,9 @@ impl OpPayload for AsyncCancel {
     }
 }
 
+/// Bind a name to a socket.
 ///
-/// === Bind ===
-///
+/// Corresponds to [`io_uring_prep_bind`](https://man.archlinux.org/man/io_uring_prep_bind.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct Bind<'a> {
@@ -175,6 +180,7 @@ pub struct Bind<'a> {
 }
 
 impl<'a> Bind<'a> {
+    /// Create a new `Bind` operation.
     pub fn new(sockfd: BorrowedUringFd<'a>, addr: &SocketAddr) -> Self {
         let (addr, addr_len) = parse::socket_addr_to_c(addr);
 
@@ -209,9 +215,9 @@ impl<'a> OpPayload for Bind<'a> {
     }
 }
 
+/// Close a file descriptor.
 ///
-/// === Close ===
-///
+/// Corresponds to [`io_uring_prep_close`](https://man.archlinux.org/man/io_uring_prep_close.3.en).
 #[derive(Debug, Clone)]
 pub struct Close {
     fd: Either<Fd, Fixed>,
@@ -247,9 +253,9 @@ impl OpPayload for Close {
     }
 }
 
+/// Initiate a connection on a socket.
 ///
-/// === Connect ===
-///
+/// Corresponds to [`io_uring_prep_connect`](https://man.archlinux.org/man/io_uring_prep_connect.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct Connect<'a> {
@@ -261,6 +267,7 @@ pub struct Connect<'a> {
 }
 
 impl<'a> Connect<'a> {
+    /// Create a new `Connect` operation.
     pub fn new(sockfd: BorrowedUringFd<'a>, addr: &SocketAddr) -> Self {
         let (addr, addr_len) = parse::socket_addr_to_c(addr);
 
@@ -295,9 +302,9 @@ impl<'a> OpPayload for Connect<'a> {
     }
 }
 
+/// Control an epoll file descriptor.
 ///
-/// === EpollCtl ===
-///
+/// Corresponds to `io_uring_prep_epoll_ctl` (no docs available).
 #[derive(Debug)]
 #[pin_project]
 pub struct EpollCtl<'a> {
@@ -309,6 +316,7 @@ pub struct EpollCtl<'a> {
 }
 
 impl<'a> EpollCtl<'a> {
+    /// Create a new `EpollCtl` operation.
     pub fn try_new(
         epfd: BorrowedUringFd<'a>,
         fd: RawFd,
@@ -358,9 +366,9 @@ impl<'a> OpPayload for EpollCtl<'a> {
     }
 }
 
+/// Wait for an I/O event on an epoll file descriptor.
 ///
-/// === EpollWait ===
-///
+/// Corresponds to [`io_uring_prep_epoll_wait`](https://man.archlinux.org/man/io_uring_prep_epoll_wait.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct EpollWait<'a> {
@@ -372,6 +380,7 @@ pub struct EpollWait<'a> {
 }
 
 impl<'a> EpollWait<'a> {
+    /// Create a new `EpollWait` operation.
     pub fn new(epfd: BorrowedUringFd<'a>, max_events: usize, timeout_ms: isize) -> Self {
         Self {
             epfd,
@@ -415,9 +424,9 @@ impl<'a> OpPayload for EpollWait<'a> {
     }
 }
 
+/// Get an extended attribute value.
 ///
-/// === FGetXattr ===
-///
+/// Corresponds to [`io_uring_prep_fgetxattr`](https://man.archlinux.org/man/io_uring_prep_fgetxattr.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct FGetXattr<'a> {
@@ -430,6 +439,7 @@ pub struct FGetXattr<'a> {
 }
 
 impl<'a> FGetXattr<'a> {
+    /// Create a new `FGetXattr` operation.
     pub fn try_new(
         fd: BorrowedUringFd<'a>,
         name: impl Into<Vec<u8>>,
@@ -477,9 +487,9 @@ impl<'a> OpPayload for FGetXattr<'a> {
     }
 }
 
+/// Set an extended attribute value.
 ///
-/// === FSetXattr ===
-///
+/// Corresponds to [`io_uring_prep_fsetxattr`](https://man.archlinux.org/man/io_uring_prep_fsetxattr.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct FSetXattr<'a> {
@@ -492,6 +502,7 @@ pub struct FSetXattr<'a> {
 }
 
 impl<'a> FSetXattr<'a> {
+    /// Create a new `FSetXattr` operation.
     pub fn try_new(
         fd: BorrowedUringFd<'a>,
         name: impl Into<Vec<u8>>,
@@ -541,9 +552,9 @@ impl<'a> OpPayload for FSetXattr<'a> {
     }
 }
 
+/// Predeclare an access pattern for file data.
 ///
-/// === Fadvise ===
-///
+/// Corresponds to [`io_uring_prep_fadvise`](https://man.archlinux.org/man/io_uring_prep_fadvise.3.en).
 #[derive(Debug)]
 pub struct Fadvise<'a> {
     fd: BorrowedUringFd<'a>,
@@ -553,6 +564,7 @@ pub struct Fadvise<'a> {
 }
 
 impl<'a> Fadvise<'a> {
+    /// Create a new `Fadvise` operation.
     pub fn new(
         fd: BorrowedUringFd<'a>,
         offset: libc::off_t,
@@ -590,9 +602,9 @@ impl<'a> OpPayload for Fadvise<'a> {
     }
 }
 
+/// Manipulate file space.
 ///
-/// === Fallocate ===
-///
+/// Corresponds to [`io_uring_prep_fallocate`](https://man.archlinux.org/man/io_uring_prep_fallocate.3.en).
 #[derive(Debug)]
 pub struct Fallocate<'a> {
     fd: BorrowedUringFd<'a>,
@@ -602,6 +614,7 @@ pub struct Fallocate<'a> {
 }
 
 impl<'a> Fallocate<'a> {
+    /// Create a new `Fallocate` operation.
     pub fn new(
         fd: BorrowedUringFd<'a>,
         offset: libc::off_t,
@@ -640,9 +653,9 @@ impl<'a> OpPayload for Fallocate<'a> {
     }
 }
 
+/// Install a direct/fixed file descriptor.
 ///
-/// === FixedFdInstall ===
-///
+/// Corresponds to [`io_uring_prep_fixed_fd_install`](https://man.archlinux.org/man/io_uring_prep_fixed_fd_install.3.en).
 #[derive(Debug)]
 pub struct FixedFdInstall {
     fixed: Fixed,
@@ -650,10 +663,11 @@ pub struct FixedFdInstall {
 }
 
 impl FixedFdInstall {
+    /// Create a new `FixedFdInstall` operation.
     pub fn try_new(fd: OwnedUringFd, flags: Option<u32>) -> Result<Self, OpcodeError> {
         Ok(Self {
             // Safety: we are transferring ownership of this fd.
-            fixed: Fixed(unsafe { fd.leak_fixed()? }),
+            fixed: Fixed(unsafe { fd.leak_direct()? }),
             flags: flags.unwrap_or(0),
         })
     }
@@ -683,9 +697,9 @@ impl OpPayload for FixedFdInstall {
     }
 }
 
+/// Synchronize a file's in-core state with storage device.
 ///
-/// === Fsync ===
-///
+/// Corresponds to [`io_uring_prep_fsync`](https://man.archlinux.org/man/io_uring_prep_fsync.3.en).
 #[derive(Debug)]
 pub struct Fsync<'a> {
     fd: BorrowedUringFd<'a>,
@@ -693,6 +707,7 @@ pub struct Fsync<'a> {
 }
 
 impl<'a> Fsync<'a> {
+    /// Create a new `Fsync` operation.
     pub fn new(fd: BorrowedUringFd<'a>, flags: Option<FsyncFlags>) -> Self {
         Self {
             fd,
@@ -722,9 +737,9 @@ impl<'a> OpPayload for Fsync<'a> {
     }
 }
 
+/// Truncate a file to a specified length.
 ///
-/// === Ftruncate ===
-///
+/// Corresponds to [`io_uring_prep_ftruncate`](https://man.archlinux.org/man/io_uring_prep_ftruncate.3.en).
 #[derive(Debug)]
 pub struct Ftruncate<'a> {
     fd: BorrowedUringFd<'a>,
@@ -732,6 +747,7 @@ pub struct Ftruncate<'a> {
 }
 
 impl<'a> Ftruncate<'a> {
+    /// Create a new `Ftruncate` operation.
     pub fn new(fd: BorrowedUringFd<'a>, len: libc::off_t) -> Self {
         Self { fd, len }
     }
@@ -758,9 +774,9 @@ impl<'a> OpPayload for Ftruncate<'a> {
     }
 }
 
+/// Wait on a futex.
 ///
-/// === FutexWait ===
-///
+/// Corresponds to [`io_uring_prep_futex_wait`](https://man.archlinux.org/man/io_uring_prep_futex_wait.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct FutexWait {
@@ -768,16 +784,17 @@ pub struct FutexWait {
     futex: u32,
     val: u64,
     mask: u64,
-    flags: WaitFlags,
+    futex_flags: Futex2Flags,
 }
 
 impl FutexWait {
-    pub fn new(futex: u32, val: u64, mask: u64, flags: WaitFlags) -> Self {
+    /// Create a new `FutexWait` operation.
+    pub fn new(futex: u32, val: u64, mask: u64, futex_flags: Futex2Flags) -> Self {
         Self {
             futex,
             val,
             mask,
-            flags,
+            futex_flags,
         }
     }
 }
@@ -789,8 +806,12 @@ impl OpPayload for FutexWait {
         let this = self.project();
 
         let futex_ptr = std::ptr::from_ref(&*this.futex);
-        let entry =
-            io_uring::opcode::FutexWait::new(futex_ptr, *this.val, *this.mask, this.flags.bits());
+        let entry = io_uring::opcode::FutexWait::new(
+            futex_ptr,
+            *this.val,
+            *this.mask,
+            this.futex_flags.bits(),
+        );
 
         Ok(entry.build())
     }
@@ -805,9 +826,111 @@ impl OpPayload for FutexWait {
     }
 }
 
+/// Wait on multiple futexes at the same time.
 ///
-/// === Listen ===
+/// Corresponds to [`io_uring_prep_futex_waitv`](https://man.archlinux.org/man/io_uring_prep_futex_waitv.3.en)
+#[derive(Debug)]
+#[pin_project]
+pub struct FutexWaitV {
+    #[pin]
+    futexv: Vec<FutexWaiter>,
+}
+
+impl FutexWaitV {
+    /// Create a new `FutexWaitV` operation.
+    pub fn new(futexv: Vec<FutexWaiter>) -> Self {
+        Self { futexv }
+    }
+}
+
+impl OpPayload for FutexWaitV {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        let futexv_ptr = this.futexv.as_ptr();
+        let entry = io_uring::opcode::FutexWaitV::new(futexv_ptr.cast(), this.futexv.len() as u32);
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+/// Wake up waiters on a specific futex.
 ///
+/// This operation wakes up at most `val` waiters that are waiting on the
+/// futex address. It is equivalent to the `FUTEX_WAKE_BITSET` operation.
+///
+/// Corresponds to [`io_uring_prep_futex_wake`](https://man.archlinux.org/man/io_uring_prep_futex_wake.3.en)
+#[derive(Debug)]
+#[pin_project]
+pub struct FutexWake {
+    #[pin]
+    futex: u32,
+    val: u64,
+    mask: u64,
+    futex_flags: Futex2Flags,
+}
+
+impl FutexWake {
+    /// Create a new `FutexWake` operation.
+    ///
+    /// # Arguments
+    ///
+    /// * `futex` - The value of the futex (note: this operation wakes the address of this field).
+    /// * `val` - The maximum number of waiters to wake (e.g., `1` to wake one, `u32::MAX` to wake all).
+    /// * `mask` - The bitmask to match against waiters.
+    /// * `futex_flags` - Flags describing the futex size (e.g. [`Futex2Flags::SIZE_U32`])
+    ///   and scope (e.g. [`Futex2Flags::PRIVATE`]).
+    pub fn new(futex: u32, val: u64, mask: u64, futex_flags: Futex2Flags) -> Self {
+        Self {
+            futex,
+            val,
+            mask,
+            futex_flags,
+        }
+    }
+}
+
+impl OpPayload for FutexWake {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        let futex_ptr = std::ptr::from_ref(&*this.futex);
+        let entry = io_uring::opcode::FutexWake::new(
+            futex_ptr,
+            *this.val,
+            *this.mask,
+            this.futex_flags.bits(),
+        );
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
+/// Listen for connections on a socket.
+///
+/// Corresponds to [`io_uring_prep_listen`](https://man.archlinux.org/man/io_uring_prep_listen.3.en).
 #[derive(Debug)]
 pub struct Listen<'a> {
     sockfd: BorrowedUringFd<'a>,
@@ -815,6 +938,7 @@ pub struct Listen<'a> {
 }
 
 impl<'a> Listen<'a> {
+    /// Create a new `Listen` operation.
     pub fn new(sockfd: BorrowedUringFd<'a>, backlog: i32) -> Self {
         Self { sockfd, backlog }
     }
@@ -841,9 +965,9 @@ impl<'a> OpPayload for Listen<'a> {
     }
 }
 
+/// Open and possibly create a file relative to a directory file descriptor.
 ///
-/// === OpenAt ===
-///
+/// Corresponds to [`io_uring_prep_openat`](https://man.archlinux.org/man/io_uring_prep_openat.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct OpenAt {
@@ -856,6 +980,7 @@ pub struct OpenAt {
 }
 
 impl OpenAt {
+    /// Create a new `OpenAt` operation.
     pub fn try_new(
         fd_mode: KernelFdMode,
         dirfd: Option<RawFd>,
@@ -908,9 +1033,9 @@ impl OpPayload for OpenAt {
     }
 }
 
+/// Open and possibly create a file with extended configuration.
 ///
-/// === OpenAt2 ===
-///
+/// Corresponds to [`io_uring_prep_openat2`](https://man.archlinux.org/man/io_uring_prep_openat2.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct OpenAt2 {
@@ -919,10 +1044,11 @@ pub struct OpenAt2 {
     #[pin]
     pathname: CString,
     #[pin]
-    how: io_uring::types::OpenHow,
+    how: OpenHow,
 }
 
 impl OpenAt2 {
+    /// Create a new `OpenAt2` operation.
     pub fn try_new(
         fd_mode: KernelFdMode,
         dirfd: Option<RawFd>,
@@ -940,7 +1066,7 @@ impl OpenAt2 {
             fd_mode,
             dirfd,
             pathname,
-            how: how.into(),
+            how,
         })
     }
 }
@@ -955,7 +1081,7 @@ impl OpPayload for OpenAt2 {
         let how_ptr = std::ptr::from_ref(&*this.how);
 
         Ok(
-            io_uring::opcode::OpenAt2::new(dirfd, this.pathname.as_ptr(), how_ptr)
+            io_uring::opcode::OpenAt2::new(dirfd, this.pathname.as_ptr(), how_ptr.cast())
                 .file_index(this.fd_mode.try_into_slot()?)
                 .build(),
         )
@@ -970,9 +1096,9 @@ impl OpPayload for OpenAt2 {
     }
 }
 
+/// No-operation. Useful for testing and benchmarking.
 ///
-/// === Nop ===
-///
+/// Corresponds to [`io_uring_prep_nop`](https://man.archlinux.org/man/io_uring_prep_nop.3.en).
 #[derive(Debug)]
 pub struct Nop;
 
@@ -993,9 +1119,9 @@ impl OpPayload for Nop {
     }
 }
 
+/// Create an endpoint for communication.
 ///
-/// === Socket ===
-///
+/// Corresponds to [`io_uring_prep_socket`](https://man.archlinux.org/man/io_uring_prep_socket.3.en).
 #[derive(Debug)]
 pub struct Socket {
     fd_mode: KernelFdMode,
@@ -1005,6 +1131,7 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Create a new `Socket` operation.
     pub fn new(
         fd_mode: KernelFdMode,
         addr_family: AddressFamily,
@@ -1042,9 +1169,9 @@ impl OpPayload for Socket {
     }
 }
 
+/// Set the socket options.
 ///
-/// === SetSockOpt ===
-///
+/// Corresponds to [`io_uring_prep_setsockopt`] (no docs).
 #[derive(Debug)]
 #[pin_project]
 pub struct SetSockOpt<'a> {
@@ -1058,6 +1185,7 @@ pub struct SetSockOpt<'a> {
 }
 
 impl<'a> SetSockOpt<'a> {
+    /// Create a new `SetSockOpt` operation.
     pub fn new<O: Into<AnySockOpt>>(sockfd: BorrowedUringFd<'a>, opt: O) -> Self {
         Self {
             sockfd,
@@ -1084,9 +1212,9 @@ impl<'a> OpPayload for SetSockOpt<'a> {
     }
 }
 
+/// Register a timeout or timer.
 ///
-/// === Timeout ===
-///
+/// Corresponds to [`io_uring_prep_timeout`](https://man.archlinux.org/man/io_uring_prep_timeout.3.en).
 #[derive(Debug)]
 #[pin_project]
 pub struct Timeout {
@@ -1139,16 +1267,17 @@ impl OpPayload for Timeout {
     }
 }
 
+/// Remove an existing timeout.
 ///
-/// === TimeoutRemove ===
-///
+/// Corresponds to [`io_uring_prep_timeout_remove`](https://man.archlinux.org/man/io_uring_prep_timeout_remove.3.en).
 #[derive(Debug, Clone)]
-pub(crate) struct TimeoutRemove {
+pub struct TimeoutRemove {
     entry: Option<io_uring::squeue::Entry>,
 }
 
 impl TimeoutRemove {
-    pub(crate) fn new(user_data: u64) -> Self {
+    /// Create a new `TimeoutRemove` operation.
+    pub fn new(user_data: u64) -> Self {
         Self {
             entry: Some(io_uring::opcode::TimeoutRemove::new(user_data).build()),
         }
@@ -1177,7 +1306,8 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::future::lib::{BorrowedUringFd, ReuseAddr};
+    use crate::future::lib::BorrowedUringFd;
+    use crate::future::lib::ops::sockopt::ReuseAddr;
     use crate::test_utils::*;
     use crate::{self as ringolo, future::lib::Op, task::JoinHandle};
     use anyhow::{Context, Result};

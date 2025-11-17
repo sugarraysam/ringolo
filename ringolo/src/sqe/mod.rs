@@ -1,4 +1,60 @@
-#![allow(dead_code)]
+//! # Submission Queue Entry (SQE) Backends
+//!
+//! This module provides the high-level abstractions that map 1:1 to specific
+//! `io_uring` submission strategies. It bridges the gap between Rust `Future`s
+//! and the raw kernel ring interface.
+//!
+//! ## SQE Backends
+//!
+//! The runtime supports four distinct patterns of submission, each optimized for
+//! specific kernel features:
+//!
+//! 1.  **[`SqeSingle`]:** Maps to a standard, single `io_uring` SQE.
+//!     * *Kernel Feature:* Standard opcodes (e.g., `read`, `write`, `close`).
+//!     * *Behavior:* One Submission <-> One Completion.
+//!
+//! 2.  **[`SqeList`] (Batch):** Submits multiple independent SQEs in a single syscall.
+//!     * *Kernel Feature:* `io_uring_enter` with multiple entries.
+//!     * *Behavior:* Reduces syscall overhead. Completions arrive in any order.
+//!
+//! 3.  **[`SqeList`] (Chain):** Submits a linked sequence of SQEs.
+//!     * *Kernel Feature:* `IOSQE_IO_LINK`.
+//!     * *Behavior:* The kernel guarantees sequential execution. If one fails,
+//!         the rest are cancelled. Used for "open-then-read-then-close" patterns.
+//!
+//! 4.  **[`SqeStream`]:** Handles multi-shot operations.
+//!     * *Kernel Feature:* `IORING_CQE_F_MORE` (e.g., `accept_multi`, `recv_multi`).
+//!     * *Behavior:* One Submission <-> Multiple Completions (Stream).
+//!
+//! ## The Submission Lifecycle
+//!
+//! All backends implement two core traits that drive the internal state machine:
+//!
+//! 1.  **[`Submittable`]:** Responsible for reserving space in the [`RawSqeSlab`],
+//!     and pushing the entries to the `io_uring` SQ ring. Importantly, this trait
+//!     only *pushes* SQEs into the SQ ring and does not call `io_uring_enter`.
+//!     This is intentional to enable higher-level batching and hand over the
+//!     actual submission responsibility to the scheduler.
+//! 2. **[`Completable`]:** Responsible for handling the asynchronous result when
+//!    the [`RawSqe`] transitions to [`RawSqeState::Ready`].
+//!
+//! ### Recovery from [`IoError::SqRingFull`]
+//!
+//! A critical feature of this design is the ability to handle backpressure from the kernel.
+//! If [`Submittable::submit`] returns an [`IoError::SqRingFull`], the runtime does not panic.
+//! Instead, the task yields, allowing the scheduler to process pending completions (CQEs)
+//! to free up space in the ring, before retrying the submission.
+//!
+//! [`SqeSingle`]: crate::sqe::SqeSingle
+//! [`SqeList`]: crate::sqe::SqeList
+//! [`SqeStream`]: crate::sqe::SqeStream
+//! [`Submittable`]: crate::sqe::Submittable
+//! [`Completable`]: crate::sqe::Completable
+//! [`RawSqeSlab`]: crate::context::RawSqeSlab
+//! [`RawSqe`]: crate::sqe::RawSqe
+//! [`RawSqeState::Ready`]: crate::sqe::RawSqeState::Ready
+//! [`IoError::SqRingFull`]: crate::sqe::IoError::SqRingFull
+//! [`Submittable::submit`]: crate::sqe::Submittable::submit
 
 use crate::runtime::{Schedule, SchedulerPanic};
 use std::future::Future;
@@ -23,17 +79,27 @@ pub(crate) use self::single::SqeSingle;
 pub(crate) mod stream;
 pub(crate) use self::stream::SqeStream;
 
+/// A trait for backends that can push entries to the `io_uring` Submission Queue.
 pub(crate) trait Submittable {
-    /// We pas the waker so we get access to the RawTask Header.
+    /// Submits the operation to the ring.
+    ///
+    /// If this returns `Err(IoError::SqRingFull)`, the runtime will handle the
+    /// backpressure and retry later.
+    ///
+    /// The `waker` is passed so it can be stored in the `RawSqe` to wake the
+    /// task upon completion.
     fn submit(&mut self, waker: &Waker) -> Result<(), IoError>;
 }
 
+/// A trait for backends that can process a completed `RawSqe`.
 pub(crate) trait Completable {
     type Output;
 
-    /// We pas the waker so we get access to the RawTask Header but also because
-    /// implementation of completable needs to guarantee the associated task will
-    /// be woken up in the future.
+    /// Polls for completion.
+    ///
+    /// Implementations must check the slab for the result. If the result is not
+    /// ready, they must ensure the `waker` is updated in the `RawSqe` to guarantee
+    /// future notifications.
     fn poll_complete(&mut self, waker: &Waker) -> Poll<Self::Output>;
 }
 
@@ -44,6 +110,10 @@ pub(super) enum State {
     Completed,
 }
 
+/// A generic Future wrapper that drives the state machine of an SQE backend.
+///
+/// It manages the transition from `Initial` (calling `submit`) to `Submitted`
+/// (calling `poll_complete`).
 #[derive(Debug)]
 pub(crate) struct Sqe<T: Submittable + Completable + Unpin> {
     state: State,
@@ -59,12 +129,9 @@ impl<T: Submittable + Completable + Unpin> Sqe<T> {
         }
     }
 
+    #[allow(unused)]
     pub(crate) fn get(&self) -> &T {
         &self.inner
-    }
-
-    pub(crate) fn get_mut(&mut self) -> &mut T {
-        &mut self.inner
     }
 }
 
@@ -128,6 +195,7 @@ impl<E, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin + Send
     }
 }
 
+#[allow(unused)]
 #[derive(Debug)]
 pub(crate) struct SqeCollection<T: Submittable + Completable + Unpin> {
     inner: Vec<(usize, Sqe<T>)>,
@@ -139,6 +207,7 @@ pub(crate) struct SqeCollection<T: Submittable + Completable + Unpin> {
 }
 
 impl<T: Submittable + Completable + Unpin> SqeCollection<T> {
+    #[allow(unused)]
     pub(crate) fn new(inner: Vec<T>) -> Self {
         let results = (0..inner.len()).map(|_| None).collect();
         Self {
@@ -185,6 +254,8 @@ impl<E: Unpin, T: Submittable + Completable<Output = Result<E, IoError>> + Unpin
     }
 }
 
+// TODO: fix SqeCollection flaky tests
+#[allow(unused_imports)]
 #[cfg(test)]
 mod tests {
     use super::list::{SqeList, SqeListKind};

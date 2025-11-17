@@ -1,5 +1,7 @@
+#![allow(unused)]
+
 use crate::runtime::{AddMode, PanicReason, TaskOpts, YieldReason};
-use crate::spawn::{TaskMetadata, TaskOptsInternal};
+use crate::spawn::TaskMetadata;
 use crate::task::Id;
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -60,7 +62,7 @@ impl Tracker {
         // Do not record maintenance task otherwise it is super annoying to keep
         // track of in tests expectations.
         if let Call::Spawn { opts, .. } | Call::Schedule { opts, .. } = &call
-            && opts.contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
+            && opts.is_maintenance_task()
         {
             return;
         }

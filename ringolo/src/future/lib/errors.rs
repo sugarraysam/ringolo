@@ -26,6 +26,7 @@ pub enum OpcodeError {
 }
 
 impl OpcodeError {
+    #[allow(unused)]
     pub(crate) fn raw_os_error(&self) -> Option<i32> {
         match self {
             OpcodeError::Io(e) => e.raw_os_error(),

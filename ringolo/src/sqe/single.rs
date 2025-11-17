@@ -10,6 +10,9 @@ pub(crate) enum SqeSingleState {
     Completed,
 }
 
+/// The simplest SQE backend, representing a single standard `io_uring` operation.
+///
+/// Maps 1:1 with a standard syscall replacement (e.g., `fsync`, `read`, `write`).
 #[derive(Debug)]
 pub(crate) struct SqeSingle {
     state: SqeSingleState,

@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use crate::runtime::runtime::ThreadNameFn;
 use anyhow::{Result, anyhow};
 use std::ffi::CStr;

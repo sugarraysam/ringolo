@@ -1,4 +1,4 @@
-#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unsafe_op_in_unsafe_fn, unused)]
 
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -26,6 +26,7 @@ pub(super) struct WakerRef<'a> {
     _p: PhantomData<&'a ()>,
 }
 
+#[doc(hidden)]
 impl Deref for WakerRef<'_> {
     type Target = Waker;
 

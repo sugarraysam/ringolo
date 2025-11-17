@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use crossbeam_deque::Worker as CbWorker;
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -18,7 +19,7 @@ pub(super) struct ThreadPool {
     // - spawn other workers
     // - drive `root_future` to completion
     // - init runtime shutdown sequence
-    pub(super) root_worker: Arc<RootWorker>,
+    pub(super) root_worker: Rc<RootWorker>,
 
     // The "regular" workers, participate in work stealing, and drive completion
     // of every other tasks. They will park themselves if there is nothing to be
@@ -43,7 +44,7 @@ impl ThreadPool {
 
         // Init root_worker *before* other threads to ensure it gets `ringolo-0`
         // thread name.
-        let root_worker = Arc::new(RootWorker::new(scheduler));
+        let root_worker = Rc::new(RootWorker::new(scheduler));
 
         let workers = local_queues
             .into_iter()
@@ -135,7 +136,7 @@ fn spawn_worker_thread(
 // We abstract both workers behind enum dispatch because the EventLoop trait is not
 // dyn compatible as it is not object safe, so we can't do dyn coercion.
 pub(super) enum WorkerRef<'a> {
-    Root(&'a Arc<RootWorker>),
+    Root(&'a Rc<RootWorker>),
     NonRoot(&'a Arc<Worker>),
 }
 
@@ -143,7 +144,7 @@ impl ThreadPool {
     #[track_caller]
     pub(super) fn with_worker<F, R>(&self, thread_id: &ThreadId, f: F) -> R
     where
-        F: FnOnce(WorkerRef) -> R,
+        F: FnOnce(WorkerRef<'_>) -> R,
     {
         let worker = if thread_id == &self.root_worker.thread_id {
             WorkerRef::Root(&self.root_worker)

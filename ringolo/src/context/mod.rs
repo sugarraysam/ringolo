@@ -1,3 +1,33 @@
+//! # Runtime Context
+//!
+//! This module manages the internal state of the runtime, split into two distinct
+//! abstraction layers to balance high-performance I/O with multi-threaded coordination:
+//!
+//! ## 1. The `Core` Context (Thread-Local)
+//!
+//! The [`Core`] is the "hot path" context. It is strictly **thread-local** and initialized
+//! once per worker thread.
+//!
+//! * **Design:** It uses internal mutability (`RefCell`) rather than synchronization primitives (`Mutex`/`RwLock`).
+//! * **Purpose:** It holds resources that are accessed frequently during the event loop, such as the `io_uring` instance ([`SingleIssuerRing`]), the slab allocator for I/O requests ([`RawSqeSlab`]), and the currently executing task.
+//! * **Benefit:** This ensures that the main polling loop incurs zero synchronization overhead (atomics/locks) when submitting I/O or switching tasks on the same thread.
+//!
+//! ## 2. The `Shared` Context (Global)
+//!
+//! The [`Shared`] context is **global** and thread-safe. It is wrapped in an `Arc` and accessible by all workers.
+//!
+//! * **Design:** It uses synchronization primitives (`RwLock`, `AtomicUsize`) to manage concurrent access.
+//! * **Purpose:** It handles coordination logic, such as:
+//!     * **Work Stealing:** Tracking which workers are busy or idle.
+//!     * **Parking/Unparking:** Managing the stack of sleeping threads using a LIFO strategy for cache locality.
+//!     * **Lifecycle:** Broadcasting shutdown signals.
+//!     * **Cross-thread notification:** Allowing one thread to wake up another.
+//!
+//! [`Core`]: crate::context::Core
+//! [`SingleIssuerRing`]: crate::context::SingleIssuerRing
+//! [`RawSqeSlab`]: crate::context::RawSqeSlab
+//! [`Shared`]: crate::context::Shared
+
 // Keep unused context methods to provide rich API for future developers.
 #![allow(dead_code)]
 
@@ -12,15 +42,15 @@ use std::thread_local;
 mod core;
 pub(crate) use core::Core;
 
-pub mod maintenance;
+pub(crate) mod maintenance;
 
-pub mod ring;
+pub(crate) mod ring;
 pub(crate) use ring::SingleIssuerRing;
 
-pub mod shared;
+pub(crate) mod shared;
 pub(crate) use shared::Shared;
 
-pub mod slab;
+pub(crate) mod slab;
 pub(crate) use slab::RawSqeSlab;
 
 mod slots;
@@ -227,14 +257,15 @@ where
 }
 
 /// The macro accepts a pattern that looks just like a closure.
-/// |$scheduler:ident| is the argument name (e.g., |s| or |scheduler|)
-/// $body:block is the code block that follows.
+/// `|$scheduler:ident|`` is the argument name (e.g., |s| or |scheduler|)
+/// `$body:block` is the code block that follows.
 //
 // Could not make this work without a macro. Tried a few things but:
 // - can't coerce a scheduler reference to &dyn Schedule because of Sized bound
 // - can't impl enum static dispatch (impl Schedule on Context) because
 //   Task<Self> arguments
 // - `for<S: Schedule> FnOnce(&S)` HRBT not yet supported: https://github.com/rust-lang/rust/issues/108185
+#[doc(hidden)]
 #[macro_export]
 macro_rules! with_scheduler {
     (|$scheduler:ident| $body:block) => {

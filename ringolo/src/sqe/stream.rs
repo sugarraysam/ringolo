@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use crate::context;
 use crate::runtime::{Schedule, SchedulerPanic};
 use crate::sqe::{CompletionHandler, IoError, RawSqe, Submittable};
@@ -15,6 +17,11 @@ pub(crate) enum SqeStreamState {
     Cancelled,
 }
 
+/// A backend for Multi-shot `io_uring` operations.
+///
+/// Unlike standard operations, a Multi-shot SQE (like `recv_multi` or `accept_multi`)
+/// is submitted once but generates a stream of Completion Queue Entries (CQEs).
+/// The kernel indicates more data is available via the `IORING_CQE_F_MORE` flag.
 #[derive(Debug)]
 pub(crate) struct SqeStream {
     state: SqeStreamState,

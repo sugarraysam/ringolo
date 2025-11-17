@@ -1,12 +1,14 @@
 use super::*;
 use crate as ringolo;
 use crate::context;
-use crate::context::maintenance::task::MAINTENANCE_TASK_OPTS;
-use crate::future::lib::{KernelFdMode, OpenAt};
-use crate::future::lib::{Nop, Op};
+use crate::future::lib::ops::{Nop, OpenAt};
+use crate::future::lib::types::{Mode, OFlag};
+use crate::future::lib::{KernelFdMode, Op};
 use crate::runtime::waker::Wake;
-use crate::runtime::{AddMode, Builder, Schedule, TaskRegistry, YieldReason, get_root};
-use crate::spawn::{TaskMetadata, TaskOpts};
+use crate::runtime::{
+    AddMode, Builder, PanicReason, Schedule, SchedulerPanic, TaskRegistry, YieldReason, get_root,
+};
+use crate::spawn::{MAINTENANCE_TASK_OPTS, TaskOpts};
 use crate::sqe::{Sqe, SqeCollection};
 use crate::task::JoinHandle;
 use crate::test_utils::*;
@@ -14,8 +16,6 @@ use crate::time::{Sleep, YieldNow};
 use crate::utils::scheduler::*;
 use crate::utils::thread::get_current_thread_name;
 use anyhow::Result;
-use nix::fcntl::OFlag;
-use nix::sys::stat::Mode;
 use rstest::rstest;
 use static_assertions::assert_impl_all;
 use std::sync::Arc;
@@ -87,6 +87,13 @@ fn test_sq_batch_too_large() -> Result<()> {
     }));
 
     assert!(res.is_err());
+    assert!(matches!(
+        res.unwrap_err()
+            .downcast_ref::<SchedulerPanic>()
+            .map(|p| p.reason),
+        Some(PanicReason::SqBatchTooLarge)
+    ));
+
     Ok(())
 }
 

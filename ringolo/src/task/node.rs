@@ -12,13 +12,36 @@ use crate::runtime::{
     OrphanPolicy, SPILL_TO_HEAP_THRESHOLD, TaskMetadata, TaskOpts, TaskRegistry, get_orphan_root,
     get_root,
 };
-use crate::spawn::TaskOptsInternal;
 use crate::task::Id;
 
-// We implement Structured Concurrency and track the parent<->children relationship
-// of tasks. This is useful to allow implementing cancellation APIs that don't require
-// passing tokens around and put the responsibility on the user to periodically
-// check for cancellation signals.
+/// Represents a single node in the global task tree.
+///
+/// `TaskNode` is the core data structure that enables [Structured Concurrency]
+/// in `ringolo`. It tracks the parent-child relationships of all tasks,
+/// which is what allows for powerful, token-less [cancellation APIs].
+///
+/// ## Key Design Decisions
+///
+/// * **Parent Reference:** The `parent` is a `Weak<TaskNode>` to prevent
+///   reference cycles, as children are owned by the parent via `Arc<TaskNode>`.
+///
+/// * **Child Collection:** We use a `LazyLock<DashMap<...>>` for `children`.
+///     * `LazyLock`: Most tasks are leaf nodes. This avoids allocating a
+///       `DashMap` until a task spawns its first child.
+///     * `DashMap`: Provides `O(1)` child removal and thread-safe,
+///       shard-based concurrency, which is crucial as tasks (and their
+///       `TaskNode`) are released from different threads.
+///
+/// * **Child Count:** A separate `AtomicUsize` (`child_count`) allows for
+///   an `O(1)` [`TaskNode::has_children()`] check without initializing the `LazyLock`
+///   or iterating `DashMap` shards.
+///
+/// * **Root Nodes:** The tree has two special roots: `ROOT_NODE` for regular
+///   tasks and `ORPHAN_ROOT_NODE` for tasks whose parents exited under
+///   the [`OrphanPolicy::Permissive`].
+///
+/// [Structured Concurrency]: crate#structured-concurrency
+/// [cancellation APIs]: crate::runtime::cancel
 pub(crate) struct TaskNode {
     pub(crate) id: Id,
 
@@ -82,7 +105,7 @@ impl TaskNode {
         let opts = opts.unwrap_or_default();
 
         // Background tasks are owned by the root and can outlive the parent.
-        let parent = if opts.contains(TaskOpts::BACKGROUND_TASK) {
+        let parent = if opts.is_background_task() {
             get_root()
         } else {
             // There are two edge cases where tasks are spawned *outside* of polling,
@@ -116,6 +139,7 @@ impl TaskNode {
         child
     }
 
+    #[allow(unused)]
     fn parent(&self) -> Option<Arc<TaskNode>> {
         self.parent.lock().as_ref().and_then(|p| p.upgrade())
     }
@@ -242,8 +266,7 @@ impl TaskNode {
     }
 
     pub(crate) fn is_maintenance_task(&self) -> bool {
-        self.opts
-            .contains_internal(TaskOptsInternal::MAINTENANCE_TASK)
+        self.opts.is_maintenance_task()
     }
 }
 
@@ -265,9 +288,8 @@ impl Drop for TaskNode {
     fn drop(&mut self) {
         if self.has_children() && !self.registry.is_closed() {
             let policy_enforced = matches!(self.registry.orphan_policy(), OrphanPolicy::Enforced);
-            let cancel_on_exit = self.opts.contains(TaskOpts::CANCEL_ALL_CHILDREN_ON_EXIT);
 
-            if policy_enforced || cancel_on_exit {
+            if policy_enforced || self.opts.cancel_all_on_exit() {
                 let stats = self.recursive_cancel_all();
                 let msg = if policy_enforced {
                     "OrphanPolicy is enforced"
@@ -290,21 +312,16 @@ impl Drop for TaskNode {
     }
 }
 
+/// A summary of a cancellation operation.
+///
+/// This struct is returned by cancellation functions to report
+/// how many tasks were visited and how many were cancelled.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct CancellationStats {
     /// Total number of task nodes visited during the traversal.
     pub visited: usize,
-    /// Number of tasks that matched the predicate and were shut down.
+    /// Number of tasks that matched the predicate and were cancelled.
     pub cancelled: usize,
-}
-
-impl CancellationStats {
-    pub fn new(visited: usize) -> Self {
-        Self {
-            visited,
-            cancelled: 0,
-        }
-    }
 }
 
 impl std::ops::AddAssign for CancellationStats {
@@ -381,6 +398,7 @@ impl Cancel {
     }
 }
 
+#[doc(hidden)]
 impl Deref for Cancel {
     type Target = TaskNode;
     fn deref(&self) -> &Self::Target {

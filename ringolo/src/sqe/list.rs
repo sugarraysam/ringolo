@@ -1,6 +1,7 @@
+#![allow(unused)]
+
 use crate::context;
 use crate::context::slab::SlabReservedBatch;
-use std::sync::Arc;
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
 use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
@@ -8,12 +9,15 @@ use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
 use std::io::{self};
 use std::iter;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Poll, Waker};
 
-// Batch and Chain APIs resolve to this type
-//
-// We use Arc<Atomic> for remaining counter as we need SqeList to be Sync + Send.
+/// A backend for submitting multiple SQEs that share a single lifecycle.
+///
+/// This struct handles both **Batch** (parallel) and **Chain** (sequential) submissions.
+/// It maintains a reference count of pending completions and only wakes the
+/// parent task when *all* operations in the list are complete.
 pub(crate) struct SqeList {
     state: SqeListState,
 }
@@ -30,15 +34,16 @@ pub(crate) enum SqeListState {
     Completed,
 }
 
+/// Defines the execution strategy for a list of SQEs.
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 pub(crate) enum SqeListKind {
+    /// **Batch Execution:**
+    /// Submits independent SQEs. They execute concurrently in the kernel.
     Batch,
 
-    // Chain API:
-    // - The next SQE will not be started until the previous one completes.
-    // - chain of requests must be submitted together as one batch
-    // - If any request in a chained sequence fails, the entire chain is aborted
-    // - CQEs will come in order, but may be interleaved
+    /// **Chain Execution (`IOSQE_IO_LINK`):**
+    /// Submits linked SQEs. The kernel guarantees they execute strictly sequentially.
+    /// If an SQE in the middle of the chain fails, subsequent SQEs are cancelled.
     Chain,
 }
 
@@ -186,18 +191,27 @@ impl From<SqeList> for Sqe<SqeList> {
 }
 
 // Trait so we can use either SqeBatchBuilder or SqeChainBuilder in future lib.
-pub trait SqeListBuilder {
+pub(crate) trait SqeListBuilder {
     fn add_entry(self, entry: Entry, flags: Option<Flags>) -> Self;
 
     fn build(self) -> SqeList;
 }
 
-// Contract on SqeBatch is:
-// - all SQEs submitted in `io_uring` as part of the same `io_uring_enter` syscall
-// - SQEs can complete in any order BUT result return will respect order of insertion
-// - will only wake up Future when all SQEs have completed
+/// Builder for constructing a parallel batch of I/O requests.
+///
+/// Use this when you have multiple independent operations (e.g., reading from
+/// 5 different sockets) and want to submit them in a single syscall.
+///
+/// **SqeBatch guarantees:**
+/// - All SQEs in this batch will be submitted as part of the same `io_uring_enter`
+///   syscall.
+/// - Results are returned in order of insertion, despite the fact that SQEs can
+///   complete in any order in the kernel.
+/// - The future will only be woken up after ALL SQEs have completed.
+/// - If one SQE fails, all the other SQEs still execute. There is no short-circuit
+///   as opposed to SqeChain.
 #[derive(Debug)]
-pub struct SqeBatchBuilder {
+pub(crate) struct SqeBatchBuilder {
     inner: SqeListBuilderInner,
 }
 
@@ -208,7 +222,7 @@ impl Default for SqeBatchBuilder {
 }
 
 impl SqeBatchBuilder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: SqeListBuilderInner::new(SqeListKind::Batch),
         }
@@ -226,16 +240,21 @@ impl SqeListBuilder for SqeBatchBuilder {
     }
 }
 
-// Contract for SqeChain is:
-// - all SQEs submitted in `io_uring` as part of the same `io_uring_enter` syscall
-// - SQEs execute serially, in the order they were appended, they are linked with
-//   IO_LINK flag.
-// - The tail of the chain is denoted by the first SQE that does not have this flag set.
-// - If one of the SQE fails, all of the remaining SQEs will complete with an error.
-// - The returned results respect the order of insertion in the builder.
-// - We only wake up the Future after all SQEs have complete
+/// Builder for constructing a sequential chain of I/O requests.
+///
+/// Use this when operations depend on order (e.g., `open` -> `read` -> `close`).
+/// This utilizes the `IOSQE_IO_LINK` feature of `io_uring`.
+///
+/// **SqeChain guarantees:**
+/// - All SQEs in this chain will be submitted as part of the same `io_uring_enter`
+///   syscall.
+/// - SQEs execute serially, in the order they were appended.
+/// - If one of the SQE fails, all of the remaining SQEs are cancelled and
+///   complete with an `libc::ECANCELLED` error.
+/// - The returned results respect the order of insertion in the builder.
+/// - We only wake up the Future after all SQEs have complete
 #[derive(Debug)]
-pub struct SqeChainBuilder {
+pub(crate) struct SqeChainBuilder {
     inner: SqeListBuilderInner,
 }
 
@@ -246,7 +265,7 @@ impl Default for SqeChainBuilder {
 }
 
 impl SqeChainBuilder {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             inner: SqeListBuilderInner::new(SqeListKind::Chain),
         }
@@ -370,7 +389,7 @@ mod tests {
     use crate::runtime::Builder;
     use crate::sqe::RawSqeState;
     use crate::test_utils::*;
-    use anyhow::{anyhow, Result};
+    use anyhow::{Result, anyhow};
     use either::Either;
     use rstest::rstest;
     use std::pin::pin;

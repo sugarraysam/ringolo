@@ -479,13 +479,6 @@ impl State {
         prev.ref_count() == 1
     }
 
-    /// Returns `true` if the task should be released.
-    pub(super) fn ref_dec_twice(&self) -> bool {
-        let prev = Snapshot(self.val.fetch_sub(2 * REF_ONE, Ordering::AcqRel));
-        debug_assert!(prev.ref_count() >= 2);
-        prev.ref_count() == 2
-    }
-
     fn fetch_update_action<F, T>(&self, mut f: F) -> T
     where
         F: FnMut(Snapshot) -> (T, Option<Snapshot>),

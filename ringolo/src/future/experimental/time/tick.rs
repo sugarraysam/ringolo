@@ -1,4 +1,5 @@
-use crate::future::lib::{Multishot, TimeoutMultishot};
+use crate::future::lib::Multishot;
+use crate::future::lib::ops::TimeoutMultishot;
 use crate::sqe::IoError;
 use futures::Stream;
 use pin_project::pin_project;
@@ -7,6 +8,44 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
+/// A stream that yields events at a fixed interval.
+///
+/// This primitive creates a `Tick` that wakes up at a set interval for a desired
+/// number of times. It is designed for implementing efficient background tasks
+/// that need to run periodically.
+///
+/// # Efficiency via Multishot
+///
+/// `Tick` is significantly more efficient than a standard `loop { sleep().await; }` pattern.
+/// Internally, it leverages `io_uring`'s **multishot timeout** feature.
+///
+/// Instead of submitting a new kernel request for every interval (which incurs
+/// syscall overhead and context switching), `Tick` performs **one** initial submission.
+/// The kernel then automatically posts completion events to the ring at the specified
+/// cadence without further intervention from user space.
+///
+/// # Behavior
+///
+/// * If `count` is `n`, the tick will fire exactly `n` times.
+/// * If `count` is `0`, the tick will fire indefinitely until dropped.
+///
+/// # Examples
+///
+/// ```
+/// use ringolo::time::Tick;
+/// use futures::StreamExt; // for .next()
+/// use std::time::Duration;
+///
+/// # async fn doc() {
+/// // Fire every 100ms, forever (count = 0)
+/// let mut interval = Tick::new(Duration::from_millis(100), 0);
+///
+/// while let Some(_) = interval.next().await {
+///     println!("Tick!");
+/// }
+/// # }
+/// ```
+#[derive(Debug)]
 #[pin_project]
 pub struct Tick {
     #[pin]
@@ -14,13 +53,10 @@ pub struct Tick {
 }
 
 impl Tick {
-    /// Create a new `Tick` that will wake up at set interval for the desired
-    /// number of times. Very useful to implement background tasks that should
-    /// run periodically. It is much more efficient than repeatedly sleeping as
-    /// it leverages a `MultishotTimeout` timeout internally which corresponds
-    /// to a single Task.
-    /// - If `count` is `n`, the tick will fire n times.
-    /// - If `count` is `0`, it will fire indefinitely.
+    /// Create a new `Tick` stream.
+    ///
+    /// * `interval`: The duration between ticks.
+    /// * `count`: The number of ticks to generate. If `0`, the stream is infinite.
     pub fn new(interval: Duration, count: u32) -> Self {
         Self {
             inner: Multishot::new(TimeoutMultishot::new(interval, count, None)),

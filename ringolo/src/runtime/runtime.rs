@@ -1,20 +1,20 @@
 use crate as ringolo;
 use crate::context;
 use crate::context::maintenance::OnCleanupError;
+use crate::runtime::Scheduler;
 use crate::runtime::local;
 use crate::runtime::stealing;
-use crate::runtime::Scheduler;
 use crate::spawn::TaskOpts;
 use crate::task::JoinHandle;
 use crate::utils::thread::set_current_thread_name;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::cell::Cell;
 use std::convert::TryFrom;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use std::thread;
 
 // Used wherever we rely on SmallVec to store entries on stack first.
@@ -82,28 +82,53 @@ impl fmt::Debug for ThreadNameFn {
 unsafe impl Send for ThreadNameFn {}
 unsafe impl Sync for ThreadNameFn {}
 
-/// Defines how we enforce structured concurrency. This is the idea that every
-/// task should have a clear owner and should not be allowed to outlive it's parent.
-/// In structured concurrency, you can't "leak" tasks and all of a task children
-/// are cancelled on exit. You have to explicitly use `TaskOpts::BACKGROUND_TASK`
-/// if you want a child to outlive it's parent, as this option attaches the child
-/// to the ROOT_NODE of the task tree instead of the parent.
+/// Defines the runtime's structured concurrency policy.
+///
+/// This policy dictates what happens when a parent task exits before its
+/// child tasks have completed.
+///
+/// The default policy is [`OrphanPolicy::Enforced`], which guarantees that
+/// children are cancelled when their parent exits. This global policy can be
+/// set to [`OrphanPolicy::Permissive`] to allow children to outlive their parents.
+///
+/// **Note on Detached Tasks:**
+///
+/// This policy controls the *global* behavior for parent-child relationships.
+/// It is separate from spawning an individually "detached" task.
+///
+/// The idiomatic way to spawn a task that is not attached to the current
+/// parent is to use [`TaskOpts::BACKGROUND_TASK`]. This option attaches the
+/// new task directly to the `ROOT_NODE` of the task tree, allowing it to
+/// outlive its spawner regardless of the [`OrphanPolicy`].
+///
+/// ### Example
+///
+/// ```no_run
+/// use ringolo::TaskOpts;
+///
+/// ringolo::spawn_builder()
+///     .with_opts(TaskOpts::BACKGROUND_TASK)
+///     .spawn(async {
+///         // ... background work ...
+///     });
+/// ```
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrphanPolicy {
     /// All children of a task are cancelled on exit. The program is *not allowed*
     /// to create orphans. This leads to better performance because we prevent many
     /// synchronous parent swapping operations and avoid child adoption by the
-    /// ORPHAN_ROOT_NODE.
+    /// `ORPHAN_ROOT_NODE`.
     #[default]
     Enforced,
 
     /// Children are allowed to outlive their parents. If a parent terminates before
-    /// it's children, all of the children are adopted by the ORPHAN_ROOT_NODE and
+    /// it's children, all of the children are adopted by the `ORPHAN_ROOT_NODE` and
     /// become orphans. This flexibility comes at a cost, with synchronous parent
     /// swapping operations and child adoption.
     Permissive,
 }
 
+/// Runtime Builder API.
 #[derive(Debug)]
 pub struct Builder {
     /// Runtime type
@@ -187,12 +212,11 @@ impl Builder {
     }
 
     /// Returns a new builder with the local thread scheduler selected.
-    ///
-    /// Configuration methods can be chained on the return value.
     pub fn new_local() -> Builder {
         Builder::new(Kind::Local)
     }
 
+    /// Returns a new builder with the stealing scheduler selected.
     pub fn new_stealing() -> Builder {
         Builder::new(Kind::Stealing)
     }
@@ -274,6 +298,8 @@ impl Builder {
         self
     }
 
+    /// Sets the number of scheduler ticks after which the scheduler will process
+    /// `io_uring` completion events (CQEs).
     #[track_caller]
     pub fn process_cqes_interval(mut self, val: u32) -> Self {
         assert!(val > 0, "process_cqes_interval must be greater than 0");
@@ -281,6 +307,8 @@ impl Builder {
         self
     }
 
+    /// Sets the number of scheduler ticks after which the scheduler will submit
+    /// pending `io_uring` submission events (SQEs).
     #[track_caller]
     pub fn submit_interval(mut self, val: u32) -> Self {
         assert!(val > 0, "submit_interval must be greater than 0");
@@ -288,6 +316,8 @@ impl Builder {
         self
     }
 
+    /// Sets the maximum number of unsubmitted `io_uring` submission events (SQEs)
+    /// allowed in the queue before a forced submission is triggered.
     #[track_caller]
     pub fn max_unsubmitted_sqes(mut self, val: usize) -> Self {
         assert!(val > 0, "max_unsubmitted_sqes must be greater than 0");
@@ -295,6 +325,8 @@ impl Builder {
         self
     }
 
+    /// Sets the maximum number of times a worker thread will attempt to steal
+    /// tasks from the global queue or other workers before parking or moving on.
     #[track_caller]
     pub fn max_steal_retries(mut self, val: usize) -> Self {
         assert!(val > 0, "max_steal_retries must be greater than 0");
@@ -302,6 +334,9 @@ impl Builder {
         self
     }
 
+    /// Sets the size (number of entries) of the `io_uring` submission queue (SQ) ring.
+    ///
+    /// This value must be a power of two.
     #[track_caller]
     pub fn sq_ring_size(mut self, val: usize) -> Self {
         assert!(val.is_power_of_two(), "sq_ring_size must be a power of two");
@@ -309,6 +344,10 @@ impl Builder {
         self
     }
 
+    /// Sets the multiplier for the completion queue (CQ) ring size, relative to the `sq_ring_size`.
+    ///
+    /// The final CQ ring size will be `sq_ring_size * cq_ring_size_multiplier`.
+    /// The default is 2.
     #[track_caller]
     pub fn cq_ring_size_multiplier(mut self, val: usize) -> Self {
         assert!(val > 0, "cq_ring_size_multiplier must be greater than 0");
@@ -316,6 +355,9 @@ impl Builder {
         self
     }
 
+    /// Sets the number of direct file descriptors to register with each `io_uring` instance.
+    ///
+    /// This is used for `io_uring`'s registered files feature.
     #[track_caller]
     pub fn direct_fds_per_ring(mut self, val: u32) -> Self {
         assert!(val > 0, "direct_fds_per_ring must be greater than 0");
@@ -323,11 +365,17 @@ impl Builder {
         self
     }
 
+    /// Sets the policy for handling errors that occur during asynchronous cleanup
+    /// operations (e.g., in `Drop` implementations).
     pub fn on_cleanup_error(mut self, on_cleanup: OnCleanupError) -> Self {
         self.on_cleanup_error = on_cleanup;
         self
     }
 
+    /// Sets the runtime's structured concurrency policy for handling child tasks
+    /// when a parent task exits.
+    ///
+    /// See [`OrphanPolicy`] for more details.
     pub fn orphan_policy(mut self, orphan_policy: OrphanPolicy) -> Self {
         self.orphan_policy = orphan_policy;
         self
@@ -390,6 +438,10 @@ impl Builder {
     }
 }
 
+/// A `ringolo` runtime instance.
+///
+/// Provides methods for running futures, spawning tasks, and shutting down the runtime.
+/// Instances are created using the [`Builder`].
 #[derive(Debug)]
 pub struct Runtime {
     scheduler: Scheduler,
@@ -400,6 +452,11 @@ impl Runtime {
         Runtime { scheduler }
     }
 
+    /// Runs a future to completion on the `ringolo` runtime.
+    ///
+    /// This blocks the current thread until the future completes. This is the
+    /// main entry point for running the `root_future` of your application.
+    /// It must be called from *outside* a runtime context.
     pub fn block_on<F: Future>(&self, root_fut: F) -> F::Output {
         ringolo::block_on(root_fut)
     }

@@ -1,13 +1,15 @@
-use nix::sys::socket::{AddressFamily, SockProtocol, SockType};
 use std::io;
 
-use crate::{
-    any_extract, any_vec,
-    future::lib::{
-        AnySockOpt, BorrowedUringFd, KernelFdMode, Op, OwnedUringFd, ReuseAddr, ReusePort,
-        SetSockOpt, SetSockOptIf, Socket, list::OpList,
-    },
-};
+use crate::future::lib::ops::sockopt::{AnySockOpt, ReuseAddr, ReusePort, SetSockOptIf};
+use crate::future::lib::ops::{SetSockOpt, Socket};
+use crate::future::lib::types::{AddressFamily, SockProtocol, SockType};
+use crate::future::lib::{BorrowedUringFd, KernelFdMode, Op, OpList, OwnedUringFd};
+use crate::{any_extract, any_vec};
+
+// TODO: simply calling `Close` on file descriptor is not enough, we also need to
+// call `Shutdown` on the socket? Otherwise if socket has pending accept it never
+// closes? Leaks sockets? Brainstorm with gemini ++ impl in maintenance task if
+// necessary.
 
 #[derive(Debug)]
 pub struct UringSocket {

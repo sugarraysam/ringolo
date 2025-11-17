@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use nix::sys::socket::{AddressFamily, SockProtocol, SockType};
-
-use crate::future::lib::{KernelFdMode, Op, Socket};
+use crate::future::lib::ops::Socket;
+use crate::future::lib::types::{AddressFamily, SockProtocol, SockType};
+use crate::future::lib::{KernelFdMode, Op};
 
 pub(crate) const LOCALHOST4: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 pub(crate) const LOCALHOST6: IpAddr = IpAddr::V6(Ipv6Addr::LOCALHOST);

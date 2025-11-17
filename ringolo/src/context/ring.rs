@@ -10,6 +10,11 @@ use crate::context::RawSqeSlab;
 use crate::runtime::RuntimeConfig;
 use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 
+/// A wrapper around `io_uring` specifically configured for a Single Issuer.
+///
+/// This implementation leverages `IORING_SETUP_SINGLE_ISSUER` and `IORING_SETUP_DEFER_TASKRUN`.
+/// This combination allows the kernel to defer processing completions until `io_uring_enter`
+/// is explicitly called, minimizing interrupt overhead and context switches.
 pub(crate) struct SingleIssuerRing {
     ring: IoUring,
 }
@@ -182,7 +187,7 @@ impl SingleIssuerRing {
                 num_completed += 1;
 
                 if let Some(CompletionEffect::WakeHead { head }) =
-                    raw_sqe.on_completion(cqe.result(), cqe.flags())?
+                    raw_sqe.on_completion(cqe.result(), cqe.flags().into())?
                 {
                     slab.get_mut(head)?.wake()?;
                 }
@@ -199,7 +204,8 @@ impl SingleIssuerRing {
 mod tests {
     use super::*;
     use crate::context;
-    use crate::future::lib::{Op, Timeout};
+    use crate::future::lib::Op;
+    use crate::future::lib::ops::Timeout;
     use crate::runtime::Builder;
     use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
     use crate::sqe::{CompletionHandler, RawSqe};

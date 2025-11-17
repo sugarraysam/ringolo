@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use std::fmt;
@@ -35,10 +37,10 @@ impl Id {
 }
 
 const ROOT_ID_VAL: u64 = 1;
-pub static ROOT_ID: Id = Id(NonZeroU64::new(ROOT_ID_VAL).unwrap());
+pub(crate) static ROOT_ID: Id = Id(NonZeroU64::new(ROOT_ID_VAL).unwrap());
 
 const ORPHAN_ROOT_ID_VAL: u64 = 2;
-pub static ORPHAN_ROOT_ID: Id = Id(NonZeroU64::new(ORPHAN_ROOT_ID_VAL).unwrap());
+pub(crate) static ORPHAN_ROOT_ID: Id = Id(NonZeroU64::new(ORPHAN_ROOT_ID_VAL).unwrap());
 
 const TASK_ID_START_VAL: u64 = 3;
 
@@ -67,10 +69,6 @@ impl Id {
         Id(NonZeroU64::new(id).expect("failed to generate unique task ID: bitspace exhausted"))
     }
 
-    pub(crate) fn as_u64(&self) -> u64 {
-        self.0.get()
-    }
-
     /// Get a unique task tracing Id to be used with tracing library.
     pub(crate) fn as_tracing_id(&self) -> tracing::Id {
         tracing::Id::from_non_zero_u64(self.0)
@@ -79,7 +77,7 @@ impl Id {
 
 /// A 4 bytes version for thread id to optimize Header layout.
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
-pub struct ThreadId(pub(crate) NonZeroU32);
+pub(crate) struct ThreadId(pub(crate) NonZeroU32);
 
 impl fmt::Display for ThreadId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

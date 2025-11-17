@@ -7,6 +7,11 @@ use smallvec::SmallVec;
 use std::io::{self, Error, ErrorKind};
 use std::ops::{Deref, DerefMut};
 
+/// A dedicated slab allocator for `io_uring` Submission Queue Entries (SQEs).
+///
+/// This structure manages the lifecycle of raw pointers used in I/O requests.
+/// It utilizes a "Reserve-Commit" pattern to ensure that entries are only
+/// permanently occupied if the I/O submission logic succeeds.
 pub(crate) struct RawSqeSlab {
     slab: slab::Slab<RawSqe>,
 }
@@ -68,6 +73,7 @@ impl RawSqeSlab {
     }
 }
 
+#[doc(hidden)]
 impl Deref for RawSqeSlab {
     type Target = Slab<RawSqe>;
 
@@ -76,6 +82,7 @@ impl Deref for RawSqeSlab {
     }
 }
 
+#[doc(hidden)]
 impl DerefMut for RawSqeSlab {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.slab

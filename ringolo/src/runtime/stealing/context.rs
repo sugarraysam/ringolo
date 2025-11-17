@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use crate::context::{Core, RawSqeSlab, Shared, SingleIssuerRing};
 use crate::runtime::RuntimeConfig;
 use crate::task::ThreadId;

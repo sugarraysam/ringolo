@@ -1,26 +1,77 @@
+//! Provides asynchronous, thread-local `io_uring` resource cleanup.
+//!
+//! ## The "Why": Thread-Local `io_uring` Resources
+//!
+//! `Ringolo` is built on `io_uring`, where many resources are **thread-local**—they
+//! are registered with a specific ring and are only valid on that thread.
+//!
+//! This presents two major challenges:
+//!
+//! 1.  **Leaky Multishot Operations:** `io_uring` multishot operations (like
+//!     [`TimeoutMultishot`]) are "leaky" by design. Once submitted, they will
+//!     fire indefinitely until the program exits *or* they are explicitly
+//!     cancelled. This cancellation **must** happen on the same thread (and ring)
+//!     that submitted it.
+//!
+//! 2.  **Registered Resources:** Resources like direct descriptors or provided
+//!     buffers are registered with the thread-local ring. They must be explicitly
+//!     closed/un-registered to avoid leaking kernel resources.
+//!
+//! ## The "How": The Asynchronous Maintenance Task
+//!
+//! This module provides a mechanism to safely clean up these resources
+//! asynchronously. All cleanup operations (like closing a file or cancelling
+//! a timeout) are handled by a special **maintenance task** that exists on
+//! *each worker thread* from program start to finish.
+//!
+//! When a future (like [`TimeoutMultishot`]) is dropped, it doesn't block
+//! to clean itself up. Instead, it calls a function from this module
+//! (e.g., [async_timeout_remove]), which enqueues a `CleanupOp` on the
+//! current thread's maintenance queue.
+//!
+//! The maintenance task wakes up periodically, drains its queue, batches
+//! all cleanup ops into a single `io_uring` submission, and executes them. This
+//! guarantees that resources submitted on a thread are also cleaned up *on that
+//! same thread*.
+//!
+//! [`TimeoutMultishot`]: crate::future::lib::TimeoutMultishot
+//!
 use std::cell::RefCell;
 
 use crate::context;
+
+#[doc(inline)]
 use crate::context::maintenance::OnCleanupError;
 use crate::context::maintenance::queue::AsyncLocalQueue;
 use crate::future::lib::list::{AnyOp, OpList};
-use crate::future::lib::{AsyncCancel, Close, TimeoutRemove};
+use crate::future::lib::ops::{AsyncCancel, Close, TimeoutRemove};
 use crate::runtime::{PanicReason, SchedulerPanic};
 use crate::sqe::IoError;
 use anyhow::Result;
 use either::Either;
 use io_uring::types::{CancelBuilder, Fd, Fixed};
 
+/// Enqueues an `io_uring` async cancellation operation.
+///
+/// This is primarily used to stop "leaky" multishot operations that are
+/// not `TIMEOUT_REMOVE`. The `user_data` typically corresponds to the
+/// slab entry of the I/O operation being cancelled.
 pub fn async_cancel(builder: CancelBuilder, user_data: usize) {
     let op = CleanupOp::new_cancel(builder, user_data);
     context::with_core(|core| core.maintenance_task.add_cleanup_op(op));
 }
 
+/// Enqueues an asynchronous `close` operation for a file descriptor.
 pub fn async_close(fd: Either<Fd, Fixed>) {
     let op = CleanupOp::new_close(fd);
     context::with_core(|core| core.maintenance_task.add_cleanup_op(op));
 }
 
+/// Enqueues an `io_uring` `TIMEOUT_REMOVE` operation.
+///
+/// This is the correct way to cancel a `TimeoutMultishot`, as it
+/// both removes the timer from `io_uring`'s internal data structures
+/// and (via `user_data`) releases its slab entry.
 pub fn async_timeout_remove(user_data: usize) {
     let op = CleanupOp::new_timeout_remove(user_data as u64);
     context::with_core(|core| core.maintenance_task.add_cleanup_op(op));
@@ -33,6 +84,7 @@ enum CleanupOpcode {
     TimeoutRemove(TimeoutRemove),
 }
 
+/// A pending cleanup operation, awaiting execution by the maintenance task.
 #[derive(Debug)]
 pub(crate) struct CleanupOp {
     /// One of the supported cleanup operation.
@@ -41,7 +93,7 @@ pub(crate) struct CleanupOp {
     /// Counter to keep track of retries.
     num_retries: usize,
 
-    /// If we should also remove a slab entry.
+    /// If we should also remove a slab entry, this is its index.
     user_data: Option<usize>,
 }
 
@@ -71,10 +123,17 @@ impl CleanupOp {
     }
 }
 
+/// The core handler, owned by the maintenance task, that batches and
+/// executes asynchronous cleanup operations.
 #[derive(Debug)]
 pub(crate) struct CleanupHandler {
+    /// The SPSC queue for all pending ops on this thread.
     queue: AsyncLocalQueue<CleanupOp>,
+
+    /// What to do if a cleanup op fails.
     policy: OnCleanupError,
+
+    /// A count of all pending operations.
     inflight: RefCell<usize>,
 }
 
@@ -103,6 +162,10 @@ impl CleanupHandler {
         self.queue.push(op);
     }
 
+    /// Drains the queue and submits a batch of cleanup operations.
+    ///
+    /// This is the main "work" function for the maintenance task.
+    /// It handles retries and error policies.
     pub(crate) async fn cleanup(&self) -> Result<(), IoError> {
         // Batch all cleanup op in a single submit call for efficiency. Creating
         // the OpList does not invalidate our CleanupOp so we can re-use it for
@@ -177,7 +240,8 @@ impl CleanupHandler {
     }
 }
 
-fn cvt(ops: &Vec<CleanupOp>) -> Vec<AnyOp<'_>> {
+#[doc(hidden)]
+fn cvt(ops: &[CleanupOp]) -> Vec<AnyOp<'_>> {
     ops.iter().map(|op| op.into()).collect()
 }
 
@@ -194,14 +258,13 @@ impl<'a> From<&CleanupOp> for AnyOp<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate as ringolo;
     use crate::context::with_slab;
+    use crate::future::lib::Multishot;
+    use crate::future::lib::ops::TimeoutMultishot;
     use crate::runtime::Builder;
     use crate::test_utils::*;
     use crate::utils::scheduler::{Call, Method};
-    use crate::{
-        self as ringolo,
-        future::lib::{Multishot, TimeoutMultishot},
-    };
     use anyhow::Result;
     use futures::StreamExt;
     use std::pin::pin;

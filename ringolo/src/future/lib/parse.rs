@@ -101,7 +101,6 @@ fn socket_addr_v6_to_c(addr: &SocketAddrV6) -> libc::sockaddr_in6 {
         sin6_addr: ip_v6_addr_to_c(addr.ip()),
         sin6_flowinfo: addr.flowinfo(),
         sin6_scope_id: addr.scope_id(),
-        ..unsafe { std::mem::zeroed() }
     }
 }
 
@@ -141,41 +140,4 @@ fn ip_v4_addr_from_c(addr: libc::in_addr) -> Ipv4Addr {
 
 fn ip_v6_addr_from_c(addr: libc::in6_addr) -> Ipv6Addr {
     Ipv6Addr::from(addr.s6_addr)
-}
-
-pub(super) fn sockname<F>(f: F) -> io::Result<SocketAddr>
-where
-    F: FnOnce(*mut libc::sockaddr, *mut libc::socklen_t) -> libc::c_int,
-{
-    unsafe {
-        let mut storage: libc::sockaddr_storage = std::mem::zeroed();
-        let mut len = size_of_val(&storage) as libc::socklen_t;
-        cvt(f((&raw mut storage).cast(), &mut len))?;
-        socket_addr_from_c(&storage, len as usize)
-    }
-}
-
-#[doc(hidden)]
-pub(super) trait IsMinusOne {
-    fn is_minus_one(&self) -> bool;
-}
-
-macro_rules! impl_is_minus_one {
-    ($($t:ident)*) => ($(impl IsMinusOne for $t {
-        fn is_minus_one(&self) -> bool {
-            *self == -1
-        }
-    })*)
-}
-
-impl_is_minus_one! { i8 i16 i32 i64 isize }
-
-/// Converts native return values to Result using the *-1 means error is in `errno`*  convention.
-/// Non-error values are `Ok`-wrapped.
-pub(super) fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
-    if t.is_minus_one() {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(t)
-    }
 }

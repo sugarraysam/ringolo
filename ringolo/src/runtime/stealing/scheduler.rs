@@ -347,6 +347,7 @@ impl Handle {
     }
 }
 
+#[doc(hidden)]
 impl Deref for Handle {
     type Target = Arc<Scheduler>;
     fn deref(&self) -> &Self::Target {

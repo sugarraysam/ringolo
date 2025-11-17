@@ -1,23 +1,66 @@
+//! Provides APIs for programmatic task cancellation.
+//!
+//! This module is the primary benefit of Ringolo's [Structured Concurrency] model.
+//! Because the runtime maintains a [global task tree], these functions can
+//! perform powerful, targeted cancellations by traversing that tree.
+//!
+//! All functions in this module (except [`recursive_cancel_all_orphans`]) operate
+//! relative to the **current task**. For example, [`recursive_cancel_all`] will
+//! cancel all *children* of the task that calls it, but not its siblings or parent.
+//!
+//! These functions require an active task context and will return
+//! [`CancelError::EmptyContext`] if called from outside a `ringolo` task.
+//!
+//! [Structured Concurrency]: crate#structured-concurrency
+//! [global task tree]: crate::task::node::TaskNode
+//! [`recursive_cancel_all_orphans`]: crate::runtime::recursive_cancel_all_orphans
+//! [`recursive_cancel_all`]: crate::runtime::recursive_cancel_all
+//! [`CancelError::EmptyContext`]: crate::runtime::cancel::CancelError
 use crate::context;
 use crate::runtime::{TaskMetadata, get_orphan_root};
+#[doc(inline)]
 use crate::task::CancellationStats;
 
+/// Cancellation errors classification.
 #[derive(thiserror::Error, Debug)]
 pub enum CancelError {
+    /// This function was called from outside a `ringolo` task context.
     #[error("No task in context. This function should be called within a future.")]
     EmptyContext,
 }
 
+/// Recursively cancels all child tasks of the current task.
+///
+/// This function walks the task tree starting from the current task,
+/// cancelling every child and all of their descendants. The current task
+/// itself is not cancelled.
+///
+/// Returns a [`CancellationStats`] detailing how many tasks were
+/// visited and cancelled.
 pub fn recursive_cancel_all() -> Result<CancellationStats, CancelError> {
     let curr = context::current_task().ok_or(CancelError::EmptyContext)?;
     Ok(curr.recursive_cancel_all())
 }
 
-pub fn recursive_cancel_leaf() -> Result<CancellationStats, CancelError> {
+/// Recursively cancels all **leaf** tasks within the current task's hierarchy.
+///
+/// This function walks the task tree from the current task, but it *only*
+/// issues cancellations for tasks that are "leaves" (i.e., tasks that
+/// have no children of their own).
+///
+/// This is useful for cancelling long-running background work (like I/O)
+/// without cancelling the intermediate parent tasks that may be
+/// managing them.
+pub fn recursive_cancel_all_leaves() -> Result<CancellationStats, CancelError> {
     let curr = context::current_task().ok_or(CancelError::EmptyContext)?;
     Ok(curr.recursive_cancel_leaf())
 }
 
+/// Recursively cancels tasks in the hierarchy that match **any** metadata tag.
+///
+/// This function walks the current task's sub-tree and cancels any
+/// task whose [`TaskMetadata`] contains *at least one* of the tags
+/// specified in the `metadata` argument.
 pub fn recursive_cancel_any_metadata(
     metadata: &TaskMetadata,
 ) -> Result<CancellationStats, CancelError> {
@@ -25,6 +68,11 @@ pub fn recursive_cancel_any_metadata(
     Ok(curr.recursive_cancel_any_metadata(metadata))
 }
 
+/// Recursively cancels tasks in the hierarchy that match **all** metadata tags.
+///
+/// This function walks the current task's sub-tree and cancels any
+/// task whose [`TaskMetadata`] contains *all* of the tags
+/// specified in the `metadata` argument.
 pub fn recursive_cancel_all_metadata(
     metadata: &TaskMetadata,
 ) -> Result<CancellationStats, CancelError> {
@@ -32,6 +80,14 @@ pub fn recursive_cancel_all_metadata(
     Ok(curr.recursive_cancel_all_metadata(metadata))
 }
 
+/// Cancels all tasks that have been "orphaned."
+///
+/// This is a special-purpose function that targets the `ORPHAN_ROOT_NODE`
+/// and recursively cancels all tasks attached to it. This is primarily
+/// useful when using [`OrphanPolicy::Permissive`].
+///
+/// **Note:** This function does *not* require a task context and will not fail
+/// with [`CancelError::EmptyContext`].
 pub fn recursive_cancel_all_orphans() -> Result<CancellationStats, CancelError> {
     let orphan_root = get_orphan_root();
     Ok(orphan_root.recursive_cancel_all())
@@ -381,7 +437,7 @@ mod tests {
                 assert!(YieldNow::new(Some(AddMode::Fifo)).await.is_ok());
             }
 
-            let stats = ringolo::recursive_cancel_leaf().context("failed to cancel leaf")?;
+            let stats = ringolo::recursive_cancel_all_leaves().context("failed to cancel leaf")?;
             assert_eq!(stats.cancelled, expected_leaf_nodes);
 
             handle.await??;

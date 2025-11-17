@@ -1,3 +1,5 @@
+#![allow(unused)]
+
 use std::marker::PhantomData;
 
 /// A guard that executes a closure when it goes out of scope.

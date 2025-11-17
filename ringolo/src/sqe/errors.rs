@@ -4,18 +4,22 @@ use io_uring::squeue::PushError;
 use std::io::{self, Error};
 
 /// A centralized error type for all scheduler and runtime operations.
+///
+/// This enum distinguishes between fatal configuration errors (which panic)
+/// and runtime backpressure errors (which trigger a yield/retry loop).
 #[derive(thiserror::Error, Debug)]
 pub enum IoError {
     /// The submission queue ring for io_uring is full.
-    /// This is a specific, recoverable state where the application
-    /// should reap completions before submitting more I/O.
+    ///
+    /// **Recoverable:** This is a backpressure signal. The runtime will catch this,
+    /// yield the current task, process completions to drain the CQ/SQ, and retry.
     #[error("Submission queue ring is full, cannot submit IO")]
     SqRingFull(#[from] PushError),
 
     #[error("FATAL: SQ entry batch too large to fit in the SQ ring")]
     SqBatchTooLarge,
 
-    /// A resource slab (e.g., for storing futures or tasks) is full.
+    /// A resource slab (e.g., for storing unusedtures or tasks) is full.
     /// This indicates the system is at its configured capacity.
     #[error("Slab allocator is full, cannot allocate new resource")]
     SlabFull,
@@ -72,6 +76,7 @@ impl IoError {
     pub(crate) fn as_panic_reason(&self) -> PanicReason {
         match self {
             IoError::SlabInvalidState => PanicReason::SlabInvalidState,
+            IoError::SqBatchTooLarge => PanicReason::SqBatchTooLarge,
             _ => PanicReason::Unknown,
         }
     }

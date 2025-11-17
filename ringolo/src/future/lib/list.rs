@@ -1,8 +1,8 @@
-use crate::future::lib::{OpPayload, single::*};
-use crate::future::lib::{OpcodeError, OwnedUringFd};
+use crate::future::lib::ops::single::*;
+use crate::future::lib::types::EpollEvent;
+use crate::future::lib::{OpPayload, OpcodeError, OwnedUringFd};
 use crate::sqe::list::{SqeBatchBuilder, SqeChainBuilder, SqeListBuilder};
 use crate::sqe::{IoError, Sqe, SqeList, SqeListKind};
-use nix::sys::epoll::EpollEvent;
 use paste::paste;
 use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
@@ -11,13 +11,13 @@ use std::pin::Pin;
 use std::task::Waker;
 use std::task::{Context, Poll, ready};
 
-// Defines a top-level operation enum and its corresponding output enum.
-//
-// This macro generates:
-// 1. The `OutputEnum` with variants matching the `-> OutputType`.
-// 2. The `OpEnum<T>` with `#[pin_project]`, using `paste` to create the projection.
-// 3. The `impl OpPayload for OpEnum<T>` block, delegating calls.
-// 4. All required `impl From<Variant> for OpEnum<T>` implementations.
+/// Generates the top-level operation enum (`AnyOp`) and its corresponding output enum (`AnyOpOutput`).
+///
+/// This macro reduces boilerplate by automatically generating:
+/// 1. The `OutputEnum` with variants matching the `-> OutputType`.
+/// 2. The `OpEnum<T>` with `#[pin_project]`, using `paste` to create the projection.
+/// 3. The `impl OpPayload for OpEnum<T>` block, delegating calls via static dispatch.
+/// 4. All required `impl From<Variant> for OpEnum<T>` implementations.
 macro_rules! define_any_op {
     (
         // The name for the main operation enum, e.g., AnyOp
@@ -35,30 +35,37 @@ macro_rules! define_any_op {
         // Use `paste` to wrap the entire expansion, allowing us to
         // create identifiers like `AnyOpProj` from `AnyOp`.
         paste! {
-            #[allow(dead_code)]
+            /// The output result corresponding to a specific [`$OpEnum`] variant.
+            ///
+            /// This enum is returned by [`OpList`](crate::future::lib::OpList) when awaiting
+            /// a batch or chain. The variant index here matches the index of the operation
+            /// submitted in the original list.
             #[derive(Debug)]
             pub enum $OutputEnum {
                 $(
+                    #[doc = concat!("Output for the [`", stringify!($OpEnum), "::", stringify!($Variant), "`] operation.")]
                     $Variant($OutputType),
                 )*
             }
 
-            /// AnyOp is an enum wrapper around all valid operations that can be used to
-            /// build a batch or a chain of ops. The contract for batch and chain is that
-            /// they will be submitted in the same `io_uring_enter` syscall, and only completes
-            /// once all operations have finished. You can achieve the same thing by writing
-            /// N ops but using the batch or chain API is *way more* efficient because:
-            /// - All ops are submitted in a single `io_uring_enter` syscall
-            /// - A single task is created on the executor instead of N tasks
-            /// - We use a shared countdown counter and only wake the task when all ops are
-            ///   done, instead of waking up N tasks one time.
-            /// - The chain leverages `io_uring`'s chain API.
-
-            #[allow(dead_code)]
+            /// A unified enum wrapper around all valid `io_uring` operations.
+            ///
+            /// This enum allows for **static dispatch** of heterogeneous operations, enabling
+            /// complex chains and batches without the overhead of `Box<dyn T>` or heap allocations.
+            ///
+            /// # Performance
+            ///
+            /// Using `AnyOp` to build an [`OpList`] is significantly more efficient than awaiting
+            /// operations individually because:
+            ///
+            /// * **Syscall Reduction:** All ops are submitted in a single `io_uring_enter` syscall.
+            /// * **Wakeup Reduction:** The runtime uses a shared countdown and only wakes the task
+            ///   once all operations are complete, preventing unecessary polling.
             #[derive(Debug)]
             #[pin_project(project = [<$OpEnum Proj>])] // e.g., creates `AnyOpProj`
             pub enum $OpEnum<'a> {
                 $(
+                    #[doc = concat!("See [`", stringify!($VariantType), "`] for details.")]
                     $Variant(#[pin] $VariantType),
                 )*
             }
@@ -110,18 +117,6 @@ macro_rules! define_any_op {
     };
 }
 
-// Generates a static dispatch enum to allow heterogeneous arbitrary length
-// chains and batches of SQEs.
-//
-// Why static dispatch enum?
-// - We could use `Vec<Box<dyn T>>` but we then need to heap-alloc every Op and
-//   pay the price of dynamic dispatch.
-// - The downside of static enum dispatch is that the size of AnyOp is the size
-//   of it's largest variant, which is a bit wasteful. Still think it's better
-//   than heap-alloc + dynamic dispatch.
-//
-// To add a variant, simply insert `$VariantName($OpType) -> Output` in the
-// `variants [ ... ]` list below.
 define_any_op! {
     op_enum: AnyOp,
     output_enum: AnyOpOutput,
@@ -152,8 +147,43 @@ define_any_op! {
     ]
 }
 
+/// A future that executes a list of operations as a **Batch** or **Chain**.
+///
+/// This struct manages a `Vec<AnyOp>`, allowing you to mix different operation types
+/// (e.g., [`Socket`], [`Bind`], [`Listen`]) in a single submission.
+///
+/// # Modes
+///
+/// * **Batch:** All operations are submitted simultaneously and execute concurrently.
+///   Completion order is not guaranteed.
+/// * **Chain:** Operations are linked using [`IOSQE_IO_LINK`](https://unixism.net/loti/tutorial/link_liburing.html).
+///   They execute sequentially.
+///   If one fails, the chain is broken, and subsequent operations are cancelled.
+///
+/// # Example
+///
+/// ```ignore
+/// use ringolo::any_vec;
+/// use ringolo::future::lib::OpList;
+/// use ringolo::future::lib::ops::{Bind, Listen, Socket};
+///
+/// // Create a chain that sets up a TCP listener in one go.
+/// // If `Bind` fails, `Listen` is never attempted.
+/// # async fn doc() -> anyhow::Result<()> {
+/// let chain = OpList::new_chain(any_vec![
+///     Socket::new(...),
+///     Bind::new(...),
+///     Listen::new(...),
+/// ]);
+///
+/// // Returns a vector of results in the same order as input
+/// let results = chain.await?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
 #[pin_project(PinnedDrop)]
-pub(crate) struct OpList<'a> {
+pub struct OpList<'a> {
     #[pin]
     ops: Vec<AnyOp<'a>>,
     kind: SqeListKind,
@@ -266,15 +296,16 @@ impl<'a> PinnedDrop for OpList<'a> {
 mod tests {
     use super::*;
     use crate as ringolo;
-    use crate::future::lib::{
-        Accept, AnySockOpt, Bind, KernelFdMode, Listen, Op, ReceiveTimeout, ReuseAddr, ReusePort,
-        TcpNoDelay,
+    use crate::future::lib::ops::sockopt::{
+        AnySockOpt, ReceiveTimeout, ReuseAddr, ReusePort, TcpNoDelay,
     };
+    use crate::future::lib::ops::{Accept, Bind, Listen};
+    use crate::future::lib::types::AddressFamily;
+    use crate::future::lib::{KernelFdMode, Op};
     use crate::task::JoinHandle;
     use crate::test_utils::*;
     use crate::{any_extract, any_extract_all, any_vec};
     use anyhow::{Context, Result};
-    use nix::sys::socket::AddressFamily;
     use rstest::rstest;
     use std::net::IpAddr;
 

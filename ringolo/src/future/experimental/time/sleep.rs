@@ -1,10 +1,30 @@
-use crate::future::lib::{Op, OpcodeError, Timeout};
+use crate::future::lib::ops::Timeout;
+use crate::future::lib::{Op, OpcodeError};
 use pin_project::pin_project;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
+/// A future that completes after a specified duration has elapsed.
+///
+/// This primitive submits a timeout operation to the `io_uring` instance.
+/// When the duration elapses, the kernel posts a completion event, waking the task.
+///
+/// # Examples
+///
+/// ```
+/// use ringolo::time::Sleep;
+/// use std::time::Duration;
+///
+/// # async fn doc() -> anyhow::Result<()> {
+/// // Sleep for 100 milliseconds
+/// let res = Sleep::try_new(Duration::from_millis(100))?.await;
+/// assert!(res.is_ok());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
 #[pin_project]
 pub struct Sleep {
     #[pin]
@@ -12,6 +32,12 @@ pub struct Sleep {
 }
 
 impl Sleep {
+    /// Creates a new `Sleep` future.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OpcodeError::SleepZeroDuration`] if `when` is zero.
+    /// To yield execution without sleeping, use [`YieldNow`](crate::time::YieldNow) instead.
     pub fn try_new(when: Duration) -> Result<Self, OpcodeError> {
         if when.is_zero() {
             return Err(OpcodeError::SleepZeroDuration);

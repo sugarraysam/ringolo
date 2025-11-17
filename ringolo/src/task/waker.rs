@@ -36,6 +36,7 @@ where
     }
 }
 
+#[doc(hidden)]
 impl<S> ops::Deref for WakerRef<'_, S> {
     type Target = Waker;
 

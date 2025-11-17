@@ -1,18 +1,23 @@
-/// Creates a `Vec<AnyOp>` from a list of `io_uring` operations.
+/// Creates a `Vec<AnyOp>` from a list of distinct operations.
 ///
-/// This convenience macro calls `.into()` on each argument, collecting them
-/// into a `Vec<AnyOp>`. It is most often used to build an `OpList`.
+/// This macro handles the conversion of concrete types (like `Bind`, `Listen`)
+/// into the `AnyOp` enum variant required by `OpList`.
 ///
-/// # Examples
+/// # Example
 ///
 /// ```ignore
-/// // Create a chained list of operations
+/// use ringolo::any_vec;
+/// use ringolo::future::lib::{Accept, Bind, KernelFdMode, Listen, OpList};
+///
+/// # async fn doc() -> anyhow::Result<()> {
 /// let ops = OpList::new_chain(any_vec![
-///     Bind::try_new(listener_ref, &sock_addr)?,
+///     Bind::new(listener_ref, &sock_addr),
 ///     Listen::new(listener_ref, 128),
 ///     Accept::new(listener_ref, KernelFdMode::Legacy, true, None),
 /// ])
 /// .await?;
+/// # Ok(())
+/// # }
 /// ```
 #[macro_export]
 macro_rules! any_vec{
@@ -21,12 +26,7 @@ macro_rules! any_vec{
     };
 }
 
-///
-/// Extracts a strongly-typed result from a single `Result<AnyOpOutput, IoError>`.
-///
-/// This contains the core extraction logic used by `any_extract!`.
-/// You can use this manually if you are iterating over the results
-/// vector yourself, but you must ensure `AnyOpOutput` is in scope.
+/// Extracts a strongly-typed result from a heterogeneous `AnyOpOutput`.
 ///
 /// # Examples
 ///
@@ -37,9 +37,9 @@ macro_rules! any_vec{
 /// ```
 ///
 /// # Panics
-/// This macro will **panic** if the `Ok(AnyOpOutput)` variant does not
-/// match the expected `$variant`.
 ///
+/// Panics if the runtime type does not match the expected variant. This is generally
+/// safe when used with `OpList` because the order of results matches the order of inputs.
 #[macro_export]
 macro_rules! any_extract {
     ($res:expr, $variant:ident) => {
@@ -72,7 +72,8 @@ macro_rules! any_extract {
 ///```
 ///
 /// # Panics
-/// This macro will **panic** if:
+///
+/// This macro will panic if:
 /// 1. The number of variants passed to the macro does not match the
 ///    length of the input `Vec`.
 /// 2. The type of an operation at a given index does not match the
@@ -106,6 +107,7 @@ macro_rules! any_extract_all {
     }};
 }
 
+#[allow(unused)]
 #[cold]
 #[track_caller]
 pub(crate) fn panic_any_extract<M>(msg: M) -> !

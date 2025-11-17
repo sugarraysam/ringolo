@@ -1,11 +1,11 @@
-#![allow(unsafe_op_in_unsafe_fn)]
+#![allow(unsafe_op_in_unsafe_fn, unused)]
 
 use crate::runtime::{Schedule, TaskMetadata, TaskOpts};
+use crate::task::Header;
 use crate::task::layout::TaskLayout;
 use crate::task::node::TaskNode;
 use crate::task::state::{Snapshot, State, TransitionToNotifiedByRef, TransitionToNotifiedByVal};
 use crate::task::trailer::Trailer;
-use crate::task::Header;
 use std::future::Future;
 use std::ptr::NonNull;
 use std::sync::Arc;

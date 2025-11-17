@@ -15,11 +15,14 @@ use std::task::Waker;
 
 use crate::context::ring::SingleIssuerRing;
 
-/// Core Thread-local context required by all flavors of schedulers. Requires
-/// interior mutability on ALL fields for best interface. Will allow borrowing
-/// multiple fields as mut in the same context. Otherwise we will run in borrow
-/// checker issues.
+/// The thread-local heart of a runtime worker.
+///
+/// `Core` allows a specific worker thread to perform I/O and manage tasks without
+/// locking shared resources. It is designed to be used via `RefCell` to allow
+/// holding mutable references to specific fields (like the `ring` or `slab`)
+/// while simultaneously borrowing the context.
 pub(crate) struct Core {
+    /// The unique identifier of the worker thread owning this core.
     pub(crate) thread_id: ThreadId,
 
     // Tracks pending I/O operations at two distinct levels:
@@ -43,17 +46,22 @@ pub(crate) struct Core {
     // on the root future, which makes sense as it would not be stealable anyways.
     pub(crate) pending_ios: Arc<AtomicUsize>,
 
-    /// Slab to manage RawSqe allocations for this thread.
+    /// High-performance slab allocator for `io_uring` Submission Queue Entries (SQEs).
+    /// Pre-allocates memory to avoid allocation during the hot path.
     pub(crate) slab: RefCell<RawSqeSlab>,
 
-    /// IoUring to submit and complete IO operations.
+    /// The raw file descriptor of the `io_uring` instance, cached for quick lookup.
     pub(crate) ring_fd: RawFd,
+
+    /// The underlying `io_uring` interface configured for Single Issuer mode.
     pub(crate) ring: RefCell<SingleIssuerRing>,
 
-    /// Task that is currently executing on this thread. This field is used to
-    /// determine the parent of newly spawned tasks.
+    /// The task currently being polled by this worker. Used to establish
+    /// parent-child relationships when spawning new tasks.
     pub(crate) current_task: RefCell<Option<Arc<TaskNode>>>,
 
+    /// A background task responsible for periodic cleanup or driving
+    /// non-blocking maintenance operations.
     pub(crate) maintenance_task: Arc<MaintenanceTask>,
 }
 

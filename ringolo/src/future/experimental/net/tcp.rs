@@ -1,15 +1,15 @@
 use super::UringSocket;
-use nix::sys::socket::{AddressFamily, SockProtocol, SockType};
 use std::{
     io,
     net::{SocketAddr, ToSocketAddrs},
     ops::Deref,
 };
 
-use crate::{
-    any_extract, any_extract_all, any_vec,
-    future::lib::{Bind, KernelFdMode, Listen, ReuseAddr, ReusePort, SetSockOpt, list::OpList},
-};
+use crate::future::lib::ops::sockopt::{ReuseAddr, ReusePort};
+use crate::future::lib::ops::{Bind, Listen, SetSockOpt};
+use crate::future::lib::types::{AddressFamily, SockProtocol, SockType};
+use crate::future::lib::{KernelFdMode, OpList};
+use crate::{any_extract, any_extract_all, any_vec};
 
 // TODO:
 // - accept
@@ -101,6 +101,7 @@ impl TcpSocket {
     }
 }
 
+#[doc(hidden)]
 impl Deref for TcpSocket {
     type Target = UringSocket;
 

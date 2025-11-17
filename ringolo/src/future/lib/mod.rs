@@ -1,30 +1,30 @@
-//! A collection of safe, idiomatic `OpPayload` and `OpStream` implementations
-//! for `io_uring`.
+//! # Low-Level I/O Building Blocks
+//!
+//! This module contains the foundational primitives for constructing asynchronous
+//! `io_uring` operations. It acts as a bridge between the raw, unsafe world of
+//! [`sqe`](crate::sqe) and the safe, idiomatic world of high-level Runtime APIs
+//! (like `fs` or `net`).
+//!
+//! ## For Runtime Developers
+//!
+//! **Target Audience:** This module is designed for **internal use** by runtime
+//! maintainers. If you are building a new high-level API (e.g., a new socket type),
+//! you will use the types defined here.
 //!
 //! ## Design Principles
 //!
-//! - **Ownership:** Payloads take ownership of resources (like buffers or paths).
-//!   Upon completion, the `Output` of the operation returns ownership of the
-//!   resource to the caller. For example, a `Read` operation returns `(buffer, bytes_read)`.
+//! * **Ownership & RAII:** Payloads strictly take ownership of resources (buffers,
+//!   paths, file descriptors). Upon completion, the `Output` returns ownership back
+//!   to the caller. This prevents use-after-free errors common in async C bindings.
 //!
-//! - **Safety:** The public API for each operation is safe. Constructors take safe
-//!   Rust types (`&Path`, `Vec<u8>`, `Duration`, etc.) and handle conversions
-//!   to the raw C types required by the kernel internally. We leverage self-referential
-//!   structs and pinning to guarantee argument stability until submit and/or complete.
-//!   This is enforced by the rust compiler through Pin.
+//! * **Self-Referential Stability:** `io_uring` requires pointers to remain valid
+//!   while the kernel holds them. We leverage [`Pin`](std::pin::Pin) and self-referential
+//!   structs to guarantee argument stability without heap allocation overhead.
 //!
-//! - **Self-Reference:** Operations that require stable pointers to their own data
-//!   (e.g., `Timeout`) store that data directly. The `OpPayload` trait's design
-//!   enables the safe creation of these pointers when the operation is first polled.
+//! * **Idiomatic Abstractions:** We abstract away `libc` structs (`timespec`,
+//!   `sockaddr`) in favor of Rust standard types (`Duration`, `SocketAddr`).
 //!
-//! - **Idiomatic Rust:** We want to abstract away working with `libc::*` structs
-//!   and raw pointers. We expose `std::lib` types in the arguments and return
-//!   `std::lib` types in the results.
-//!
-//! - **Don't do too much:** Let's not make opinionated decisions about how raw
-//!   results should be parsed. This is meant to be a low-level building block
-//!   library.
-//!
+
 use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
 use futures::Stream;
 use io_uring::squeue::Entry;
@@ -38,42 +38,48 @@ pub(crate) use errors::OpcodeError;
 
 #[macro_use]
 mod fd;
-#[allow(unused)]
+#[doc(inline)]
 pub use fd::{BorrowedUringFd, KernelFdMode, OwnedUringFd, UringFdKind};
 
+/// TODO: show macro inline here instead of crate root??
+/// Convenience macros to work with `OpList`.
 #[macro_use]
 pub mod list_macros;
-pub mod list;
 
-pub mod multishot;
-pub use multishot::*;
+#[doc(hidden)]
+pub mod list;
+#[doc(inline)]
+pub use list::{AnyOp, AnyOpOutput, OpList};
+
+pub mod ops;
 
 pub(super) mod parse;
 
-pub mod single;
-pub use single::*;
+/// Helper types to interact with `io_uring` and kernel interfaces.
+pub mod types;
 
-mod sockopt;
-pub use sockopt::*;
-
-mod types;
-
-/// Traits and structs for one-shot `io_uring` operation (i.e.: SqeSingle).
+/// Traits and structs for one-shot `io_uring` operation.
+///
+/// Implement this trait to define how a high-level struct (like `OpenAt`)
+/// translates into a raw `io_uring` Submission Queue Entry (SQE).
 pub(crate) trait OpPayload {
+    /// The result type produced when the operation completes (e.g., `i32`, `OwnedUringFd`).
     type Output;
 
+    /// Constructs the raw `io_uring` entry.
+    ///
+    /// This is called when the `Op` is first polled. The `self` is pinned, ensuring
+    /// that any pointers derived from `self` (like buffer pointers) remain valid
+    /// until the future is dropped.
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError>;
 
+    /// Transforms the raw kernel result into the high-level `Output`.
+    ///
+    /// The `waker` is passed to allow reconstructing the `Task` context if needed
+    /// (e.g., for resource tracking).
+    ///
     // Safety: This method should only be called once, when the operation is complete.
     // It is allowed to "consume the pin" so we can return owned data without copies.
-    //
-    // The reason we pass the waker to reconstruct the output is because it allows
-    // reconstructing a handle to the underlying ringolo runtime Task that owns this
-    // future. We keep track of thread-local iouring resources (e.g.: registered
-    // file descriptor, provided buffer, registered buffer), that are owned by each
-    // tasks. This information is used to determine when it is safe for a worker
-    // on another thread to steal the task without leaking or creating dangling
-    // resources.
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
@@ -81,6 +87,12 @@ pub(crate) trait OpPayload {
     ) -> Result<Self::Output, IoError>;
 }
 
+/// A generic Future that drives an `OpPayload`.
+///
+/// This wrapper manages the lifecycle of the operation:
+/// 1.  **Initialization:** Calls `create_entry` and submits to the ring.
+/// 2.  **Pinning:** Holds the data in place so the kernel can access it safely.
+/// 3.  **Completion:** Awaits the CQE and transforms the result via `into_output`.
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
 pub(crate) struct Op<T: OpPayload> {
@@ -106,6 +118,7 @@ impl<T: OpPayload + Clone> Clone for Op<T> {
 }
 
 impl<T: OpPayload> Op<T> {
+    #[allow(unused)]
     pub(crate) fn new(data: T) -> Self {
         Self {
             data,
@@ -191,6 +204,7 @@ impl MultishotParams {
     }
 }
 
+#[derive(Debug)]
 #[pin_project(PinnedDrop)]
 pub(crate) struct Multishot<T: MultishotPayload> {
     #[pin]
@@ -204,6 +218,7 @@ pub(crate) struct Multishot<T: MultishotPayload> {
 }
 
 impl<T: MultishotPayload> Multishot<T> {
+    #[allow(unused)]
     pub(crate) fn new(data: T) -> Self {
         Self {
             data,
@@ -291,6 +306,7 @@ impl<T: MultishotPayload> PinnedDrop for Multishot<T> {
 
 #[cfg(test)]
 mod tests {
+    use super::ops::AsyncCancel;
     use super::*;
     use crate::test_utils::*;
     use anyhow::Result;

@@ -1,13 +1,9 @@
 use crate::context::maintenance::cleanup::{CleanupHandler, CleanupOp};
 use crate::runtime::RuntimeConfig;
-use crate::spawn::{TaskOpts, TaskOptsInternal};
+use crate::spawn::MAINTENANCE_TASK_OPTS;
 use crate::utils::scope_guard::ScopeGuard;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock};
-
-pub(crate) static MAINTENANCE_TASK_OPTS: LazyLock<TaskOpts> = LazyLock::new(|| {
-    TaskOpts::STICKY | TaskOpts::BACKGROUND_TASK | TaskOptsInternal::MAINTENANCE_TASK.into()
-});
 
 #[derive(Debug)]
 pub(crate) struct MaintenanceTask {
@@ -41,7 +37,7 @@ impl MaintenanceTask {
         // Drop handle so that when we cancel the maintenance task, we also drop the
         // result. The result of the maintenance task *is never consumed* from outside
         // the maintenance task.
-        let _ = crate::spawn_builder()
+        let _handle = crate::spawn_builder()
             .with_opts(*MAINTENANCE_TASK_OPTS)
             .spawn(run(self));
     }

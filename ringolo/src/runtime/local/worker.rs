@@ -1,4 +1,4 @@
-use crate::context::{self, Shared};
+use crate::context;
 use crate::runtime::local;
 use crate::runtime::local::scheduler::LocalTask;
 use crate::runtime::runtime::RuntimeConfig;
@@ -11,7 +11,6 @@ use anyhow::{Result, anyhow};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::pin::pin;
-use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -28,20 +27,15 @@ pub(crate) struct Worker {
 
     /// Handle to single local queue.
     pollable: RefCell<VecDeque<LocalTask>>,
-
-    /// TODO: unused - remove?
-    /// Shared context available in scheduler and worker
-    shared: Arc<Shared>,
 }
 
 impl Worker {
-    pub(super) fn new(cfg: &RuntimeConfig, shared: Arc<Shared>) -> Self {
+    pub(super) fn new(cfg: &RuntimeConfig) -> Self {
         Self {
             thread_id: ThreadId::next(),
             cfg: RefCell::new(cfg.into()),
             ticker: RefCell::new(Ticker::new()),
             pollable: RefCell::new(VecDeque::new()),
-            shared,
         }
     }
 

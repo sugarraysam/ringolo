@@ -1,8 +1,10 @@
-pub mod sync_wrapper;
+pub(crate) mod io_uring;
+
+pub(crate) mod sync_wrapper;
 pub(crate) use sync_wrapper::SyncWrapper;
 
-pub mod scheduler;
+pub(crate) mod scheduler;
 
-pub mod scope_guard;
+pub(crate) mod scope_guard;
 
-pub mod thread;
+pub(crate) mod thread;
