@@ -470,6 +470,12 @@ bitflags!(
 #[repr(transparent)]
 pub struct OpenHow(io_uring::types::OpenHow);
 
+impl Default for OpenHow {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OpenHow {
     /// Creates a new `OpenHow` with empty flags, mode, and resolve.
     pub fn new() -> Self {

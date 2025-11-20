@@ -2,7 +2,7 @@
 //!
 //! This module contains the foundational primitives for constructing asynchronous
 //! `io_uring` operations. It acts as a bridge between the raw, unsafe world of
-//! [`sqe`](crate::sqe) and the safe, idiomatic world of high-level Runtime APIs
+//! **SQE Backends** and the safe, idiomatic world of high-level Runtime APIs
 //! (like `fs` or `net`).
 //!
 //! ## For Runtime Developers
@@ -41,10 +41,12 @@ mod fd;
 #[doc(inline)]
 pub use fd::{BorrowedUringFd, KernelFdMode, OwnedUringFd, UringFdKind};
 
-/// TODO: show macro inline here instead of crate root??
 /// Convenience macros to work with `OpList`.
 #[macro_use]
+#[doc(hidden)]
 pub mod list_macros;
+#[doc(inline)]
+pub use crate::{any_extract, any_extract_all, any_vec};
 
 #[doc(hidden)]
 pub mod list;
@@ -62,7 +64,7 @@ pub mod types;
 ///
 /// Implement this trait to define how a high-level struct (like `OpenAt`)
 /// translates into a raw `io_uring` Submission Queue Entry (SQE).
-pub(crate) trait OpPayload {
+pub trait OpPayload {
     /// The result type produced when the operation completes (e.g., `i32`, `OwnedUringFd`).
     type Output;
 
@@ -95,7 +97,7 @@ pub(crate) trait OpPayload {
 /// 3.  **Completion:** Awaits the CQE and transforms the result via `into_output`.
 #[pin_project(PinnedDrop)]
 #[derive(Debug)]
-pub(crate) struct Op<T: OpPayload> {
+pub struct Op<T: OpPayload> {
     #[pin]
     data: T,
 
@@ -166,22 +168,54 @@ impl<T: OpPayload> PinnedDrop for Op<T> {
     }
 }
 
+/// Specifies the mechanism used to cancel an in-flight operation.
 #[derive(Debug)]
-pub(crate) enum CancelHow {
+pub enum CancelHow {
+    /// Cancels the operation using [`IORING_OP_ASYNC_CANCEL`](https://man7.org/linux/man-pages/man3/io_uring_prep_cancel.3.html)
+    ///
+    /// This is the standard cancellation method for almost all I/O operations
+    /// (files, sockets, `poll_add`, etc.). It attempts to locate the request
+    /// in the ring by its `user_data` and cancel it.
     AsyncCancel,
+
+    /// Cancels the operation using [`IORING_OP_TIMEOUT_REMOVE`](https://man.archlinux.org/man/io_uring_prep_timeout_remove.3.en).
+    ///
+    /// This is required specifically for operations submitted via `IORING_OP_TIMEOUT`.
+    /// Attempting to cancel a native `io_uring` timer with `ASYNC_CANCEL` is incorrect
+    /// and will not work as intended.
     TimeoutRemove,
 }
 
 /// Traits and structs for multishot `io_uring` operations (i.e.: SqeStream).
-pub(crate) trait MultishotPayload {
+///
+/// Unlike [`OpPayload`], which maps 1 SQE to 1 CQE, a `MultishotPayload`
+/// maps **1 SQE to N CQEs**. This is used for operations like [`io_uring_prep_recv_multishot`]
+/// or repeated timer expirations.
+///
+/// Implementors of this trait define how to construct the initial request and how to
+/// parse the stream of completion results coming back from the kernel.
+///
+/// [`io_uring_prep_recv_multishot`]: https://man7.org/linux/man-pages/man3/io_uring_prep_recv_multishot.3.html
+pub trait MultishotPayload {
+    /// The type of each item yielded by the stream.
     type Item;
 
+    /// Determines the cancellation strategy for this operation.
     fn cancel_how(&self) -> CancelHow;
 
+    /// Constructs the parameters for the initial `io_uring` submission.
+    ///
+    /// This returns the raw `Entry` to be submitted and the expected completion count.
+    /// This is called exactly once when the `Multishot` stream is first polled.
     fn create_params(self: Pin<&mut Self>) -> Result<MultishotParams, OpcodeError>;
 
-    // See comment on `OpPayload::into_result` for why we are passing the Waker
-    // to reconstruct the next_item.
+    /// Transforms a raw kernel result (CQE `res` field) into the high-level `Item`.
+    ///
+    /// # Arguments
+    ///
+    /// * `waker` - The waker from the current task context. This is provided so that
+    ///   the payload can facilitate complex state tracking if necessary.
+    /// * `result` - The `res` field from the completion queue entry.
     fn into_next(
         self: Pin<&mut Self>,
         waker: &Waker,
@@ -189,13 +223,19 @@ pub(crate) trait MultishotPayload {
     ) -> Result<Self::Item, IoError>;
 }
 
+/// Configuration parameters for initializing a multishot operation.
 #[derive(Debug)]
-pub(crate) struct MultishotParams {
-    pub(crate) entry: Entry,
+pub struct MultishotParams {
+    /// The raw Submission Queue Entry (SQE) to be submitted to the ring.
+    pub entry: Entry,
 
-    // count == 0 means infinite multishot
-    // count == n means complete after n completions
-    pub(crate) count: u32,
+    /// The number of expected completions for this operation.
+    ///
+    /// * `count == 0`: **Infinite Multishot**. The operation remains active in the kernel
+    ///   until explicitly cancelled or an error occurs (e.g., `multishot accept`).
+    /// * `count > 0`: **Fixed Multishot**. The operation is expected to produce exactly
+    ///   `n` completions before terminating automatically.
+    pub count: u32,
 }
 
 impl MultishotParams {
@@ -204,9 +244,19 @@ impl MultishotParams {
     }
 }
 
+/// A generic `Stream` that drives a [`MultishotPayload`].
+///
+/// This wrapper manages the lifecycle of a persistent `io_uring` operation:
+/// 1. **Initialization**: Submits the SQE on the first poll.
+/// 2. **Streaming**: Yields items as CQEs arrive.
+/// 3. **Cancellation**: Automatically cancels the operation in the kernel when dropped.
+///
+/// # Pinning
+/// This struct is pinned to ensure that any buffers or resources owned by the `data`
+/// payload remain at a stable memory address for the duration of the kernel operation.
 #[derive(Debug)]
 #[pin_project(PinnedDrop)]
-pub(crate) struct Multishot<T: MultishotPayload> {
+pub struct Multishot<T: MultishotPayload> {
     #[pin]
     data: T,
 

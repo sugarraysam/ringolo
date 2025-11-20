@@ -16,7 +16,7 @@ pub use cancel::{
 /// Builder API to configure and create a runtime.
 pub mod runtime;
 #[doc(inline)]
-pub use runtime::{Builder, OrphanPolicy, Runtime};
+pub use runtime::{Builder, OnCleanupError, OrphanPolicy, Runtime};
 
 /// Utilities to spawn new tasks.
 pub mod spawn;

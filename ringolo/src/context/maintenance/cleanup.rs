@@ -40,12 +40,10 @@ use std::cell::RefCell;
 
 use crate::context;
 
-#[doc(inline)]
-use crate::context::maintenance::OnCleanupError;
 use crate::context::maintenance::queue::AsyncLocalQueue;
 use crate::future::lib::list::{AnyOp, OpList};
 use crate::future::lib::ops::{AsyncCancel, Close, TimeoutRemove};
-use crate::runtime::{PanicReason, SchedulerPanic};
+use crate::runtime::{OnCleanupError, PanicReason, SchedulerPanic};
 use crate::sqe::IoError;
 use anyhow::Result;
 use either::Either;
@@ -56,13 +54,13 @@ use io_uring::types::{CancelBuilder, Fd, Fixed};
 /// This is primarily used to stop "leaky" multishot operations that are
 /// not `TIMEOUT_REMOVE`. The `user_data` typically corresponds to the
 /// slab entry of the I/O operation being cancelled.
-pub fn async_cancel(builder: CancelBuilder, user_data: usize) {
+pub(crate) fn async_cancel(builder: CancelBuilder, user_data: usize) {
     let op = CleanupOp::new_cancel(builder, user_data);
     context::with_core(|core| core.maintenance_task.add_cleanup_op(op));
 }
 
 /// Enqueues an asynchronous `close` operation for a file descriptor.
-pub fn async_close(fd: Either<Fd, Fixed>) {
+pub(crate) fn async_close(fd: Either<Fd, Fixed>) {
     let op = CleanupOp::new_close(fd);
     context::with_core(|core| core.maintenance_task.add_cleanup_op(op));
 }
@@ -72,7 +70,7 @@ pub fn async_close(fd: Either<Fd, Fixed>) {
 /// This is the correct way to cancel a `TimeoutMultishot`, as it
 /// both removes the timer from `io_uring`'s internal data structures
 /// and (via `user_data`) releases its slab entry.
-pub fn async_timeout_remove(user_data: usize) {
+pub(crate) fn async_timeout_remove(user_data: usize) {
     let op = CleanupOp::new_timeout_remove(user_data as u64);
     context::with_core(|core| core.maintenance_task.add_cleanup_op(op));
 }

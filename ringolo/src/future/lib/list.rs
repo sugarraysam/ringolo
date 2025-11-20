@@ -304,7 +304,7 @@ mod tests {
     use crate::future::lib::{KernelFdMode, Op};
     use crate::task::JoinHandle;
     use crate::test_utils::*;
-    use crate::{any_extract, any_extract_all, any_vec};
+    use crate::future::lib::{any_extract, any_extract_all, any_vec};
     use anyhow::{Context, Result};
     use rstest::rstest;
     use std::net::IpAddr;

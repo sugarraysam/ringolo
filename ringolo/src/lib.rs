@@ -22,9 +22,9 @@
 //!
 //! [task module]: https://docs.rs/tokio/latest/tokio/#working-with-tasks
 //!
-//! ## Quick Start
+//! ## ⚡ Quick Start
 //!
-//! ```no_run
+//! ```
 //! #[ringolo::main]
 //! async fn main() {
 //!     println!("Hello from the runtime!");
@@ -39,9 +39,30 @@
 //! }
 //! ```
 //!
-//! ## Key features
+//! ## ✨ Key features
 //!
-//! ### I/O Model: Readiness vs. Completion
+//! ### 🚀 Submission Strategies
+//!
+//! The runtime supports four distinct submission backends to optimize throughput
+//! and latency:
+//!
+//! | Strategy | Description | Driver | Example |
+//! |:---|:---|:---|:---|
+//! | **Single** | Standard 1:1 dispatch. One SQE results in one CQE. | [`Op`] | [`Sleep`] |
+//! | **Chain** | Strict kernel-side ordering via [`IOSQE_IO_LINK`]. Defines dependent sequences without userspace latency. | [`OpList::new_chain`] | [`TcpListener::bind`] |
+//! | **Batch** | Same as **Chain**, except ops execute concurrently and complete in any order. | [`OpList::new_batch`] | N/A |
+//! | **Multishot** | Single SQE establishes a persistent request that generates a stream of CQEs (e.g. timers, accept). | [`Multishot`] | [`Tick`] |
+//!
+//! [`Op`]: crate::future::lib::Op
+//! [`Sleep`]: crate::future::experimental::time::Sleep
+//! [`IOSQE_IO_LINK`]: https://unixism.net/loti/tutorial/link_liburing.html
+//! [`OpList::new_chain`]: crate::future::lib::OpList
+//! [`OpList::new_batch`]: crate::future::lib::OpList
+//! [`TcpListener::bind`]: method@crate::future::experimental::net::tcp::TcpListener::bind
+//! [`Multishot`]: crate::future::lib::Multishot
+//! [`Tick`]: crate::future::experimental::time::Tick
+//!
+//! ### ⚙️ I/O Model: Readiness vs. Completion
 //!
 //! A key difference from Tokio is the underlying I/O model. Tokio is
 //! **readiness-based**, typically using `epoll`. This `epoll` context is global
@@ -53,7 +74,7 @@
 //! such as registered direct descriptors or provided buffers, are bound to that
 //! specific ring and are invalid on any other thread.
 //!
-//! ### Work-Stealing and Thread-Local Resources
+//! ### 🧵 Work-Stealing and Thread-Local Resources
 //!
 //! This thread-local design presents a core challenge for work-stealing.
 //! When an I/O operation is submitted on a thread's ring, its corresponding
@@ -66,17 +87,17 @@
 //!
 //! Ringolo's work-stealing scheduler is designed around this constraint. It
 //! performs resource and pending I/O accounting to determine when a task is
-//! "stealable". View the detailed implementation within the [task header module].
+//! "stealable". View the detailed implementation within the [task module].
 //!
-//! [task header module]: crate::task::Header::is_stealable
+//! [task module]: crate::task
 //!
-//! ### Structured Concurrency
+//! ### 🌳 Structured Concurrency
 //!
 //! Another key difference from Tokio is Ringolo's adoption of [Structured Concurrency].
 //! While this can be an overloaded term, in Ringolo it provides a simple guarantee:
 //! **tasks are not allowed to outlive their parent.**
 //!
-//! To enforce this, the runtime maintains a [global task tree] to track the task
+//! To enforce this, the runtime maintains a **global task tree** to track the task
 //! hierarchy. When a parent task exits, all of its child tasks are automatically
 //! cancelled.
 //!
@@ -93,12 +114,11 @@
 //!     all tasks, but it is not the intended model for typical use.
 //!
 //! [Structured Concurrency]: https://en.wikipedia.org/wiki/Structured_concurrency
-//! [global task tree]: crate::task::node::TaskNode
 //! [`OrphanPolicy::Enforced`]: crate::runtime::OrphanPolicy
 //! [`TaskOpts::BACKGROUND_TASK`]: crate::runtime::spawn::TaskOpts
 //! [`OrphanPolicy::Permissive`]: crate::runtime::OrphanPolicy
 //!
-//! #### Motivation: Safer Cancellation APIs
+//! #### 🛑 Motivation: Safer Cancellation APIs
 //!
 //! The primary motivation for this design is to provide powerful and safe
 //! cancellation APIs.
@@ -118,7 +138,26 @@
 //! [cancellation tokens]: https://github.com/facebook/folly/blob/main/folly/CancellationToken.h#L50-L68
 //! [cancellation APIs]: crate::runtime::cancel
 //!
-//! ### Async cleanup
+//! ## 🛡️ Kernel Interface & Pointer Stability
+//!
+//! Interfacing with `io_uring` requires passing raw memory addresses to the kernel.
+//! To prevent undefined behavior, the runtime guarantees strict pointer stability
+//! based on the data's role:
+//!
+//! * **Read-only inputs:** Pointers to input data (such as file paths) are guaranteed
+//!   to remain stable until the request is **submitted**.
+//! * **Writable outputs:** Pointers to mutable buffers (such as read destinations) are
+//!   guaranteed to remain stable until the operation **completes**.
+//!
+//! Ringolo handles these complex lifetime requirements transparently using
+//! **self-referential structs** and **pinning**. By taking ownership of resources
+//! and pinning them in memory, the runtime ensures the kernel never encounters
+//! a dangling pointer or a use-after-free error.
+//!
+//! For implementation details on these safe primitives, see the [`future::lib`](crate::future::lib)
+//! module.
+//!
+//! ### 🧹 Async cleanup via [RAII]
 //!
 //! The thread-local design of `io_uring` also dictates the model for resource
 //! cleanup. Certain "leaky" operations, like [multishot timers], and
@@ -126,19 +165,19 @@
 //! unregistered or closed.
 //!
 //! This cleanup **must** happen on the same thread's ring that created them.
-//! To solve this without blocking on `drop`, Ringolo uses a [maintenance task]
-//! on each worker thread. When a future is dropped, it enqueues an async
-//! cleanup operation with its local maintenance task. This task then batches
-//! and submits these operations, ensuring all resources are freed on the correct
-//! thread.
+//! To solve this without blocking on `drop`, Ringolo uses a **maintenance task**
+//! on each worker thread to handle this transparently. When a future is dropped,
+//! it enqueues an async cleanup operation with its local maintenance task. This
+//! task then batches and submits these operations, ensuring all resources are
+//! freed on the correct thread.
 //!
 //! The runtime's behavior on a failed cleanup operation is controlled by
 //! the [OnCleanupError] policy.
 //!
-//! [multishot timers]: crate::future::lib::TimeoutMultishot
-//! [direct descriptors]: crate::future::lib::UringFdKind::Fixed
-//! [maintenance task]: crate::context::maintenance::task::MaintenanceTask
-//! [OnCleanupError]: crate::context::maintenance::OnCleanupError
+//! [RAII]: https://en.cppreference.com/w/cpp/language/raii.html
+//! [multishot timers]: crate::future::lib::ops::TimeoutMultishot
+//! [direct descriptors]: crate::future::lib::UringFdKind::Direct
+//! [OnCleanupError]: crate::runtime::OnCleanupError
 
 #[doc(inline)]
 pub use ringolo_macros::main;
@@ -148,8 +187,8 @@ pub use ringolo_macros::test;
 
 /// Thread-local and shared context for the runtime workers.
 mod context;
-#[doc(inline)]
-pub use context::maintenance::cleanup::{async_cancel, async_close, async_timeout_remove};
+#[doc(hidden)]
+pub(crate) use context::maintenance::cleanup::{async_cancel, async_close, async_timeout_remove};
 
 /// User-facing set of libraries exposing native futures for the runtime.
 pub mod future;

@@ -6,11 +6,11 @@
 /// # Example
 ///
 /// ```ignore
-/// use ringolo::any_vec;
+/// use ringolo::future::lib::any_vec;
 /// use ringolo::future::lib::{Accept, Bind, KernelFdMode, Listen, OpList};
 ///
 /// # async fn doc() -> anyhow::Result<()> {
-/// let ops = OpList::new_chain(any_vec![
+/// let results = OpList::new_chain(any_vec![
 ///     Bind::new(listener_ref, &sock_addr),
 ///     Listen::new(listener_ref, 128),
 ///     Accept::new(listener_ref, KernelFdMode::Legacy, true, None),
@@ -20,6 +20,7 @@
 /// # }
 /// ```
 #[macro_export]
+#[doc(hidden)]
 macro_rules! any_vec{
     ($($op:expr),* $(,)?) => {
         vec![$($op.into()),*]
@@ -41,6 +42,7 @@ macro_rules! any_vec{
 /// Panics if the runtime type does not match the expected variant. This is generally
 /// safe when used with `OpList` because the order of results matches the order of inputs.
 #[macro_export]
+#[doc(hidden)]
 macro_rules! any_extract {
     ($res:expr, $variant:ident) => {
         match $res {
@@ -67,7 +69,7 @@ macro_rules! any_extract {
 /// # Examples
 ///
 ///```ignore
-/// use ringolo::any_extract_all;
+/// use ringolo::future::lib::any_extract_all;
 /// let (bind_res, listen_res) = any_extract_all!(results, Bind, Listen);
 ///```
 ///
@@ -80,6 +82,7 @@ macro_rules! any_extract {
 ///    expected variant.
 ///
 #[macro_export]
+#[doc(hidden)]
 macro_rules! any_extract_all {
     ($vec:expr, $($variant:ident),+) => {{
         // 1. Compile-time array of stringified variant names

@@ -1,9 +1,6 @@
 [workspace]
 resolver = "2"
-members = [
-  "ringolo",
-  "ringolo-macros",
-]
+members = ["ringolo", "ringolo-macros"]
 
 [patch.crates-io]
 ringolo = { path = "ringolo" }
