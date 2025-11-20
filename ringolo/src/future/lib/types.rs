@@ -38,6 +38,44 @@ pub enum AddressFamily {
     /// Near field communication
     Nfc = libc::AF_NFC,
 }
+bitflags! {
+    /// `AT_*` constants for use with [`LinkAt`], and other `*at` ops.
+    ///
+    /// [`LinkAt`]: crate::future::lib::ops::LinkAt
+    #[repr(transparent)]
+    #[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+    pub struct AtFlags: libc::c_int {
+        /// Do not dereference symbolic links; operate on the link itself.
+        const SYMLINK_NOFOLLOW = libc::AT_SYMLINK_NOFOLLOW;
+
+        /// Perform access checks using the effective user and group IDs.
+        const EACCESS = libc::AT_EACCESS;
+
+        /// Remove a directory instead of a file (equivalent to `rmdir`).
+        const REMOVEDIR = libc::AT_REMOVEDIR;
+
+        /// Follow symbolic links if the path is a link.
+        const SYMLINK_FOLLOW = libc::AT_SYMLINK_FOLLOW;
+
+        /// Suppress automounting if the path refers to an automount point.
+        const NO_AUTOMOUNT = libc::AT_NO_AUTOMOUNT;
+
+        /// Operate on the file descriptor directly if the path is an empty string.
+        const EMPTY_PATH = libc::AT_EMPTY_PATH;
+
+        /// Synchronize with the filesystem based on the default `stat()` behavior.
+        const STATX_SYNC_AS_STAT = libc::AT_STATX_SYNC_AS_STAT;
+
+        /// Force synchronization with the backing storage or server to ensure fresh data.
+        const STATX_FORCE_SYNC = libc::AT_STATX_FORCE_SYNC;
+
+        /// Do not synchronize; accept cached attributes if they are available.
+        const STATX_DONT_SYNC = libc::AT_STATX_DONT_SYNC;
+
+        /// <https://docs.rs/bitflags/*/bitflags/#externally-defined-flags>
+        const _ = !0;
+    }
+}
 
 /// Represents an event returned by `epoll_wait`.
 ///

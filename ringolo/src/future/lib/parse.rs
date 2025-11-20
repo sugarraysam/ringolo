@@ -1,7 +1,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
+use anyhow::{Result, anyhow};
+use std::ffi::CString;
 use std::fmt;
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 ///
 /// C socket integration with `libc`, copied from `std::net`.
@@ -140,4 +144,13 @@ fn ip_v4_addr_from_c(addr: libc::in_addr) -> Ipv4Addr {
 
 fn ip_v6_addr_from_c(addr: libc::in6_addr) -> Ipv6Addr {
     Ipv6Addr::from(addr.s6_addr)
+}
+
+pub(super) fn bytes_to_cstring(bytes: impl Into<Vec<u8>>) -> Result<CString> {
+    CString::new(bytes.into()).map_err(|e| anyhow!("Invalid name: {:?}", e))
+}
+
+pub(super) fn path_to_cstring(path: impl AsRef<Path>) -> Result<CString> {
+    CString::new(path.as_ref().as_os_str().as_bytes())
+        .map_err(|e| anyhow!("Invalid pathname: {:?}", e))
 }

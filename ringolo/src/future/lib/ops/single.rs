@@ -6,9 +6,10 @@
 
 use crate::future::lib::fd::AsRawOrDirect;
 use crate::future::lib::ops::sockopt::{AnySockOpt, SetSockOptIf};
+use crate::future::lib::parse::{bytes_to_cstring, path_to_cstring};
 use crate::future::lib::types::{
-    AddressFamily, EpollEvent, EpollOp, FallocateFlags, Futex2Flags, FutexWaiter, Mode, OFlag,
-    OpenHow, PosixFadviseAdvice, SockFlag, SockProtocol, SockType,
+    AddressFamily, AtFlags, EpollEvent, EpollOp, FallocateFlags, Futex2Flags, FutexWaiter, Mode,
+    OFlag, OpenHow, PosixFadviseAdvice, SockFlag, SockProtocol, SockType,
 };
 use crate::future::lib::{
     BorrowedUringFd, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, parse,
@@ -23,7 +24,6 @@ use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::task::Waker;
@@ -445,11 +445,9 @@ impl<'a> FGetXattr<'a> {
         name: impl Into<Vec<u8>>,
         len: u32,
     ) -> Result<Self, OpcodeError> {
-        let name = CString::new(name.into()).map_err(|e| anyhow!("Invalid name: {:?}", e))?;
-
         Ok(Self {
             fd,
-            name,
+            name: bytes_to_cstring(name)?,
             value: vec![0u8; len as usize],
             len,
         })
@@ -928,6 +926,67 @@ impl OpPayload for FutexWake {
     }
 }
 
+/// Get an extended attribute value.
+///
+/// Corresponds to [`io_uring_prep_getxattr`](https://man.archlinux.org/man/io_uring_prep_getxattr.3.en).
+#[derive(Debug)]
+#[pin_project]
+pub struct GetXattr {
+    #[pin]
+    name: CString,
+    #[pin]
+    value: Vec<u8>,
+    #[pin]
+    path: CString,
+    len: u32,
+}
+
+impl GetXattr {
+    /// Create a new `GetXattr` operation.
+    pub fn try_new(
+        name: impl Into<Vec<u8>>,
+        path: impl AsRef<Path>,
+        len: u32,
+    ) -> Result<Self, OpcodeError> {
+        Ok(Self {
+            name: bytes_to_cstring(name)?,
+            value: vec![0u8; len as usize],
+            path: path_to_cstring(path)?,
+            len,
+        })
+    }
+}
+
+impl OpPayload for GetXattr {
+    type Output = (i32, Vec<u8>);
+
+    fn create_entry(mut self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let mut this = self.as_mut().project();
+
+        let name_ptr = std::ptr::from_ref(&*this.name);
+        let path_ptr = std::ptr::from_ref(&*this.path);
+
+        let entry = io_uring::opcode::GetXattr::new(
+            name_ptr.cast(),
+            this.value.as_mut_ptr().cast(),
+            path_ptr.cast(),
+            *this.len,
+        );
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let mut this = self.project();
+        let res = result?;
+        Ok((res, std::mem::take(&mut this.value)))
+    }
+}
+
 /// Listen for connections on a socket.
 ///
 /// Corresponds to [`io_uring_prep_listen`](https://man.archlinux.org/man/io_uring_prep_listen.3.en).
@@ -965,6 +1024,76 @@ impl<'a> OpPayload for Listen<'a> {
     }
 }
 
+/// Creates a new link (also known as a hard link) to an existing file.
+/// Corresponds to [`io_uring_prep_linkat`](https://man7.org/linux/man-pages/man3/io_uring_prep_linkat.3.html)
+#[derive(Debug)]
+#[pin_project]
+pub struct LinkAt {
+    olddirfd: RawFd,
+    #[pin]
+    oldpath: CString,
+    newdirfd: RawFd,
+    #[pin]
+    newpath: CString,
+    flags: AtFlags,
+}
+
+impl LinkAt {
+    pub fn try_new(
+        olddirfd: Option<RawFd>,
+        oldpath: impl AsRef<Path>,
+        newdirfd: Option<RawFd>,
+        newpath: impl AsRef<Path>,
+        flags: AtFlags,
+    ) -> Result<Self, OpcodeError> {
+        if olddirfd.is_none() && !oldpath.as_ref().is_absolute() {
+            return Err(anyhow!("olddirfd can only be ignored if oldpath is absolute.").into());
+        }
+
+        if newdirfd.is_none() && !newpath.as_ref().is_absolute() {
+            return Err(anyhow!("newdirfd can only be ignored if newpath is absolute.").into());
+        }
+
+        Ok(Self {
+            olddirfd: olddirfd.unwrap_or(libc::AT_FDCWD),
+            oldpath: path_to_cstring(oldpath)?,
+            newdirfd: newdirfd.unwrap_or(libc::AT_FDCWD),
+            newpath: path_to_cstring(newpath)?,
+            flags,
+        })
+    }
+}
+
+impl OpPayload for LinkAt {
+    type Output = i32;
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        let oldpath_ptr = std::ptr::from_ref(&*this.oldpath);
+        let newpath_ptr = std::ptr::from_ref(&*this.newpath);
+
+        let entry = io_uring::opcode::LinkAt::new(
+            io_uring::types::Fd(*this.olddirfd),
+            oldpath_ptr.cast(),
+            io_uring::types::Fd(*this.newdirfd),
+            newpath_ptr.cast(),
+        )
+        .flags(this.flags.bits());
+
+        Ok(entry.build())
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        _waker: &Waker,
+        result: Result<i32, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let res = result?;
+        Ok(res)
+    }
+}
+
 /// Open and possibly create a file relative to a directory file descriptor.
 ///
 /// Corresponds to [`io_uring_prep_openat`](https://man.archlinux.org/man/io_uring_prep_openat.3.en).
@@ -972,9 +1101,9 @@ impl<'a> OpPayload for Listen<'a> {
 #[pin_project]
 pub struct OpenAt {
     fd_mode: KernelFdMode,
-    dirfd: Option<RawFd>,
+    dirfd: RawFd,
     #[pin]
-    pathname: CString,
+    path: CString,
     flags: OFlag,
     mode: Mode,
 }
@@ -984,25 +1113,22 @@ impl OpenAt {
     pub fn try_new(
         fd_mode: KernelFdMode,
         dirfd: Option<RawFd>,
-        pathname: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         flags: OFlag,
         mode: Mode,
     ) -> Result<Self, OpcodeError> {
-        if dirfd.is_none() && !pathname.as_ref().is_absolute() {
-            return Err(anyhow!("DirFd can only be ignored for absolute pathname.").into());
+        if dirfd.is_none() && !path.as_ref().is_absolute() {
+            return Err(anyhow!("dirfd can only be ignored if path is absolute.").into());
         }
 
         if flags.contains(OFlag::O_CREAT) && mode.is_empty() {
             return Err(anyhow!("Mode can't be empty if O_CREAT is set.").into());
         }
 
-        let pathname = CString::new(pathname.as_ref().as_os_str().as_bytes())
-            .map_err(|e| anyhow!("Invalid pathname: {:?}", e))?;
-
         Ok(Self {
             fd_mode,
-            dirfd,
-            pathname,
+            dirfd: dirfd.unwrap_or(libc::AT_FDCWD),
+            path: path_to_cstring(path)?,
             flags,
             mode,
         })
@@ -1015,13 +1141,13 @@ impl OpPayload for OpenAt {
     fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
         let this = self.project();
 
-        let dirfd = io_uring::types::Fd(this.dirfd.unwrap_or(libc::AT_FDCWD));
-
-        Ok(io_uring::opcode::OpenAt::new(dirfd, this.pathname.as_ptr())
-            .flags(this.flags.bits())
-            .mode(this.mode.bits())
-            .file_index(this.fd_mode.try_into_slot()?)
-            .build())
+        Ok(
+            io_uring::opcode::OpenAt::new(io_uring::types::Fd(*this.dirfd), this.path.as_ptr())
+                .flags(this.flags.bits())
+                .mode(this.mode.bits())
+                .file_index(this.fd_mode.try_into_slot()?)
+                .build(),
+        )
     }
 
     fn into_output(
@@ -1042,7 +1168,7 @@ pub struct OpenAt2 {
     fd_mode: KernelFdMode,
     dirfd: Option<RawFd>,
     #[pin]
-    pathname: CString,
+    path: CString,
     #[pin]
     how: OpenHow,
 }
@@ -1052,20 +1178,17 @@ impl OpenAt2 {
     pub fn try_new(
         fd_mode: KernelFdMode,
         dirfd: Option<RawFd>,
-        pathname: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         how: OpenHow,
     ) -> Result<Self, OpcodeError> {
-        if dirfd.is_none() && !pathname.as_ref().is_absolute() {
-            return Err(anyhow!("DirFd can only be ignored for absolute pathname.").into());
+        if dirfd.is_none() && !path.as_ref().is_absolute() {
+            return Err(anyhow!("DirFd can only be ignored for absolute path.").into());
         }
-
-        let pathname = CString::new(pathname.as_ref().as_os_str().as_bytes())
-            .map_err(|e| anyhow!("Invalid pathname: {:?}", e))?;
 
         Ok(Self {
             fd_mode,
             dirfd,
-            pathname,
+            path: path_to_cstring(path)?,
             how,
         })
     }
@@ -1081,7 +1204,7 @@ impl OpPayload for OpenAt2 {
         let how_ptr = std::ptr::from_ref(&*this.how);
 
         Ok(
-            io_uring::opcode::OpenAt2::new(dirfd, this.pathname.as_ptr(), how_ptr.cast())
+            io_uring::opcode::OpenAt2::new(dirfd, this.path.as_ptr(), how_ptr.cast())
                 .file_index(this.fd_mode.try_into_slot()?)
                 .build(),
         )
