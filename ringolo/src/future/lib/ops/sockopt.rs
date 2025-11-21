@@ -1,0 +1,549 @@
+//! All supported socket operations.
+//!
+//! Copied from [`nix`] crate and adapted for `io_uring` and async world.
+//! Omitted many of the platform dependent options and focused on Linux.
+//!
+//! [`nix`]: https://docs.rs/nix/latest/nix/sys/socket/trait.SetSockOpt.html
+
+use crate::future::lib::fd::AsRawOrDirect;
+use crate::future::lib::{BorrowedUringFd, OpcodeError};
+use io_uring::squeue::Entry;
+
+/// A trait implemented by all concrete socket option types (e.g., [`TcpNoDelay`], [`ReuseAddr`]).
+///
+/// This trait serves two purposes:
+/// 1. It allows specific options to be converted into the generic [`AnySockOpt`] enum.
+/// 2. It provides the logic to construct the raw `io_uring` submission entry (SQE) for the specific option.
+pub trait SetSockOptIf: Into<AnySockOpt> {
+    /// Constructs an `io_uring` submission entry for this socket option.
+    ///
+    /// This method is called by the runtime when preparing the operation for submission.
+    /// It takes a borrowed file descriptor and returns the configured SQE.
+    fn create_entry(&self, fd: BorrowedUringFd<'_>) -> Result<Entry, OpcodeError>;
+}
+
+/// Static dispatch enum for all concrete [`SetSockOptIf`] implementors.
+///
+/// This allows us to store any socket option in a concrete struct like [`OpList`](crate::future::lib::OpList),
+/// to create heterogenous chains and batches with static dispatch and no heap
+/// allocations.
+#[derive(Debug, Copy, Clone)]
+pub enum AnySockOpt {
+    /// See [`ReuseAddr`].
+    ReuseAddr(ReuseAddr),
+
+    /// See [`ReusePort`].
+    ReusePort(ReusePort),
+
+    /// See [`TcpNoDelay`].
+    TcpNoDelay(TcpNoDelay),
+
+    /// See [`Linger`].
+    Linger(Linger),
+
+    /// See [`ReceiveTimeout`].
+    ReceiveTimeout(ReceiveTimeout),
+
+    /// See [`SendTimeout`].
+    SendTimeout(SendTimeout),
+
+    /// See [`Broadcast`].
+    Broadcast(Broadcast),
+
+    /// See [`OobInline`].
+    OobInline(OobInline),
+
+    /// See [`DontRoute`].
+    DontRoute(DontRoute),
+
+    /// See [`KeepAlive`].
+    KeepAlive(KeepAlive),
+
+    /// See [`RcvBuf`].
+    RcvBuf(RcvBuf),
+
+    /// See [`SndBuf`].
+    SndBuf(SndBuf),
+
+    /// See [`ReceiveTimestamp`].
+    ReceiveTimestamp(ReceiveTimestamp),
+
+    /// See [`Mark`].
+    Mark(Mark),
+
+    /// See [`TxTime`].
+    TxTime(TxTime),
+
+    /// See [`Ipv6V6Only`].
+    Ipv6V6Only(Ipv6V6Only),
+
+    /// See [`AttachReusePortCbpf`].
+    AttachReusePortCbpf(AttachReusePortCbpf),
+}
+
+impl SetSockOptIf for AnySockOpt {
+    fn create_entry(&self, fd: BorrowedUringFd<'_>) -> Result<Entry, OpcodeError> {
+        match self {
+            AnySockOpt::ReuseAddr(op) => op.create_entry(fd),
+            AnySockOpt::ReusePort(op) => op.create_entry(fd),
+            AnySockOpt::TcpNoDelay(op) => op.create_entry(fd),
+            AnySockOpt::Linger(op) => op.create_entry(fd),
+            AnySockOpt::ReceiveTimeout(op) => op.create_entry(fd),
+            AnySockOpt::SendTimeout(op) => op.create_entry(fd),
+            AnySockOpt::Broadcast(op) => op.create_entry(fd),
+            AnySockOpt::OobInline(op) => op.create_entry(fd),
+            AnySockOpt::DontRoute(op) => op.create_entry(fd),
+            AnySockOpt::KeepAlive(op) => op.create_entry(fd),
+            AnySockOpt::RcvBuf(op) => op.create_entry(fd),
+            AnySockOpt::SndBuf(op) => op.create_entry(fd),
+            AnySockOpt::ReceiveTimestamp(op) => op.create_entry(fd),
+            AnySockOpt::Mark(op) => op.create_entry(fd),
+            AnySockOpt::TxTime(op) => op.create_entry(fd),
+            AnySockOpt::Ipv6V6Only(op) => op.create_entry(fd),
+            AnySockOpt::AttachReusePortCbpf(op) => op.create_entry(fd),
+        }
+    }
+}
+
+macro_rules! setsockopt_impl {
+    ($(#[$attr:meta])* $name:ident, $level:expr, $flag:path, bool) => {
+        setsockopt_impl!(
+            $(#[$attr])*
+            $name,
+            $level,
+            $flag,
+            bool,
+            $crate::future::lib::ops::sockopt::SetBool
+        );
+    };
+
+    ($(#[$attr:meta])* $name:ident, $level:expr, $flag:path, usize) => {
+        setsockopt_impl!(
+            $(#[$attr])*
+            $name,
+            $level,
+            $flag,
+            usize,
+            $crate::future::lib::ops::sockopt::SetUsize
+        );
+    };
+
+    ($(#[$attr:meta])* $name:ident, $level:expr, $flag:path, $ty:ty) => {
+        setsockopt_impl!(
+            $(#[$attr])*
+            $name,
+            $level,
+            $flag,
+            $ty,
+            $crate::future::lib::ops::sockopt::SetStruct<$ty>
+        );
+    };
+
+    ($(#[$attr:meta])* $name:ident, $level:expr, $flag:path, $ty:ty, $setter:ty) => {
+        $(#[$attr])*
+        #[derive(Debug, Copy, Clone)]
+        pub struct $name {
+            setter: $setter,
+        }
+
+        impl $name {
+            /// Create a new option with the given value.
+            pub fn new(val: $ty) -> Self {
+                Self {
+                    setter: <$setter>::new(val),
+                }
+            }
+        }
+
+        // Impl SetSockOptIf for Op.
+        impl $crate::future::lib::ops::sockopt::SetSockOptIf for $name {
+            fn create_entry(
+                &self,
+                fd: BorrowedUringFd<'_>,
+            ) -> Result<io_uring::squeue::Entry, $crate::future::lib::OpcodeError> {
+                let entry = resolve_fd!(fd, |fd| {
+                    io_uring::opcode::SetSockOpt::new(
+                        fd,
+                        $level as u32,
+                        $flag as u32,
+                        self.setter.ffi_ptr(),
+                        self.setter.ffi_len(),
+                    )
+                });
+
+                Ok(entry.build())
+            }
+        }
+
+        // Impl static dispatch enum for OpList.
+        impl From<$name> for AnySockOpt {
+            fn from(op: $name) -> Self {
+                AnySockOpt::$name(op)
+            }
+        }
+    };
+}
+
+setsockopt_impl!(
+    /// Enables local address reuse
+    ReuseAddr,
+    libc::SOL_SOCKET,
+    libc::SO_REUSEADDR,
+    bool
+);
+
+setsockopt_impl!(
+    /// Permits multiple AF_INET or AF_INET6 sockets to be bound to an
+    /// identical socket address.
+    ReusePort,
+    libc::SOL_SOCKET,
+    libc::SO_REUSEPORT,
+    bool
+);
+
+setsockopt_impl!(
+    /// Used to disable Nagle's algorithm.
+    ///
+    /// Nagle's algorithm:
+    ///
+    /// Under most circumstances, TCP sends data when it is presented; when
+    /// outstanding data has not yet been acknowledged, it gathers small amounts
+    /// of output to be sent in a single packet once an acknowledgement is
+    /// received.  For a small number of clients, such as window systems that
+    /// send a stream of mouse events which receive no replies, this
+    /// packetization may cause significant delays.  The boolean option, when
+    /// enabled, defeats this algorithm.
+    TcpNoDelay,
+    libc::IPPROTO_TCP,
+    libc::TCP_NODELAY,
+    bool
+);
+
+setsockopt_impl!(
+    /// When enabled, a close(2) or shutdown(2) will not return until all
+    /// queued messages for the socket have been successfully sent or the
+    /// linger timeout has been reached.
+    Linger,
+    libc::SOL_SOCKET,
+    libc::SO_LINGER,
+    libc::linger
+);
+
+setsockopt_impl!(
+    /// Specify the receiving timeout until reporting an error.
+    ReceiveTimeout,
+    libc::SOL_SOCKET,
+    libc::SO_RCVTIMEO,
+    libc::timeval
+);
+
+setsockopt_impl!(
+    /// Specify the sending timeout until reporting an error.
+    SendTimeout,
+    libc::SOL_SOCKET,
+    libc::SO_SNDTIMEO,
+    libc::timeval
+);
+
+setsockopt_impl!(
+    /// Set the broadcast flag.
+    Broadcast,
+    libc::SOL_SOCKET,
+    libc::SO_BROADCAST,
+    bool
+);
+
+setsockopt_impl!(
+    /// If this option is enabled, out-of-band data is directly placed into
+    /// the receive data stream.
+    OobInline,
+    libc::SOL_SOCKET,
+    libc::SO_OOBINLINE,
+    bool
+);
+
+setsockopt_impl!(
+    /// Set the don't route flag.
+    DontRoute,
+    libc::SOL_SOCKET,
+    libc::SO_DONTROUTE,
+    bool
+);
+
+setsockopt_impl!(
+    /// Enable sending of keep-alive messages on connection-oriented sockets.
+    KeepAlive,
+    libc::SOL_SOCKET,
+    libc::SO_KEEPALIVE,
+    bool
+);
+
+setsockopt_impl!(
+    /// Sets the maximum socket receive buffer in bytes.
+    RcvBuf,
+    libc::SOL_SOCKET,
+    libc::SO_RCVBUF,
+    usize
+);
+
+setsockopt_impl!(
+    /// Sets the maximum socket send buffer in bytes.
+    SndBuf,
+    libc::SOL_SOCKET,
+    libc::SO_SNDBUF,
+    usize
+);
+
+setsockopt_impl!(
+    /// Enable or disable the receiving of the `SO_TIMESTAMP` control message.
+    ReceiveTimestamp,
+    libc::SOL_SOCKET,
+    libc::SO_TIMESTAMP,
+    bool
+);
+
+setsockopt_impl!(
+    /// Set the mark for each packet sent through this socket (similar to the
+    /// netfilter MARK target but socket-based).
+    Mark,
+    libc::SOL_SOCKET,
+    libc::SO_MARK,
+    u32
+);
+
+setsockopt_impl!(
+    /// Configures the behavior of time-based transmission of packets, for use
+    /// with the `TxTime` control message.
+    TxTime,
+    libc::SOL_SOCKET,
+    libc::SO_TXTIME,
+    libc::sock_txtime
+);
+
+setsockopt_impl!(
+    /// The socket is restricted to sending and receiving IPv6 packets only.
+    Ipv6V6Only,
+    libc::IPPROTO_IPV6,
+    libc::IPV6_V6ONLY,
+    bool
+);
+
+setsockopt_impl!(
+    /// To be used with `ReusePort`,
+    /// we can then attach a BPF (classic)
+    /// to set how the packets are assigned
+    /// to the socket (e.g. cpu distribution).
+    AttachReusePortCbpf,
+    libc::SOL_SOCKET,
+    libc::SO_ATTACH_REUSEPORT_CBPF,
+    libc::sock_fprog
+);
+
+/// Helper trait that describes what is expected from a `SetSockOptIf` setter.
+#[doc(hidden)]
+trait Set<T> {
+    /// Initialize the setter with a given value.
+    fn new(val: T) -> Self;
+
+    /// Returns a pointer to the stored value. This pointer will be passed to the system's
+    /// `setsockopt` call (`man 3p setsockopt`, argument `option_value`).
+    fn ffi_ptr(&self) -> *const libc::c_void;
+
+    /// Returns length of the stored value. This pointer will be passed to the system's
+    /// `setsockopt` call (`man 3p setsockopt`, argument `option_len`).
+    fn ffi_len(&self) -> libc::socklen_t;
+}
+
+/// Setter for a boolean value.
+// Hide the docs, because it's an implementation detail of `sockopt_impl!`
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SetBool {
+    val: libc::c_int,
+}
+
+impl Set<bool> for SetBool {
+    fn new(val: bool) -> SetBool {
+        SetBool {
+            val: i32::from(val),
+        }
+    }
+
+    fn ffi_ptr(&self) -> *const libc::c_void {
+        std::ptr::from_ref(&self.val).cast()
+    }
+
+    fn ffi_len(&self) -> libc::socklen_t {
+        std::mem::size_of_val(&self.val) as libc::socklen_t
+    }
+}
+
+/// Setter for an `usize` value.
+// Hide the docs, because it's an implementation detail of `sockopt_impl!`
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SetUsize {
+    val: libc::c_int,
+}
+
+impl Set<usize> for SetUsize {
+    fn new(val: usize) -> SetUsize {
+        SetUsize {
+            val: val as libc::c_int,
+        }
+    }
+
+    fn ffi_ptr(&self) -> *const libc::c_void {
+        std::ptr::from_ref(&self.val).cast()
+    }
+
+    fn ffi_len(&self) -> libc::socklen_t {
+        std::mem::size_of_val(&self.val) as libc::socklen_t
+    }
+}
+
+/// Setter for an arbitrary `struct`.
+// Hide the docs, because it's an implementation detail of `sockopt_impl!`
+#[doc(hidden)]
+#[derive(Debug, Copy, Clone)]
+pub struct SetStruct<T> {
+    ptr: T,
+}
+
+impl<T> Set<T> for SetStruct<T>
+where
+    T: Copy + Clone,
+{
+    fn new(ptr: T) -> SetStruct<T> {
+        SetStruct { ptr }
+    }
+
+    fn ffi_ptr(&self) -> *const libc::c_void {
+        std::ptr::from_ref(&self.ptr).cast()
+    }
+
+    fn ffi_len(&self) -> libc::socklen_t {
+        std::mem::size_of::<T>() as libc::socklen_t
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::BorrowedFd;
+
+    use super::*;
+    use crate::future::lib::ops::SetSockOpt;
+    use crate::future::lib::{Op, OwnedUringFd};
+    use crate::test_utils::*;
+    use crate::{self as ringolo, future::lib::KernelFdMode};
+    use anyhow::{Context, Result};
+    use nix::sys::socket as nix;
+    use rstest::rstest;
+
+    fn getsockopt<O: nix::GetSockOpt>(fd: &OwnedUringFd, opt: O) -> O::Val {
+        fd.with_raw(|fd| {
+            let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+            nix::getsockopt(&borrowed, opt)
+        })
+        .expect("failed to raw fd")
+        .expect("failed to get sockopt")
+    }
+
+    #[rstest]
+    #[case::reuse_addr(ReuseAddr::new(true), nix::sockopt::ReuseAddr)]
+    #[case::reuse_port(ReusePort::new(true), nix::sockopt::ReusePort)]
+    #[case::tcp_no_delay(TcpNoDelay::new(true), nix::sockopt::TcpNoDelay)]
+    #[case::broadcast(Broadcast::new(true), nix::sockopt::Broadcast)]
+    #[case::oob_inline(OobInline::new(true), nix::sockopt::OobInline)]
+    #[case::dont_route(DontRoute::new(true), nix::sockopt::DontRoute)]
+    #[case::keep_alive(KeepAlive::new(true), nix::sockopt::KeepAlive)]
+    #[ringolo::test]
+    async fn test_setsockopt_bool_opts<O, N>(
+        #[case] ringolo_opt: O,
+        #[case] nix_opt: N,
+    ) -> Result<()>
+    where
+        O: Into<AnySockOpt>,
+        N: nix::GetSockOpt<Val = bool>,
+    {
+        let sockfd = tcp_socket4(KernelFdMode::Legacy)
+            .await
+            .context("failed to create sockfd")?;
+
+        let before = getsockopt(&sockfd, nix_opt);
+        assert_eq!(before, false);
+
+        Op::new(SetSockOpt::new(sockfd.borrow(), ringolo_opt))
+            .await
+            .context("failed to set opt")?;
+
+        let after = getsockopt(&sockfd, nix_opt);
+        assert_eq!(after, true);
+
+        Ok(())
+    }
+
+    #[rstest]
+    #[case::recv_buf(true, nix::sockopt::RcvBuf)]
+    #[case::send_buf(false, nix::sockopt::SndBuf)]
+    #[ringolo::test]
+    async fn test_setsockopt_usize_opts<N>(#[case] recv_buf: bool, #[case] nix_opt: N) -> Result<()>
+    where
+        N: nix::GetSockOpt<Val = usize>,
+    {
+        let sockfd = tcp_socket4(KernelFdMode::Legacy)
+            .await
+            .context("failed to create sockfd")?;
+
+        let before = getsockopt(&sockfd, nix_opt);
+        if recv_buf {
+            Op::new(SetSockOpt::new(sockfd.borrow(), RcvBuf::new(before * 2))).await
+        } else {
+            Op::new(SetSockOpt::new(sockfd.borrow(), SndBuf::new(before * 2))).await
+        }
+        .context("failed to setopt")?;
+
+        // Kernel only uses the value as a *hint*
+        let after = getsockopt(&sockfd, nix_opt);
+        assert!(after > before);
+
+        Ok(())
+    }
+
+    #[ringolo::test]
+    async fn test_setsockopt_linger() -> Result<()> {
+        let sockfd = tcp_socket4(KernelFdMode::Legacy)
+            .await
+            .context("failed to create sockfd")?;
+
+        let before = getsockopt(&sockfd, nix::sockopt::Linger);
+        assert_eq!(
+            before,
+            libc::linger {
+                l_onoff: 0,
+                l_linger: 0
+            }
+        );
+
+        Op::new(SetSockOpt::new(
+            sockfd.borrow(),
+            Linger::new(libc::linger {
+                l_onoff: 1,
+                l_linger: 10,
+            }),
+        ))
+        .await
+        .context("failed to set opt")?;
+
+        let after = getsockopt(&sockfd, nix::sockopt::Linger);
+        assert_eq!(
+            after,
+            libc::linger {
+                l_onoff: 1,
+                l_linger: 10,
+            }
+        );
+
+        Ok(())
+    }
+}
