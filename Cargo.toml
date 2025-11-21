@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["ringolo", "ringolo-macros"]
+
+[patch.crates-io]
+ringolo = { path = "ringolo" }
+ringolo-macros = { path = "ringolo-macros" }

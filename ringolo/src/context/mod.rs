@@ -1,0 +1,365 @@
+//! # Runtime Context
+//!
+//! This module manages the internal state of the runtime, split into two distinct
+//! abstraction layers to balance high-performance I/O with multi-threaded coordination:
+//!
+//! ## 1. The `Core` Context (Thread-Local)
+//!
+//! The [`Core`] is the "hot path" context. It is strictly **thread-local** and initialized
+//! once per worker thread.
+//!
+//! * **Design:** It uses internal mutability (`RefCell`) rather than synchronization primitives (`Mutex`/`RwLock`).
+//! * **Purpose:** It holds resources that are accessed frequently during the event loop, such as the `io_uring` instance ([`SingleIssuerRing`]), the slab allocator for I/O requests ([`RawSqeSlab`]), and the currently executing task.
+//! * **Benefit:** This ensures that the main polling loop incurs zero synchronization overhead (atomics/locks) when submitting I/O or switching tasks on the same thread.
+//!
+//! ## 2. The `Shared` Context (Global)
+//!
+//! The [`Shared`] context is **global** and thread-safe. It is wrapped in an `Arc` and accessible by all workers.
+//!
+//! * **Design:** It uses synchronization primitives (`RwLock`, `AtomicUsize`) to manage concurrent access.
+//! * **Purpose:** It handles coordination logic, such as:
+//!     * **Work Stealing:** Tracking which workers are busy or idle.
+//!     * **Parking/Unparking:** Managing the stack of sleeping threads using a LIFO strategy for cache locality.
+//!     * **Lifecycle:** Broadcasting shutdown signals.
+//!     * **Cross-thread notification:** Allowing one thread to wake up another.
+//!
+//! [`Core`]: crate::context::Core
+//! [`SingleIssuerRing`]: crate::context::SingleIssuerRing
+//! [`RawSqeSlab`]: crate::context::RawSqeSlab
+//! [`Shared`]: crate::context::Shared
+
+// Keep unused context methods to provide rich API for future developers.
+#![allow(dead_code)]
+
+use crate::runtime::{Scheduler, local, stealing};
+use crate::task::ThreadId;
+use crate::task::{Id, TaskNode};
+use std::cell::{OnceCell, RefCell};
+use std::sync::Arc;
+use std::thread_local;
+
+// Exports
+mod core;
+pub(crate) use core::Core;
+
+pub(crate) mod maintenance;
+
+pub(crate) mod ring;
+pub(crate) use ring::SingleIssuerRing;
+
+pub(crate) mod shared;
+pub(crate) use shared::Shared;
+
+pub(crate) mod slab;
+pub(crate) use slab::RawSqeSlab;
+
+mod slots;
+
+pub(crate) struct RootContext {
+    context: Context,
+    scheduler: Scheduler,
+}
+
+impl RootContext {
+    fn new_local(ctx: local::Context, scheduler: local::Handle) -> Self {
+        Self {
+            context: Context::Local(ctx),
+            scheduler: Scheduler::Local(scheduler),
+        }
+    }
+
+    fn new_stealing(ctx: stealing::Context, scheduler: stealing::Handle) -> Self {
+        Self {
+            context: Context::Stealing(ctx),
+            scheduler: Scheduler::Stealing(scheduler),
+        }
+    }
+}
+
+// We need type erasure in Thread-local storage so we hide the runtime context
+// impl behind this enum and unfortunately have to match everywhere. This is
+// still better than doing dynamic dispatch.
+pub(crate) enum Context {
+    Local(local::Context),
+    Stealing(stealing::Context),
+}
+
+thread_local! {
+    static CONTEXT: OnceCell<RefCell<RootContext>> = const { OnceCell::new() };
+}
+
+#[track_caller]
+pub(crate) fn init_local_context(scheduler: local::Handle) {
+    CONTEXT.with(|ctx| {
+        ctx.get_or_init(|| {
+            let ctx = local::Context::try_new(&scheduler.cfg, &scheduler)
+                .expect("Failed to initialize thread-local context");
+
+            RefCell::new(RootContext::new_local(ctx, scheduler))
+        });
+    });
+}
+
+#[track_caller]
+pub(crate) fn init_stealing_context(thread_id: ThreadId, scheduler: stealing::Handle) {
+    CONTEXT.with(|ctx| {
+        ctx.get_or_init(|| {
+            let ctx = stealing::Context::try_new(
+                thread_id,
+                &scheduler.cfg,
+                Arc::clone(&scheduler.shared),
+            )
+            .expect("Failed to initialize stealing context");
+
+            RefCell::new(RootContext::new_stealing(ctx, scheduler))
+        });
+    });
+}
+
+pub(crate) fn expect_local_scheduler<F, R>(f: F) -> R
+where
+    F: FnOnce(&local::Context, &local::Handle) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+
+        match (&root.context, &root.scheduler) {
+            (Context::Local(ctx), Scheduler::Local(scheduler)) => f(ctx, scheduler),
+            _ => panic_scheduler_uninitialized(),
+        }
+    })
+}
+
+pub(crate) fn expect_stealing_scheduler<F, R>(f: F) -> R
+where
+    F: FnOnce(&stealing::Context, &stealing::Handle) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+
+        match (&root.context, &root.scheduler) {
+            (Context::Stealing(ctx), Scheduler::Stealing(scheduler)) => f(ctx, scheduler),
+            _ => panic_scheduler_uninitialized(),
+        }
+    })
+}
+
+#[inline(always)]
+pub(crate) fn with_core<F, R>(f: F) -> R
+where
+    F: FnOnce(&Core) -> R,
+{
+    with_context(|outer| match outer {
+        Context::Local(c) => c.with_core(f),
+        Context::Stealing(c) => c.with_core(f),
+    })
+}
+
+#[inline(always)]
+pub(crate) fn with_shared<F, R>(f: F) -> R
+where
+    F: FnOnce(&Arc<Shared>) -> R,
+{
+    with_context(|outer| match outer {
+        Context::Local(c) => c.with_shared(f),
+        Context::Stealing(c) => c.with_shared(f),
+    })
+}
+
+#[inline(always)]
+pub(crate) fn with_slab<F, R>(f: F) -> R
+where
+    F: FnOnce(&RawSqeSlab) -> R,
+{
+    with_core(|core| f(&core.slab.borrow()))
+}
+
+#[inline(always)]
+pub(crate) fn with_slab_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut RawSqeSlab) -> R,
+{
+    with_core(|core| f(&mut core.slab.borrow_mut()))
+}
+
+#[inline(always)]
+pub(crate) fn with_ring<F, R>(f: F) -> R
+where
+    F: FnOnce(&SingleIssuerRing) -> R,
+{
+    with_core(|core| f(&core.ring.borrow()))
+}
+
+#[inline(always)]
+pub(crate) fn with_ring_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut SingleIssuerRing) -> R,
+{
+    with_core(|core| f(&mut core.ring.borrow_mut()))
+}
+
+#[inline(always)]
+pub(crate) fn with_slab_and_ring<F, R>(f: F) -> R
+where
+    F: FnOnce(&RawSqeSlab, &SingleIssuerRing) -> R,
+{
+    with_slab(|slab| with_ring(|ring| f(slab, ring)))
+}
+
+#[inline(always)]
+pub(crate) fn with_slab_and_ring_mut<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut RawSqeSlab, &mut SingleIssuerRing) -> R,
+{
+    with_core(|core| {
+        let mut slab = core.slab.borrow_mut();
+        let mut ring = core.ring.borrow_mut();
+        f(&mut slab, &mut ring)
+    })
+}
+
+#[inline(always)]
+pub(crate) fn current_task_id() -> Option<Id> {
+    with_core(|core| core.current_task.borrow().as_ref().map(|t| t.id))
+}
+
+#[inline(always)]
+pub(crate) fn current_task() -> Option<Arc<TaskNode>> {
+    with_core(|core| core.current_task.borrow().clone())
+}
+
+#[inline(always)]
+pub(crate) fn set_current_task(task: Option<Arc<TaskNode>>) -> Option<Arc<TaskNode>> {
+    with_core(|core| core.current_task.replace(task))
+}
+
+// Private helpers.
+#[inline(always)]
+pub(crate) fn with_context<F, R>(f: F) -> R
+where
+    F: FnOnce(&Context) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+        f(&root.context)
+    })
+}
+
+#[inline(always)]
+pub(crate) fn with_scheduler<F, R>(f: F) -> R
+where
+    F: FnOnce(&Scheduler) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+        f(&root.scheduler)
+    })
+}
+
+/// The macro accepts a pattern that looks just like a closure.
+/// `|$scheduler:ident|`` is the argument name (e.g., |s| or |scheduler|)
+/// `$body:block` is the code block that follows.
+//
+// Could not make this work without a macro. Tried a few things but:
+// - can't coerce a scheduler reference to &dyn Schedule because of Sized bound
+// - can't impl enum static dispatch (impl Schedule on Context) because
+//   Task<Self> arguments
+// - `for<S: Schedule> FnOnce(&S)` HRBT not yet supported: https://github.com/rust-lang/rust/issues/108185
+#[doc(hidden)]
+#[macro_export]
+macro_rules! with_scheduler {
+    (|$scheduler:ident| $body:block) => {
+        $crate::context::with_scheduler(|root| match root {
+            $crate::runtime::Scheduler::Local(s) => {
+                let $scheduler = s;
+                $body
+            }
+            $crate::runtime::Scheduler::Stealing(s) => {
+                let $scheduler = s;
+                $body
+            }
+        })
+    };
+}
+
+#[track_caller]
+#[cold]
+fn panic_scheduler_uninitialized() -> ! {
+    panic!("Expected scheduler to be initialized.");
+}
+
+#[derive(Debug)]
+pub(crate) enum PendingIoOp {
+    Increment,
+    Decrement,
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::runtime::Builder;
+    use crate::test_utils::init_local_runtime_and_context;
+
+    use super::*;
+    use anyhow::Result;
+    use std::panic::catch_unwind;
+    use std::thread;
+
+    #[test]
+    fn test_context_is_thread_local() -> Result<()> {
+        const THREAD_A_RING_SIZE: usize = 64;
+        const THREAD_B_RING_SIZE: usize = 64;
+
+        let builder_a = Builder::new_local().sq_ring_size(THREAD_A_RING_SIZE);
+        let builder_b = Builder::new_local().sq_ring_size(THREAD_B_RING_SIZE);
+
+        let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder_a))?;
+
+        with_slab_and_ring_mut(|slab, ring| {
+            assert_eq!(slab.capacity(), THREAD_A_RING_SIZE * 2);
+            assert_eq!(ring.sq().capacity(), THREAD_A_RING_SIZE);
+        });
+
+        let handle = thread::spawn(move || -> Result<()> {
+            init_local_runtime_and_context(Some(builder_b))?;
+            with_slab_and_ring_mut(|slab, ring| {
+                assert_eq!(slab.capacity(), THREAD_B_RING_SIZE * 2);
+                assert_eq!(ring.sq().capacity(), THREAD_B_RING_SIZE);
+            });
+            Ok(())
+        });
+
+        assert!(handle.join().is_ok());
+
+        with_slab_and_ring_mut(|slab, ring| {
+            assert_eq!(slab.capacity(), THREAD_B_RING_SIZE * 2);
+            assert_eq!(ring.sq().capacity(), THREAD_B_RING_SIZE);
+        });
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_context_has_interior_mutability() -> Result<()> {
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+
+        assert!(
+            catch_unwind(|| {
+                with_context(|_outer_ctx| with_slab_and_ring_mut(|_slab, _ring| {}))
+            })
+            .is_ok(),
+            "Can borrow two root fields as mut because interior mutability."
+        );
+
+        assert!(
+            catch_unwind(|| {
+                with_context(|_outer_ctx| {
+                    with_context(|_inner_ctx| {});
+                })
+            })
+            .is_ok(),
+            "Can have N immutable borrows of root context."
+        );
+
+        Ok(())
+    }
+}
