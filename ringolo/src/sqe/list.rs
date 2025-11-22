@@ -99,22 +99,25 @@ impl Submittable for SqeList {
                 context::with_slab_and_ring_mut(|slab, ring| {
                     let reserved_batch = slab.reserve_batch(builder.len())?;
 
-                    let (raws, next_state) = builder.build(&reserved_batch);
+                    // 1. Assign `user_data` (slab indices) to the entries.
+                    //
+                    // Note: This increments pending IO counters immediately. This is exception-safe:
+                    // if `ring.push_batch` fails below, `raws` will go out of scope and the `RawSqe`
+                    // destructor will automatically decrement the counters.
+                    let (raws, next_state) = builder.build(waker, &reserved_batch);
+
+                    // 2. Submit entries to the ring now that they have the correct `user_data`.
                     ring.push_batch(builder.entries())?;
 
+                    // 3. Commit the RawSqes to the slab.
                     reserved_batch.commit(raws)?;
                     Ok(next_state)
                 })
             }
         }
+        // On successful push, transition state to submitted.
         .map(|next_state| {
-            // On successful push, we can transition the state and increment the
-            // number of pending IOs at both the thread-level and task-level.
             self.state = next_state;
-            context::with_core(|core| {
-                core.increment_pending_ios();
-                core.increment_task_pending_ios(waker);
-            });
         })
     }
 }
@@ -152,12 +155,6 @@ impl Completable for SqeList {
                 "SqeList completion logic error: unable to free all RawSqes"
             );
 
-            // # Important
-            // We need to decrement task `pending_ios` *after* dropping the RawSqe
-            // to prevent making the task stealable while it still needs to drop this
-            // RawSqe from thread-local slab.
-            context::with_core(|c| c.decrement_task_pending_ios(waker));
-
             res
         });
 
@@ -169,10 +166,6 @@ impl Completable for SqeList {
 impl Drop for SqeList {
     fn drop(&mut self) {
         if let SqeListState::Submitted { indices, .. } = &self.state {
-            // If we get here, it means *nothing* will decrement the task pending_ios.
-            // The consequence is the task will *not be stealable*. We can live with that
-            // and there is no way to get access to the underlying task anyways because
-            // the Waker is lost.
             context::with_slab_mut(|slab| {
                 indices.iter().for_each(|idx| {
                     if slab.try_remove(*idx).is_none() {
@@ -347,6 +340,7 @@ impl SqeListBuilderInner {
     // respect this order when returning results.
     fn build(
         &mut self,
+        waker: &Waker,
         batch: &SlabReservedBatch<'_>,
     ) -> (SmallVec<[RawSqe; SPILL_TO_HEAP_THRESHOLD]>, SqeListState) {
         let n_sqes = self.list.len();
@@ -356,10 +350,10 @@ impl SqeListBuilderInner {
         let head_idx = indices[0];
 
         let raws = iter::repeat_with(|| {
-            RawSqe::new(CompletionHandler::new_batch_or_chain(
-                head_idx,
-                Arc::clone(&remaining),
-            ))
+            RawSqe::new(
+                waker,
+                CompletionHandler::new_batch_or_chain(head_idx, Arc::clone(&remaining)),
+            )
         })
         .take(n_sqes)
         .collect();
@@ -392,6 +386,7 @@ mod tests {
     use anyhow::{Result, anyhow};
     use either::Either;
     use rstest::rstest;
+    use std::collections::HashSet;
     use std::pin::pin;
     use std::sync::atomic::Ordering;
     use std::task::{Context, Poll};
@@ -409,11 +404,13 @@ mod tests {
         };
 
         // Need to submit for slab to be populated.
-        let (waker, _) = mock_waker();
+        let (waker, waker_data) = mock_waker();
         list.submit(&waker)?;
-        list.set_waker(&waker)?;
 
-        let mut num_heads = 0;
+        assert_eq!(waker_data.get_pending_ios(), n as u32);
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), n);
+
+        let mut seen_heads = HashSet::new();
 
         context::with_slab(|slab| -> Result<()> {
             let SqeListState::Submitted { indices, .. } = &list.state else {
@@ -422,17 +419,15 @@ mod tests {
 
             for idx in indices {
                 let sqe = slab.get(*idx)?;
-                assert_eq!(sqe.get_state(), RawSqeState::Pending);
+                assert_eq!(sqe.state, RawSqeState::Pending);
 
                 match &sqe.handler {
                     CompletionHandler::BatchOrChain {
                         head, remaining, ..
                     } => {
                         assert_eq!(remaining.load(Ordering::Relaxed), indices.len());
-                        if sqe.has_waker() {
-                            assert_eq!(*idx, *head, "sqe with waker should be head node");
-                            num_heads += 1;
-                        }
+                        assert!(sqe.waker.is_some());
+                        seen_heads.insert(*head);
                     }
                     _ => assert!(false, "unexpected completion handler"),
                 }
@@ -440,7 +435,7 @@ mod tests {
             Ok(())
         })?;
 
-        assert_eq!(num_heads, 1, "expected one unique head node");
+        assert_eq!(seen_heads.len(), 1, "expected one unique head node");
         Ok(())
     }
 
@@ -474,8 +469,8 @@ mod tests {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
 
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 1));
-            assert_eq!(waker_data.get_pending_ios(), 1);
+            assert_eq!(context::with_core(|core| core.get_pending_ios()), size);
+            assert_eq!(waker_data.get_pending_ios(), size as u32);
         }
 
         let head_idx = sqe_fut.get().get_head_idx()?;
@@ -483,11 +478,10 @@ mod tests {
         context::with_slab_and_ring_mut(|slab, ring| {
             assert_eq!(ring.sq().len(), size);
 
-            // Waker only set on head in batch/chain setup
             let res = slab.get(head_idx).and_then(|sqe| {
                 assert!(!sqe.is_ready());
-                assert!(sqe.has_waker());
-                assert_eq!(sqe.get_state(), RawSqeState::Pending);
+                assert!(sqe.waker.is_some());
+                assert_eq!(sqe.state, RawSqeState::Pending);
                 Ok(())
             });
 
@@ -500,12 +494,9 @@ mod tests {
             assert_eq!(waker_data.get_count(), 0);
 
             // Process CQEs :: wakes up Waker
-            assert_eq!(ring.process_cqes(slab, None)?, size);
+            assert_eq!(ring.process_cqes(slab, Some(size))?, size);
             assert_eq!(waker_data.get_count(), 1);
 
-            // Only core pending_ios is zero
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 0));
-            assert_eq!(waker_data.get_pending_ios(), 1);
             Ok(())
         })?;
 
@@ -521,7 +512,8 @@ mod tests {
             assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
         }
 
-        // Task pending io reaches 0 after RawSqe is released
+        // Task pending io reaches 0 after RawSqe(s) are released
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
         assert_eq!(waker_data.get_pending_ios(), 0);
         Ok(())
     }
@@ -578,8 +570,8 @@ mod tests {
             assert!(matches!(sqe_fut.as_mut().poll(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
 
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 1));
-            assert_eq!(waker_data.get_pending_ios(), 1);
+            assert_eq!(context::with_core(|core| core.get_pending_ios()), size);
+            assert_eq!(waker_data.get_pending_ios(), size as u32);
         }
 
         let SqeListState::Submitted { indices, .. } = &sqe_fut.get().state else {
@@ -595,7 +587,7 @@ mod tests {
             // Waker only set on head in batch/chain setup
             let res = slab.get(head_idx).and_then(|sqe| {
                 assert!(!sqe.is_ready());
-                assert!(sqe.has_waker());
+                assert!(sqe.waker.is_some());
                 Ok(())
             });
 
@@ -611,8 +603,6 @@ mod tests {
             assert_eq!(ring.process_cqes(slab, None)?, size);
             assert_eq!(waker_data.get_count(), 1);
 
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 0));
-            assert_eq!(waker_data.get_pending_ios(), 1);
             Ok(())
         })?;
 
@@ -637,6 +627,7 @@ mod tests {
             assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
         }
 
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
         assert_eq!(waker_data.get_pending_ios(), 0);
         Ok(())
     }

@@ -6,6 +6,7 @@ use crate::runtime::{AddMode, EventLoop, RuntimeConfig};
 use crate::task::ThreadId;
 use anyhow::Result;
 use crossbeam_deque::{Injector, Stealer, Worker as CbWorker};
+use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::iter;
@@ -32,11 +33,18 @@ pub(crate) struct Worker {
     global: Arc<Injector<StealableTask>>,
 
     /// Local pollable queue for tasks that are not stealable by other threads.
-    /// This means that these tasks have locally pending IO on this thread's
-    /// iouring.
-    /// We use a VecDeque to be able to push/pop from both ends, this way we can
-    /// respect FIFO/LIFO ordering interchangeably.
-    pollable: RefCell<VecDeque<StealableTask>>,
+    ///
+    /// These tasks are bound to this thread because they have pending IO operations
+    /// registered on this thread's `io_uring` instance.
+    ///
+    /// This queue is wrapped in a `Mutex` to support the `remote_abort` API.
+    /// Even though these tasks cannot be stolen for execution, other threads
+    /// may need to inject a cancellation request (abort) which must be processed
+    /// by this owning thread to ensure thread-local resources are dropped correctly.
+    ///
+    /// We use a `VecDeque` to allow pushing/popping from both ends, enabling
+    /// interchangeable FIFO/LIFO ordering.
+    pollable: Mutex<VecDeque<StealableTask>>,
 
     /// Local stealable queue for tasks that don't have any locally pending IO.
     /// By definition they are also pollable.
@@ -64,7 +72,7 @@ impl Worker {
             ticker: RefCell::new(Ticker::new()),
             pop_global_queue: RefCell::new(false),
             global,
-            pollable: RefCell::new(VecDeque::new()),
+            pollable: Mutex::new(VecDeque::new()),
             stealable,
             stealers,
         }
@@ -85,7 +93,7 @@ impl EventLoop for Worker {
 
     fn add_task(&self, task: Self::Task, mode: AddMode) {
         task.set_owner_id(self.thread_id);
-        let mut pollable = self.pollable.borrow_mut();
+        let mut pollable = self.pollable.lock();
 
         // # Fast path
         //
@@ -114,6 +122,9 @@ impl EventLoop for Worker {
             // crossbeam worker is setup with LIFO. This is notably used to implement
             // `yield_now` which is infrequent but very useful.
             AddMode::Fifo => pollable.push_front(task),
+
+            // Task will be cancelled simply add to local pollable queue.
+            AddMode::Cancel => pollable.push_back(task),
         }
     }
 
@@ -128,28 +139,27 @@ impl EventLoop for Worker {
 
         // 1. Always start popping from pollable as these tasks were just scheduled so
         //    we expect the CPU cache to be hot because of LIFO.
-        //
-        // Another reason why this is a good choice is that it gives more time for
-        // other workers to steal tasks from our stealable queue.
-        self.pollable.borrow_mut().pop_back().or_else(|| {
-            // 2. Look in our stealable queue
-            self.stealable.pop().or_else(|| {
-                // 3. No local work, repeatedly try the global injector and other
-                //    workers stealable queues.
-                iter::repeat_with(|| {
-                    // Work from the injector is by definition stealable as it has not
-                    // scheduled any IO on any thread. This is why we put the batch in
-                    // our stealable queue.
-                    self.global.steal_batch_and_pop(&self.stealable).or_else(||
+        if let Some(task) = self.pollable.lock().pop_back() {
+            return Some(task);
+        }
+
+        // 2. Look in our stealable queue
+        self.stealable.pop().or_else(|| {
+            // 3. No local work, repeatedly try the global injector and other
+            //    workers stealable queues.
+            iter::repeat_with(|| {
+                // Work from the injector is by definition stealable as it has not
+                // scheduled any IO on any thread. This is why we put the batch in
+                // our stealable queue.
+                self.global.steal_batch_and_pop(&self.stealable).or_else(||
                             // The behavior of collect here is to return the first Success(T) so
                             // *we are not* iterating through all stealers everytime.
                             self.stealers.iter().map(|s| s.steal()).collect())
-                })
-                // Repeat a maximum of `MAX_STEAL_RETRIES` otherwise return None.
-                .take(self.cfg.borrow().max_steal_retries)
-                .find(|s| !s.is_retry())
-                .and_then(|s| s.success())
             })
+            // Repeat a maximum of `MAX_STEAL_RETRIES` otherwise return None.
+            .take(self.cfg.borrow().max_steal_retries)
+            .find(|s| !s.is_retry())
+            .and_then(|s| s.success())
         })
     }
 
@@ -181,6 +191,7 @@ impl Worker {
     ) -> Result<Option<F::Output>> {
         'event_loop: loop {
             if let Some(task) = self.find_task() {
+                task.set_owner_id(self.thread_id);
                 task.run();
             } else if ctx.with_core(|core| core.get_pending_ios() > 0) {
                 // Block thread waiting for next completion.
@@ -243,7 +254,13 @@ impl Worker {
                     task.shutdown();
                 }
             }
-        })
+        });
+        self.drain_queues();
+    }
+
+    fn drain_queues(&self) {
+        self.pollable.lock().clear();
+        while let Some(_) = self.stealable.pop() {}
     }
 }
 

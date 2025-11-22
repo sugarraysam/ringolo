@@ -238,7 +238,6 @@ impl CleanupHandler {
     }
 }
 
-#[doc(hidden)]
 fn cvt(ops: &[CleanupOp]) -> Vec<AnyOp<'_>> {
     ops.iter().map(|op| op.into()).collect()
 }

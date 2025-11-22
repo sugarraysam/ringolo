@@ -56,10 +56,11 @@ impl RootWorker {
 impl EventLoop for RootWorker {
     type Task = StealableTask;
 
-    fn add_task(&self, task: Self::Task, _mode: AddMode) {
+    fn add_task(&self, task: Self::Task, mode: AddMode) {
         debug_assert!(
-            task.is_maintenance_task(),
-            "Only maintenance task can be scheduled on root_worker."
+            task.is_maintenance_task() || matches!(mode, AddMode::Cancel),
+            "Can only schedule maintenance task or unclaimed tasks
+                        that needs cancellation on root_worker"
         );
         task.set_owner_id(self.thread_id);
         self.pollable.borrow_mut().push_back(task);
@@ -101,10 +102,6 @@ impl RootWorker {
 
         loop {
             if let Some(task) = self.find_task() {
-                debug_assert!(
-                    task.is_maintenance_task(),
-                    "Only maintenance task should be running on root_worker"
-                );
                 task.run();
             } else if ctx.with_core(|core| core.get_pending_ios() > 0) {
                 // Block thread waiting for next completion.

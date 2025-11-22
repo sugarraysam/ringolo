@@ -79,12 +79,6 @@ impl Id {
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub(crate) struct ThreadId(pub(crate) NonZeroU32);
 
-impl fmt::Display for ThreadId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 impl ThreadId {
     pub(crate) fn next() -> ThreadId {
         static COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -101,6 +95,29 @@ impl ThreadId {
     pub(crate) fn as_u32(&self) -> u32 {
         self.0.get()
     }
+}
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<u32> for ThreadId {
+    #[inline]
+    fn from(id: u32) -> Self {
+        match NonZeroU32::new(id) {
+            Some(nz) => ThreadId(nz),
+            None => panic_invalid_thread_id(id),
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+#[track_caller]
+fn panic_invalid_thread_id(id: u32) -> ! {
+    panic!("ThreadId invariant violated: expected non-zero, got {}", id);
 }
 
 #[cfg(test)]

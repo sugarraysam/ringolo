@@ -6,7 +6,7 @@ use dashmap::DashMap;
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, Weak};
 
 pub(crate) fn get_root() -> Arc<TaskNode> {
     crate::with_scheduler!(|s| { s.tasks.get_root() })
@@ -83,13 +83,19 @@ impl<S: Schedule> OwnedTasks<S> {
             shutdown_state: Arc::new(ShutdownState::new()),
         });
 
-        registry
-            .root
-            .get_or_init(|| Arc::new(TaskNode::new_root(ROOT_ID, registry.clone())));
+        registry.root.get_or_init(|| {
+            Arc::new(TaskNode::new_root(
+                ROOT_ID,
+                Arc::downgrade(&registry) as Weak<dyn TaskRegistry>,
+            ))
+        });
 
-        registry
-            .orphan_root
-            .get_or_init(|| Arc::new(TaskNode::new_root(ORPHAN_ROOT_ID, registry.clone())));
+        registry.orphan_root.get_or_init(|| {
+            Arc::new(TaskNode::new_root(
+                ORPHAN_ROOT_ID,
+                Arc::downgrade(&registry) as Weak<dyn TaskRegistry>,
+            ))
+        });
 
         registry
     }
@@ -229,7 +235,7 @@ impl<S: Schedule> OwnedTasks<S> {
 /// Expose functionality of the TaskRegistry common to any scheduler.
 pub(crate) trait TaskRegistry: Send + Sync + std::fmt::Debug {
     /// Allow shutting down a specific task.
-    fn shutdown(&self, id: &Id);
+    fn remote_abort(&self, id: &Id);
 
     /// Returns true if the registry was closed as part of runtime shutdown.
     fn is_closed(&self) -> bool;
@@ -239,9 +245,9 @@ pub(crate) trait TaskRegistry: Send + Sync + std::fmt::Debug {
 }
 
 impl<S: Schedule> TaskRegistry for OwnedTasks<S> {
-    fn shutdown(&self, id: &Id) {
-        if let Some((_, task)) = self.tasks.remove(id) {
-            task.shutdown()
+    fn remote_abort(&self, id: &Id) {
+        if let Some(task) = self.tasks.get(id) {
+            task.remote_abort();
         }
     }
 
@@ -368,7 +374,13 @@ mod tests {
 
         let task = mock_task(None, None);
         let task_id = task.id();
-        let task_clone: Task<DummyScheduler> = Task::new(task.as_raw());
+        let task_clone = mock_task(None, None);
+
+        // Mimic duplicate task ID using unsafe to bypass immutability
+        unsafe {
+            let node_ptr = Arc::as_ptr(&task_clone.as_raw().task_node()) as *mut TaskNode;
+            (*node_ptr).id = task_id;
+        }
 
         assert!(matches!(registry.insert(task), InsertResult::Ok));
         assert!(

@@ -11,10 +11,10 @@ use crate::task::{JoinHandle, Notified, Task};
 #[allow(unused)]
 use crate::utils::scheduler::{Call, Method, Tracker};
 use anyhow::Result;
-use crossbeam_deque::Injector;
+use crossbeam_deque::{Injector, Steal};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Barrier, OnceLock};
+use std::sync::{Arc, Barrier, OnceLock, Weak};
 use std::task::Waker;
 
 pub(crate) type StealableTask = Notified<Handle>;
@@ -119,19 +119,14 @@ impl Schedule for Handle {
             },
         );
 
-        // Maintenance tasks never go on the injector. Otherwise, tasks spawned
-        // while polling `root_future` OR spawned before the user calls `block_on`
-        // are added to the injector.
-        if !task.is_maintenance_task()
-            && context::with_core(|core| {
-                core.is_polling_root() || core.is_pre_block_on(&self.root_thread_id())
-            })
-        {
+        if self.should_use_injector(&task, mode) {
             self.0.injector.push(task);
             let _ = self.shared.unpark_one_thread();
         } else {
-            // Otherwise, add task to the local worker.
-            self.add_task_to_current_worker(task, mode.unwrap_or(AddMode::Lifo));
+            // 99% of the time, the owner == current_thread. The only time where
+            // we might schedule a task on a separate thread is to perform
+            // cancellation with `remote_abort`.
+            self.schedule_on_owner(task, mode.unwrap_or(AddMode::Lifo));
         }
     }
 
@@ -203,8 +198,8 @@ impl Schedule for Handle {
         );
     }
 
-    fn task_registry(&self) -> std::sync::Arc<dyn TaskRegistry> {
-        self.tasks.clone()
+    fn task_registry(&self) -> Weak<dyn TaskRegistry> {
+        Arc::downgrade(&self.tasks) as Weak<dyn TaskRegistry>
     }
 }
 
@@ -300,6 +295,7 @@ impl Handle {
 
             // Cancel all remaining tasks.
             self.tasks.shutdown_all_partitions();
+            self.drain_injector();
 
             res
         } else {
@@ -307,23 +303,29 @@ impl Handle {
         }
     }
 
+    // Determines if a task should go to the global injector queue instead of
+    // a specific worker's local queue.
+    fn should_use_injector(&self, task: &StealableTask, mode: Option<AddMode>) -> bool {
+        // 1. Maintenance tasks are always local/internal.
+        !task.is_maintenance_task() &&
+
+        // 2. Cancellation must happen on the owning worker to ensure
+        //    thread-local resources are dropped correctly.
+        !matches!(mode, Some(AddMode::Cancel)) &&
+
+        // 3. During startup (pre-block_on) or root polling, we inject globally
+        //    to distribute initial load.
+        context::with_core(|core| {
+            core.is_polling_root() || core.is_pre_block_on(&self.root_thread_id())
+        })
+    }
+
     #[track_caller]
-    fn add_task_to_current_worker(&self, task: StealableTask, mode: AddMode) {
-        let thread_id = context::with_core(|core| core.thread_id);
-
+    fn schedule_on_owner(&self, task: StealableTask, mode: AddMode) {
         self.get_pool()
-            .with_worker(&thread_id, |worker| match worker {
+            .with_worker(&task.get_owner_id(), |worker| match worker {
                 WorkerRef::NonRoot(w) => w.add_task(task, mode),
-
-                // We are only allowed to schedule the maintenance task on the
-                // root_worker. Everything else goes in the pool.
-                WorkerRef::Root(w) => {
-                    debug_assert!(
-                        task.is_maintenance_task(),
-                        "Can only schedule maintenance task on root_worker"
-                    );
-                    w.add_task(task, mode)
-                }
+                WorkerRef::Root(w) => w.add_task(task, mode),
             });
     }
 
@@ -334,6 +336,10 @@ impl Handle {
 
     fn root_thread_id(&self) -> ThreadId {
         self.get_pool().root_worker.thread_id
+    }
+
+    fn drain_injector(&self) {
+        while let Steal::Success(_) = self.injector.steal() {}
     }
 
     #[cold]

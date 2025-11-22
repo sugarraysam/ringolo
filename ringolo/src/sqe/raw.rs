@@ -1,6 +1,8 @@
+use crate::task::Header;
 use crate::utils::io_uring::CompletionFlags;
 use std::collections::VecDeque;
 use std::io::{Error, ErrorKind, Result};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::task::Waker;
@@ -23,35 +25,47 @@ pub(crate) struct RawSqe {
     pub(crate) state: RawSqeState,
 
     pub(crate) handler: CompletionHandler,
+
+    // If Some, this points to the specific task Header that owns this IO.
+    // If None, this IO belongs to the root future.
+    pub(crate) task_header: Option<NonNull<Header>>,
 }
 
 impl Default for RawSqe {
     fn default() -> Self {
         Self {
             waker: None,
-            state: RawSqeState::Pending,
+            state: RawSqeState::Reserved,
             handler: CompletionHandler::new_single(),
+            task_header: None,
         }
     }
 }
 
 impl RawSqe {
-    pub(crate) fn new(handler: CompletionHandler) -> Self {
+    pub(crate) fn new(waker: &Waker, handler: CompletionHandler) -> Self {
+        let task_header = context::with_core(|core| {
+            core.increment_pending_ios();
+
+            if !core.is_polling_root() {
+                // Safety: Don't track `pending_ios` for the root_future. The reason is because it
+                // *is not backed* by a regular task and is never stealable by other threads.
+                unsafe {
+                    let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
+                    Header::increment_pending_ios(ptr);
+                    Some(ptr)
+                }
+            } else {
+                None
+            }
+        });
+
         Self {
             handler,
-            waker: None,
+            waker: Some(waker.clone()),
             state: RawSqeState::Pending,
+            task_header,
         }
-    }
-
-    pub(crate) fn get_state(&self) -> RawSqeState {
-        self.state
-    }
-
-    // Used in tests.
-    #[allow(dead_code)]
-    pub(crate) fn has_waker(&self) -> bool {
-        self.waker.is_some()
     }
 
     pub(crate) fn set_waker(&mut self, waker: &Waker) {
@@ -66,16 +80,27 @@ impl RawSqe {
         self.waker = Some(waker.clone());
     }
 
-    pub(crate) fn get_waker(&self) -> Result<&Waker> {
-        self.waker
-            .as_ref()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "get_waker failed: waker is none"))
+    // Consumes the waker and wakes the task.
+    // This corresponds to `Waker::wake(self)`.
+    pub(crate) fn wake_by_val(&mut self) -> Result<()> {
+        let waker = self
+            .waker
+            .take()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "wake_by_val failed: waker is none"))?;
+        waker.wake();
+        Ok(())
     }
 
-    pub(crate) fn take_waker(&mut self) -> Result<Waker> {
+    // Wakes up the task without consuming the waker. Useful for `SqeMore` where
+    // we get N cqes for a single SQE. Prefer using consuming `wake()` version
+    // when possible as this has a performance cost.
+    pub(crate) fn wake_by_ref(&self) -> Result<()> {
         self.waker
-            .take()
-            .ok_or_else(|| Error::new(ErrorKind::NotFound, "take_waker failed: waker is none"))
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::NotFound, "wake_by_ref failed: waker is none"))?
+            .wake_by_ref();
+
+        Ok(())
     }
 
     pub(crate) fn on_completion(
@@ -98,7 +123,7 @@ impl RawSqe {
         match &mut self.handler {
             CompletionHandler::Single { result } => {
                 *result = Some(cqe_res);
-                self.wake()?;
+                self.wake_by_val()?;
 
                 Ok(None)
             }
@@ -136,16 +161,13 @@ impl RawSqe {
                     }
                 };
 
-                // Important to distinguish between final wake and wake_by_ref.
-                // This is because we will decrement the pending IO counter on the
-                // task when invoking the consuming wake() call.
                 if done {
-                    self.wake()?;
-                    Ok(None)
+                    self.wake_by_val()?;
                 } else {
                     self.wake_by_ref()?;
-                    Ok(None)
                 }
+
+                Ok(None)
             }
         }
     }
@@ -216,27 +238,52 @@ impl RawSqe {
         matches!(self.state, RawSqeState::Completed)
     }
 
-    pub(crate) fn wake(&mut self) -> Result<()> {
-        let waker = self.take_waker()?;
+    pub(crate) fn cancel(&mut self) -> bool {
+        // Idempotency: Ignore if already processed or cancelled.
+        if matches!(
+            self.state,
+            RawSqeState::Reserved | RawSqeState::Cancelled | RawSqeState::Completed
+        ) {
+            return false;
+        }
 
-        // Waking by val is a signal that one pending IO resource has successfully
-        // completed on the local io_uring. This contract is enforced by all of the SQE
-        // primitives, i.e.: SqeSingle, SqeStream, SqeList, etc.
-        //
-        // We only decrement the thread-level `pending_io`, as the task-level IO can
-        // only be decremented after we release the RawSqe from the slab.
-        context::with_core(|core| core.decrement_pending_ios());
+        self.state = RawSqeState::Cancelled;
 
-        waker.wake();
-        Ok(())
+        // Release task reference immediately so the Task can complete/drop.
+        if let Some(header_ptr) = self.task_header {
+            unsafe {
+                Header::decrement_pending_ios(header_ptr);
+            }
+        }
+
+        true
     }
+}
 
-    // Wakes up the task without consuming the waker. Useful for `SqeMore` where
-    // we get N cqes for a single SQE. Prefer using consuming `wake()` version
-    // when possible as this has a performance cost.
-    pub(crate) fn wake_by_ref(&self) -> Result<()> {
-        self.get_waker()?.wake_by_ref();
-        Ok(())
+impl Drop for RawSqe {
+    fn drop(&mut self) {
+        if matches!(self.state, RawSqeState::Reserved) {
+            // Do nothing - RawSqe was never promoted beyond reserved while using
+            // reservation API of the slab.
+            return;
+        }
+
+        // Decrement core IOs (ignore failure if TLS is tearing down during
+        // thread exit).
+        context::try_with_core(|core| {
+            core.decrement_pending_ios();
+        });
+
+        // Decrement task pending IOs unless cancelled (cancelled IOs are
+        // handled by the maintenance task).
+        if !matches!(self.state, RawSqeState::Cancelled)
+            && let Some(header_ptr) = self.task_header
+        {
+            // Safety: see comment in constructor.
+            unsafe {
+                Header::decrement_pending_ios(header_ptr);
+            }
+        }
     }
 }
 
@@ -327,6 +374,9 @@ pub(crate) enum CompletionEffect {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum RawSqeState {
+    // Initial state for the reservation API.
+    Reserved,
+
     // Waiting to be submitted and completed
     Pending,
 
@@ -335,6 +385,11 @@ pub(crate) enum RawSqeState {
 
     // Operation is completed and all results were consumed.
     Completed,
+
+    // Cancelled before it could complete. Used by infinite streams to prevent
+    // future completions. Cancellation involves the maintenance task so we use
+    // this signal in the Drop impl to prevent decrementing IO on the wrong thread.
+    Cancelled,
 }
 
 #[cfg(test)]
@@ -348,29 +403,6 @@ mod tests {
     use std::io::{self, ErrorKind};
     use std::sync::atomic::Ordering;
 
-    #[test]
-    fn test_raw_sqe_set_waker_logic() -> Result<()> {
-        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
-        let mut sqe = RawSqe::new(CompletionHandler::new_single());
-
-        let (waker1, waker1_data) = mock_waker();
-
-        sqe.set_waker(&waker1);
-        sqe.wake_by_ref()?;
-        assert_eq!(waker1_data.get_count(), 1);
-
-        // Set unrelated waker - should overwrite waker1
-        let (waker2, waker2_data) = mock_waker();
-        assert_eq!(waker1.will_wake(&waker2), false);
-
-        sqe.set_waker(&waker2);
-        sqe.wake_by_ref().unwrap();
-
-        assert_eq!(waker1_data.get_count(), 1);
-        assert_eq!(waker2_data.get_count(), 1);
-        Ok(())
-    }
-
     #[rstest]
     #[case::positive_result_success(123, Ok(123))]
     #[case::zero_result_success(0, Ok(0))]
@@ -381,15 +413,13 @@ mod tests {
         #[case] expected: io::Result<i32>,
     ) -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
-        let mut sqe = RawSqe::new(CompletionHandler::new_single());
-
         let (waker, waker_data) = mock_waker();
-        sqe.set_waker(&waker);
-        context::with_core(|core| core.increment_pending_ios());
+
+        let mut sqe = RawSqe::new(&waker, CompletionHandler::new_single());
 
         assert!(sqe.on_completion(res, CompletionFlags::empty())?.is_none());
-
         assert!(sqe.is_ready());
+        assert_eq!(waker_data.get_count(), 1);
         let got = sqe.take_final_result();
 
         // Result and entry consumed
@@ -402,13 +432,9 @@ mod tests {
             _ => panic!("Result mismatch"),
         }
 
-        // The waker was consumed and called
-        assert_eq!(waker_data.get_count(), 1);
-        assert!(sqe.waker.is_none());
-        assert_eq!(
-            context::with_core(|core| core.pending_ios.load(Ordering::Relaxed)),
-            0
-        );
+        drop(sqe);
+        assert_eq!(waker_data.get_pending_ios(), 0);
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
 
         Ok(())
     }
@@ -421,6 +447,8 @@ mod tests {
         #[case] n_sqes: usize,
     ) -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, waker_data) = mock_waker();
+
         let remaining = Arc::new(AtomicUsize::new(n_sqes));
 
         context::with_slab_mut(|slab| -> Result<()> {
@@ -430,15 +458,18 @@ mod tests {
 
             let entries = (0..n_sqes)
                 .map(|_| {
-                    let raw = RawSqe::new(CompletionHandler::new_batch_or_chain(
-                        head_idx,
-                        Arc::clone(&remaining),
-                    ));
+                    let raw = RawSqe::new(
+                        &waker,
+                        CompletionHandler::new_batch_or_chain(head_idx, Arc::clone(&remaining)),
+                    );
                     Ok(raw)
                 })
                 .collect::<Result<SmallVec<_>>>()?;
 
             let _ = batch.commit(entries)?;
+
+            assert_eq!(waker_data.get_pending_ios(), n_sqes as u32);
+            assert_eq!(context::with_core(|c| c.get_pending_ios()), n_sqes);
 
             for i in 0..n_sqes {
                 let raw = slab.get_mut(indices[i])?;
@@ -453,6 +484,14 @@ mod tests {
             }
 
             assert_eq!(remaining.load(Ordering::Relaxed), 0);
+
+            // Drop and decrement pending IOs
+            indices.iter().for_each(|idx| {
+                assert!(slab.try_remove(*idx).is_some());
+            });
+            assert_eq!(waker_data.get_pending_ios(), 0);
+            assert_eq!(context::with_core(|c| c.get_pending_ios()), 0);
+
             Ok(())
         })
     }
@@ -460,21 +499,19 @@ mod tests {
     #[test]
     fn test_raw_sqe_stream_by_flag_completion() -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, waker_data) = mock_waker();
+
         let n = 5;
 
         // count = 0 triggers ByFlag completion
-        let mut sqe = RawSqe::new(CompletionHandler::new_stream(0));
-
-        let (waker, waker_data) = mock_waker();
-        sqe.set_waker(&waker);
-        context::with_core(|core| core.increment_pending_ios());
+        let mut sqe = RawSqe::new(&waker, CompletionHandler::new_stream(0));
         assert_eq!(sqe.state, RawSqeState::Pending);
 
         for i in 1..=n {
             assert!(sqe.on_completion(123, CompletionFlags::MORE)?.is_none());
             assert_eq!(waker_data.get_count(), i);
 
-            assert!(sqe.has_waker(), "waker should NOT be consumed");
+            assert!(sqe.waker.is_some(), "waker should NOT be consumed");
             assert_eq!(sqe.state, RawSqeState::Ready);
 
             assert!(matches!(sqe.pop_next_result()?, Some(123)));
@@ -482,12 +519,15 @@ mod tests {
 
         assert!(sqe.on_completion(789, CompletionFlags::empty())?.is_none());
         assert_eq!(waker_data.get_count(), n + 1);
-        assert!(!sqe.has_waker(), "waker SHOULD be consumed now");
 
         assert!(matches!(sqe.pop_next_result()?, Some(789)));
         assert_eq!(sqe.state, RawSqeState::Completed);
 
         assert!(sqe.pop_next_result()?.is_none());
+
+        drop(sqe);
+        assert_eq!(waker_data.get_pending_ios(), 0);
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
 
         Ok(())
     }
@@ -495,13 +535,12 @@ mod tests {
     #[test]
     fn test_raw_sqe_lifecycle() -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, waker_data) = mock_waker();
 
-        let raw = RawSqe::new(CompletionHandler::new_single());
-        assert_eq!(raw.get_state(), RawSqeState::Pending);
+        let raw = RawSqe::new(&waker, CompletionHandler::new_single());
+        assert_eq!(raw.state, RawSqeState::Pending);
 
         context::with_slab_mut(|slab| -> Result<()> {
-            let (waker, waker_data) = mock_waker();
-
             let idx = {
                 let reserved = slab.reserve_entry()?;
                 let idx = reserved.key();
@@ -510,23 +549,42 @@ mod tests {
             };
 
             let inserted = slab.get_mut(idx).unwrap();
-            assert_eq!(inserted.get_state(), RawSqeState::Pending);
-
-            // Mimick incrementing pending_io API after submit.
-            inserted.set_waker(&waker);
-            context::with_core(|core| core.increment_pending_ios());
+            assert_eq!(inserted.state, RawSqeState::Pending);
 
             assert!(inserted.on_completion(0, CompletionFlags::empty()).is_ok());
-            assert_eq!(inserted.get_state(), RawSqeState::Ready);
+            assert_eq!(inserted.state, RawSqeState::Ready);
 
             assert_eq!(waker_data.get_count(), 1);
             assert!(slab.try_remove(idx).is_some());
 
-            assert_eq!(
-                context::with_core(|core| core.pending_ios.load(Ordering::Relaxed)),
-                0
-            );
+            assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
             Ok(())
         })
+    }
+
+    #[test]
+    fn test_cancel() -> Result<()> {
+        let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, waker_data) = mock_waker();
+
+        let mut raw = RawSqe::new(&waker, CompletionHandler::new_single());
+        assert_eq!(raw.state, RawSqeState::Pending);
+
+        assert_eq!(waker_data.get_pending_ios(), 1);
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 1);
+
+        // Cancel N times test idempotency.
+        for _ in 0..10 {
+            raw.cancel();
+            assert_eq!(raw.state, RawSqeState::Cancelled);
+
+            assert_eq!(waker_data.get_pending_ios(), 0);
+            assert_eq!(context::with_core(|core| core.get_pending_ios()), 1);
+        }
+
+        drop(raw);
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
+
+        Ok(())
     }
 }

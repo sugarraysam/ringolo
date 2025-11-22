@@ -50,8 +50,11 @@ impl SqeStream {
     // otherwise we will keep posting CQE forever depending on the stream config.
     pub(crate) fn cancel(&mut self) -> Option<usize> {
         let old = mem::replace(&mut self.state, SqeStreamState::Cancelled);
+
         match old {
-            SqeStreamState::Submitted { idx } => Some(idx),
+            SqeStreamState::Submitted { idx } => {
+                context::with_slab_mut(|slab| slab.cancel(idx)).then_some(idx)
+            }
             _ => None,
         }
     }
@@ -77,22 +80,15 @@ impl Submittable for SqeStream {
                     entry.set_user_data(idx as u64);
                     ring.push(entry)?;
 
-                    reserved.commit(RawSqe::new(CompletionHandler::new_stream(*count)));
+                    reserved.commit(RawSqe::new(waker, CompletionHandler::new_stream(*count)));
 
                     Ok(idx)
                 })
             }
         }
-        // On successful push, we can transition the state and increment the
-        // number of local pending IOs for this task.
+        // On successful push, transition state to submitted.
         .map(|idx| {
-            // On successful push, we can transition the state and increment the
-            // number of pending IOs at both the thread-level and task-level.
             self.state = SqeStreamState::Submitted { idx };
-            context::with_core(|core| {
-                core.increment_pending_ios();
-                core.increment_task_pending_ios(waker);
-            });
         })
     }
 }
@@ -150,17 +146,10 @@ impl Stream for SqeStream {
                             Ok(Some(result)) => Poll::Ready(Some(Ok(result))),
                             Ok(None) => {
                                 if raw_sqe.is_completed() {
-                                    // # Important
-                                    // We need to decrement task `pending_ios` *after* dropping the RawSqe
-                                    // to prevent making the task stealable while it still needs to drop this
-                                    // RawSqe from thread-local slab.
                                     debug_assert!(
                                         slab.try_remove(idx).is_some(),
                                         "RawSqe not found in slab."
                                     );
-                                    context::with_core(|c| {
-                                        c.decrement_task_pending_ios(cx.waker())
-                                    });
 
                                     self.state = SqeStreamState::Completed;
                                     Poll::Ready(None)
@@ -183,10 +172,6 @@ impl Stream for SqeStream {
 impl Drop for SqeStream {
     fn drop(&mut self) {
         if let SqeStreamState::Submitted { idx } = &self.state {
-            // If we get here, it means *nothing* will decrement the task pending_ios.
-            // The consequence is the task will *not be stealable*. We can live with that
-            // and there is no way to get access to the underlying task anyways because
-            // the Waker is lost.
             context::with_slab_mut(|slab| {
                 if slab.try_remove(*idx).is_none() {
                     eprintln!("[SqeStream]: SQE {} not found in slab during drop", idx);
@@ -215,8 +200,6 @@ mod tests {
     fn test_sqe_stream_timeout_multishot(#[case] count: u32, #[case] nsecs: u32) -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
 
-        let n = count as usize;
-
         let timespec = Timespec::new().sec(0).nsec(nsecs);
         let timeout = Timeout::new(&timespec)
             .count(count)
@@ -235,7 +218,8 @@ mod tests {
 
             assert!(matches!(stream.as_mut().poll_next(&mut ctx), Poll::Pending));
             assert_eq!(waker_data.get_count(), 0);
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 1));
+
+            assert_eq!(context::with_core(|core| core.get_pending_ios()), 1);
             assert_eq!(waker_data.get_pending_ios(), 1);
         }
 
@@ -246,7 +230,7 @@ mod tests {
 
             let res = slab.get(idx).and_then(|sqe| {
                 assert!(!sqe.is_ready());
-                assert!(sqe.has_waker());
+                assert!(sqe.waker.is_some());
 
                 if let CompletionHandler::Stream { completion, .. } = &sqe.handler {
                     assert!(completion.has_more());
@@ -261,7 +245,7 @@ mod tests {
             // the kernel queues "task_work" everytime a timer fires. We have to
             // repeatedly enter the kernel with `io_uring_enter + GETEVENTS` to convert
             // the `task_work` into CQEs.
-            let mut num_awaiting = n;
+            let mut num_awaiting = count as usize;
             while num_awaiting > 0 {
                 // Submit our single SQE and wait for CQEs :: `io_uring_enter`
                 ring.submit_and_wait(num_awaiting, None)?;
@@ -275,15 +259,13 @@ mod tests {
             // We wake the task N time, and let scheduler handle the Notified
             // state and set the bit appropriately.
             assert_eq!(waker_data.get_count(), count as usize);
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 0));
-            assert_eq!(waker_data.get_pending_ios(), 1);
 
             if let CompletionHandler::Stream {
                 results,
                 completion,
             } = &slab.get(idx)?.handler
             {
-                assert_eq!(results.len(), n);
+                assert_eq!(results.len(), count as usize);
                 assert!(!completion.has_more());
             }
 
@@ -291,7 +273,7 @@ mod tests {
         })?;
 
         let mut fired = 0;
-        while fired < n {
+        while fired < count {
             match stream.as_mut().poll_next(&mut ctx) {
                 Poll::Ready(Some(Err(IoError::Io(e)))) => {
                     assert_eq!(e.raw_os_error().unwrap(), libc::ETIME);
@@ -305,7 +287,16 @@ mod tests {
             }
         }
 
-        assert_eq!(fired, n);
+        assert_eq!(fired, count);
+
+        // Polling one more time stream should be completed, and we should drop
+        // the RawSqe from the slab.
+        assert!(matches!(
+            stream.as_mut().poll_next(&mut ctx),
+            Poll::Ready(None)
+        ));
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
+        assert_eq!(waker_data.get_pending_ios(), 0);
         Ok(())
     }
 }

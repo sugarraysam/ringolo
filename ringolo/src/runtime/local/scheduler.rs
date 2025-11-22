@@ -12,8 +12,8 @@ use crate::utils::scheduler::{Call, Method, Tracker};
 use anyhow::Result;
 use std::cell::RefCell;
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::task::Waker;
 
 pub(crate) type LocalTask = Notified<Handle>;
@@ -186,8 +186,8 @@ impl Schedule for Handle {
         );
     }
 
-    fn task_registry(&self) -> std::sync::Arc<dyn TaskRegistry> {
-        self.tasks.clone()
+    fn task_registry(&self) -> Weak<dyn TaskRegistry> {
+        Arc::downgrade(&self.tasks) as Weak<dyn TaskRegistry>
     }
 }
 
@@ -255,6 +255,7 @@ impl Handle {
         if !self.shared.shutdown.swap(true, Ordering::AcqRel) {
             self.tasks.close_and_partition();
             self.tasks.shutdown_all_partitions();
+            self.worker.drain();
         }
     }
 

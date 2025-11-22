@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::runtime::{Schedule, TaskMetadata, TaskOpts};
+use crate::runtime::{AddMode, Schedule, TaskMetadata, TaskOpts};
 use crate::task::harness::Harness;
 use crate::task::node::{TaskNode, TaskNodeGuard};
 use crate::task::state::State;
@@ -226,7 +226,7 @@ pub(crate) struct Vtable {
     pub(super) poll: unsafe fn(NonNull<Header>),
 
     /// Schedules the task for execution on the runtime.
-    pub(super) schedule: unsafe fn(NonNull<Header>),
+    pub(super) schedule: unsafe fn(NonNull<Header>, AddMode),
 
     /// Deallocates the memory.
     pub(super) dealloc: unsafe fn(NonNull<Header>),
@@ -371,11 +371,11 @@ unsafe fn poll<T: Future, S: Schedule>(ptr: NonNull<Header>) {
     harness.poll();
 }
 
-unsafe fn schedule<S: Schedule>(ptr: NonNull<Header>) {
+unsafe fn schedule<S: Schedule>(ptr: NonNull<Header>, mode: AddMode) {
     let scheduler = Header::get_scheduler::<S>(ptr);
     scheduler
         .as_ref()
-        .schedule(Notified::new(Task::from_raw(ptr.cast())), None);
+        .schedule(Notified::new(Task::from_raw(ptr.cast())), Some(mode));
 }
 
 unsafe fn dealloc<T: Future, S: Schedule>(ptr: NonNull<Header>) {

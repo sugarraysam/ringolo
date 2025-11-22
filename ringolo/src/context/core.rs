@@ -6,11 +6,10 @@ use crate::runtime::RuntimeConfig;
 use crate::task::ThreadId;
 use crate::task::{Header, TaskNode};
 use anyhow::Result;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::os::unix::io::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::Waker;
 
 use crate::context::ring::SingleIssuerRing;
@@ -44,7 +43,7 @@ pub(crate) struct Core {
     // a Waker implementation where the `data` pointer is the `Scheduler`
     // itself, not a task `Header`. For this reason, we do not track pending_ios
     // on the root future, which makes sense as it would not be stealable anyways.
-    pub(crate) pending_ios: Arc<AtomicUsize>,
+    pub(crate) pending_ios: Cell<usize>,
 
     /// High-performance slab allocator for `io_uring` Submission Queue Entries (SQEs).
     /// Pre-allocates memory to avoid allocation during the hot path.
@@ -73,9 +72,9 @@ impl Core {
     ) -> Result<Self> {
         let ring = SingleIssuerRing::try_new(cfg)?;
 
-        let mut core = Core {
+        let core = Core {
             thread_id,
-            pending_ios: Arc::new(AtomicUsize::new(0)),
+            pending_ios: Cell::new(0),
             slab: RefCell::new(RawSqeSlab::new(
                 cfg.sq_ring_size * cfg.cq_ring_size_multiplier,
             )),
@@ -85,12 +84,7 @@ impl Core {
             maintenance_task: Arc::new(MaintenanceTask::new(cfg, shared.shutdown.clone())),
         };
 
-        // We share an atomic counter for pending_ios on this thread. The
-        // *hot path* will access the atomic on Core directly. The *cold path*
-        // will use the shared context. This is required to support cross-thread
-        // cancellation.
-        core.pending_ios = shared.register_worker(&core);
-
+        shared.register_worker(&core);
         Ok(core)
     }
 
@@ -111,34 +105,16 @@ impl Core {
     }
 
     pub(crate) fn get_pending_ios(&self) -> usize {
-        self.pending_ios.load(Ordering::Acquire)
+        self.pending_ios.get()
     }
 
     pub(crate) fn increment_pending_ios(&self) {
-        self.pending_ios.fetch_add(1, Ordering::Release);
+        self.pending_ios.update(|x| x + 1);
     }
 
     pub(crate) fn decrement_pending_ios(&self) {
-        self.pending_ios.fetch_sub(1, Ordering::Release);
-    }
-
-    pub(crate) fn increment_task_pending_ios(&self, waker: &Waker) {
-        self.modify_task_pending_ios(waker, 1);
-    }
-
-    pub(crate) fn decrement_task_pending_ios(&self, waker: &Waker) {
-        self.modify_task_pending_ios(waker, -1);
-    }
-
-    fn modify_task_pending_ios(&self, waker: &Waker, delta: i32) {
-        // Don't track owned_resources for the root_future. The reason is because it
-        // *is not backed* by a regular task and is never stealable by other threads.
-        if !self.is_polling_root() {
-            unsafe {
-                let ptr = NonNull::new_unchecked(waker.data() as *mut Header);
-                Header::modify_pending_ios(ptr, delta);
-            }
-        }
+        self.pending_ios
+            .update(|x| x.checked_add_signed(-1).expect("underflow"));
     }
 
     pub(crate) fn increment_task_owned_resources(&self, waker: &Waker) -> Option<NonNull<Header>> {
@@ -158,38 +134,21 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-    use crate as ringolo;
-    use crate::context::{self, PendingIoOp, init_stealing_context};
-    use crate::runtime::runtime::Kind;
-    use crate::test_utils::{init_local_runtime_and_context, init_stealing_runtime_and_context};
+    use crate::context;
+    use crate::test_utils::init_stealing_runtime_and_context;
     use anyhow::Result;
     use rstest::rstest;
 
-    #[ringolo::test]
-    async fn test_pending_io_on_core_and_shared() -> Result<()> {
-        let thread_id = context::with_core(|core| {
-            core.increment_pending_ios();
-            core.decrement_pending_ios();
-            core.increment_pending_ios();
-
-            assert_eq!(core.get_pending_ios(), 1);
-            core.thread_id
-        });
-
-        context::with_shared(|shared| {
-            assert_eq!(shared.get_pending_ios(&thread_id), 1);
-
-            shared.modify_pending_ios(&thread_id, PendingIoOp::Increment, 1);
-            shared.modify_pending_ios(&thread_id, PendingIoOp::Increment, 1);
-            shared.modify_pending_ios(&thread_id, PendingIoOp::Decrement, 1);
-        });
-
-        context::with_core(|core| {
-            assert_eq!(core.get_pending_ios(), 2);
-
-            // Need to manually set to zero otherwise worker does not exit.
-            core.decrement_pending_ios();
-            core.decrement_pending_ios();
+    #[rstest]
+    #[case::two(2)]
+    #[case::four(4)]
+    fn test_core_registers_worker_in_shared(#[case] num_workers: usize) -> Result<()> {
+        let (runtime, _scheduler) = init_stealing_runtime_and_context(num_workers, None)?;
+        runtime.block_on(async {
+            assert_eq!(
+                context::with_shared(|shared| shared.worker_slots.len()),
+                num_workers + 1 // root_worker
+            );
         });
 
         Ok(())

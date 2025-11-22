@@ -1,8 +1,7 @@
 use crate::task::{Notified, Task};
 use anyhow::Result;
-use std::fmt;
-use std::sync::Arc;
 use std::task::Waker;
+use std::{fmt, sync::Weak};
 
 // Public APIs
 /// Cancellation APIs for tasks built on top of the global task tree.
@@ -75,7 +74,10 @@ pub(crate) trait Schedule: Sync + Sized + 'static + std::fmt::Debug {
     fn unhandled_panic(&self, payload: SchedulerPanic);
 
     /// Returns TaskRegistry for this scheduler.
-    fn task_registry(&self) -> Arc<dyn TaskRegistry>;
+    //
+    // The registry holds references to TaskNode, and TaskNode holds reference
+    // to TaskRegistry. We use weak to break the cycle and avoid memory leaks.
+    fn task_registry(&self) -> Weak<dyn TaskRegistry>;
 }
 
 #[doc(hidden)]
@@ -153,6 +155,12 @@ pub enum AddMode {
     /// polled in the order they were yielded, but may be less cache-efficient
     /// than `Lifo`.
     Fifo,
+
+    /// Schedules a task to be cancelled.
+    ///
+    /// We leverage the `RawTask::remote_abort` API to make sure we cancel the
+    /// task on the owning thread so we can free resources in the right place.
+    Cancel,
 }
 
 #[doc(hidden)]

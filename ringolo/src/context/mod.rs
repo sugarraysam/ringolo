@@ -145,11 +145,46 @@ where
 }
 
 #[inline(always)]
+pub(crate) fn with_context<F, R>(f: F) -> R
+where
+    F: FnOnce(&Context) -> R,
+{
+    CONTEXT.with(|ctx| {
+        let root = ctx.get().expect("Context not initialized").borrow();
+        f(&root.context)
+    })
+}
+
+#[inline(always)]
+pub(crate) fn try_with_context<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&Context) -> R,
+{
+    CONTEXT
+        .try_with(|ctx| {
+            let root = ctx.get().expect("Context not initialized").borrow();
+            f(&root.context)
+        })
+        .ok()
+}
+
+#[inline(always)]
 pub(crate) fn with_core<F, R>(f: F) -> R
 where
     F: FnOnce(&Core) -> R,
 {
     with_context(|outer| match outer {
+        Context::Local(c) => c.with_core(f),
+        Context::Stealing(c) => c.with_core(f),
+    })
+}
+
+#[inline(always)]
+pub(crate) fn try_with_core<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&Core) -> R,
+{
+    try_with_context(|outer| match outer {
         Context::Local(c) => c.with_core(f),
         Context::Stealing(c) => c.with_core(f),
     })
@@ -233,18 +268,6 @@ pub(crate) fn set_current_task(task: Option<Arc<TaskNode>>) -> Option<Arc<TaskNo
     with_core(|core| core.current_task.replace(task))
 }
 
-// Private helpers.
-#[inline(always)]
-pub(crate) fn with_context<F, R>(f: F) -> R
-where
-    F: FnOnce(&Context) -> R,
-{
-    CONTEXT.with(|ctx| {
-        let root = ctx.get().expect("Context not initialized").borrow();
-        f(&root.context)
-    })
-}
-
 #[inline(always)]
 pub(crate) fn with_scheduler<F, R>(f: F) -> R
 where
@@ -286,12 +309,6 @@ macro_rules! with_scheduler {
 #[cold]
 fn panic_scheduler_uninitialized() -> ! {
     panic!("Expected scheduler to be initialized.");
-}
-
-#[derive(Debug)]
-pub(crate) enum PendingIoOp {
-    Increment,
-    Decrement,
 }
 
 #[cfg(test)]

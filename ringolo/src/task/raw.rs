@@ -1,6 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn, unused)]
 
-use crate::runtime::{Schedule, TaskMetadata, TaskOpts};
+use crate::runtime::{AddMode, Schedule, TaskMetadata, TaskOpts};
 use crate::task::Header;
 use crate::task::layout::TaskLayout;
 use crate::task::node::TaskNode;
@@ -66,7 +66,7 @@ impl RawTask {
         &self.header().state
     }
 
-    pub(super) fn task_node(&self) -> Arc<TaskNode> {
+    pub(crate) fn task_node(&self) -> Arc<TaskNode> {
         unsafe { Header::get_task_node(self.ptr) }
     }
 
@@ -76,9 +76,9 @@ impl RawTask {
         unsafe { (vtable.poll)(self.ptr) }
     }
 
-    pub(super) fn schedule(self) {
+    pub(super) fn schedule(self, mode: AddMode) {
         let vtable = self.header().vtable;
-        unsafe { (vtable.schedule)(self.ptr) }
+        unsafe { (vtable.schedule)(self.ptr, mode) }
     }
 
     pub(super) fn dealloc(self) {
@@ -144,7 +144,7 @@ impl RawTask {
                 // The old ref-count is retained for now to ensure that the task
                 // is not dropped during the call to `schedule` if the call
                 // drops the task it was given.
-                self.schedule();
+                self.schedule(AddMode::Lifo);
 
                 // Now that we have completed the call to schedule, we can
                 // release our ref-count.
@@ -167,7 +167,7 @@ impl RawTask {
                 // and the caller also holds a ref-count. The caller's ref-count
                 // ensures that the task is not destroyed even if the new task
                 // is dropped before `schedule` returns.
-                self.schedule();
+                self.schedule(AddMode::Lifo);
             }
             TransitionToNotifiedByRef::DoNothing => {}
         }
@@ -188,7 +188,7 @@ impl RawTask {
             // Since the caller holds a ref-count, the task cannot be destroyed
             // before the call to `schedule` returns even if the call drops the
             // `Notified` internally.
-            self.schedule();
+            self.schedule(AddMode::Cancel);
         }
     }
 

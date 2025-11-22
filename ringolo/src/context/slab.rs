@@ -1,4 +1,5 @@
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
+use crate::sqe::RawSqeState;
 use crate::sqe::errors::IoError;
 use crate::sqe::raw::RawSqe;
 use anyhow::anyhow;
@@ -12,6 +13,7 @@ use std::ops::{Deref, DerefMut};
 /// This structure manages the lifecycle of raw pointers used in I/O requests.
 /// It utilizes a "Reserve-Commit" pattern to ensure that entries are only
 /// permanently occupied if the I/O submission logic succeeds.
+#[derive(Debug)]
 pub(crate) struct RawSqeSlab {
     slab: slab::Slab<RawSqe>,
 }
@@ -70,6 +72,10 @@ impl RawSqeSlab {
                 format!("Key {:?} not found in slab.", key),
             )
         })
+    }
+
+    pub(crate) fn cancel(&mut self, key: usize) -> bool {
+        self.slab.get_mut(key).is_some_and(|sqe| sqe.cancel())
     }
 }
 
@@ -166,7 +172,11 @@ impl Drop for SlabReservedBatch<'_> {
         if !self.committed {
             // SAFETY: we know the indices are valid so should not panic.
             self.indices.iter().for_each(|idx| {
-                self.slab.remove(*idx);
+                let removed = self.slab.remove(*idx);
+                debug_assert!(
+                    matches!(removed.state, RawSqeState::Reserved),
+                    "RawSqeState was never migrated."
+                );
             })
         }
     }
@@ -191,6 +201,7 @@ mod tests {
     #[test]
     fn test_insert_and_len() -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, _) = mock_waker();
 
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes);
@@ -198,7 +209,7 @@ mod tests {
         for i in 1..=n_sqes {
             let reserved = slab.reserve_entry()?;
             let idx = reserved.key();
-            reserved.commit(RawSqe::new(CompletionHandler::new_single()));
+            reserved.commit(RawSqe::new(&waker, CompletionHandler::new_single()));
 
             assert!(slab.get(idx).is_ok());
             assert_eq!(slab.len(), i);
@@ -210,13 +221,14 @@ mod tests {
     #[test]
     fn test_slab_full() -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, _) = mock_waker();
 
         let n_sqes = 3;
         let mut slab = RawSqeSlab::new(n_sqes - 1);
 
         for i in 1..=n_sqes {
             let res = slab.reserve_entry().map(|reserved| {
-                reserved.commit(RawSqe::new(CompletionHandler::new_single()));
+                reserved.commit(RawSqe::new(&waker, CompletionHandler::new_single()));
             });
 
             if i == n_sqes {
@@ -232,6 +244,7 @@ mod tests {
     #[test]
     fn test_reserve_batch() -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
+        let (waker, _) = mock_waker();
 
         context::with_slab_mut(|slab| -> Result<()> {
             let n_sqes = 16;
@@ -256,7 +269,7 @@ mod tests {
 
                 // Commit the batch
                 let entries = (0..n_sqes)
-                    .map(|_| RawSqe::new(CompletionHandler::new_single()))
+                    .map(|_| RawSqe::new(&waker, CompletionHandler::new_single()))
                     .collect::<SmallVec<[_; SPILL_TO_HEAP_THRESHOLD]>>();
 
                 batch.commit(entries)?;
