@@ -22,7 +22,7 @@ jobs:
     - run: cargo test --all-features -- --test-threads=1
   
   sanitizers:
-    name: Test (${{ matrix.sanitizer }})
+    name: Santizer Test (${{ matrix.sanitizer }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
