@@ -1,12 +1,14 @@
 use anyhow::Result;
 use io_uring::squeue::Entry;
 use io_uring::types::{SubmitArgs, Timespec};
-use io_uring::{CompletionQueue, EnterFlags, IoUring, SubmissionQueue};
+use io_uring::{CompletionQueue, EnterFlags, IoUring, SubmissionQueue, Submitter};
+use std::cell::{Ref, RefCell, RefMut};
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;
 
 use crate::context::RawSqeSlab;
+use crate::context::buffer_pool::BufferPool;
 use crate::runtime::RuntimeConfig;
 use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 
@@ -17,6 +19,8 @@ use crate::sqe::{CompletionEffect, IoError, RawSqeState};
 /// is explicitly called, minimizing interrupt overhead and context switches.
 pub(crate) struct SingleIssuerRing {
     ring: IoUring,
+
+    buffer_pool: RefCell<BufferPool>,
 }
 
 impl SingleIssuerRing {
@@ -52,7 +56,10 @@ impl SingleIssuerRing {
         ring.submitter()
             .register_files_sparse(cfg.direct_fds_per_ring)?;
 
-        Ok(SingleIssuerRing { ring })
+        Ok(SingleIssuerRing {
+            ring,
+            buffer_pool: RefCell::new(BufferPool::new()),
+        })
     }
 
     pub(crate) fn as_raw_fd(&self) -> RawFd {
@@ -212,6 +219,18 @@ impl SingleIssuerRing {
         }
 
         Ok(num_completed)
+    }
+
+    pub(crate) fn submitter(&self) -> Submitter<'_> {
+        self.ring.submitter()
+    }
+
+    pub(crate) fn pool_mut(&self) -> RefMut<'_, BufferPool> {
+        self.buffer_pool.borrow_mut()
+    }
+
+    pub(crate) fn pool(&self) -> Ref<'_, BufferPool> {
+        self.buffer_pool.borrow()
     }
 }
 

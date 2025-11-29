@@ -4,7 +4,7 @@ use crate::context;
 use crate::context::slab::SlabReservedBatch;
 use crate::runtime::SPILL_TO_HEAP_THRESHOLD;
 use crate::sqe::errors::IoError;
-use crate::sqe::{Completable, CompletionHandler, RawSqe, Sqe, Submittable};
+use crate::sqe::{Completable, CompletionHandler, CqeRes, RawSqe, Sqe, Submittable};
 use io_uring::squeue::{Entry, Flags};
 use smallvec::SmallVec;
 use std::io::{self};
@@ -123,7 +123,7 @@ impl Submittable for SqeList {
 }
 
 impl Completable for SqeList {
-    type Output = Result<Vec<io::Result<i32>>, IoError>;
+    type Output = Result<Vec<io::Result<CqeRes>>, IoError>;
 
     fn poll_complete(&mut self, waker: &Waker) -> Poll<Self::Output> {
         if !self.is_ready() {
@@ -506,7 +506,7 @@ mod tests {
             // SqeList contract is the results order has to respect the
             // insertion order.
             for io_result in results {
-                assert!(matches!(io_result, Ok(0)));
+                assert!(matches!(io_result, Ok(cqe_res) if cqe_res.res == 0));
             }
         } else {
             assert!(false, "Expected Poll::Ready(Ok((entry, result)))");
@@ -616,7 +616,7 @@ mod tests {
             for (io_result, (_user_data, expected)) in results.iter().zip(expectations) {
                 match (io_result, expected) {
                     (Err(e1), Either::Right(e2)) => assert_eq!(e1.raw_os_error().unwrap(), e2),
-                    (Ok(r1), Either::Left(r2)) => assert_eq!(*r1, r2),
+                    (Ok(r1), Either::Left(r2)) => assert_eq!(*r1, CqeRes::default().with_res(r2)),
                     (left, right) => {
                         dbg!("left: {:?}, right: {:?}", left, right);
                         assert!(false,);

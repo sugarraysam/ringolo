@@ -112,8 +112,8 @@ impl RawSqe {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
 
-        let cqe_res: Result<i32> = if cqe_res >= 0 {
-            Ok(cqe_res)
+        let cqe_res: Result<CqeRes> = if cqe_res >= 0 {
+            Ok(CqeRes::new(cqe_res, cqe_flags))
         } else {
             Err(Error::from_raw_os_error(-cqe_res))
         };
@@ -172,7 +172,7 @@ impl RawSqe {
         }
     }
 
-    pub(crate) fn pop_next_result(&mut self) -> anyhow::Result<Option<i32>, IoError> {
+    pub(crate) fn pop_next_result(&mut self) -> anyhow::Result<Option<CqeRes>, IoError> {
         if matches!(self.state, RawSqeState::Pending) {
             return Ok(None);
         }
@@ -206,7 +206,7 @@ impl RawSqe {
         .into())
     }
 
-    pub(crate) fn take_final_result(&mut self) -> Result<i32> {
+    pub(crate) fn take_final_result(&mut self) -> Result<CqeRes> {
         if !matches!(self.state, RawSqeState::Ready) {
             return Err(Error::other(format!("unexpected state: {:?}", self.state)));
         }
@@ -315,15 +315,46 @@ impl StreamCompletion {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CqeRes {
+    pub(crate) res: i32,
+    pub(crate) flags: CompletionFlags,
+}
+
+impl CqeRes {
+    pub fn new(res: i32, flags: CompletionFlags) -> Self {
+        Self { res, flags }
+    }
+
+    pub fn with_res(mut self, res: i32) -> Self {
+        self.res = res;
+        self
+    }
+
+    pub fn with_flags(mut self, flags: CompletionFlags) -> Self {
+        self.flags = flags;
+        self
+    }
+}
+
+impl Default for CqeRes {
+    fn default() -> Self {
+        Self {
+            res: 0,
+            flags: CompletionFlags::empty(),
+        }
+    }
+}
+
 // Enum to hold the data that is different for each completion type. RawSqe is
 // responsible to implement the logic.
 #[derive(Debug)]
 pub(crate) enum CompletionHandler {
     Single {
-        result: Option<Result<i32>>,
+        result: Option<Result<CqeRes>>,
     },
     BatchOrChain {
-        result: Option<Result<i32>>,
+        result: Option<Result<CqeRes>>,
 
         // Waker only set on the head, so we store a pointer to the head SQE.
         head: usize,
@@ -334,7 +365,7 @@ pub(crate) enum CompletionHandler {
     Stream {
         // We use the SqeStreamError to be able to distinguish between an IO
         // error or an application error.
-        results: VecDeque<anyhow::Result<i32, IoError>>,
+        results: VecDeque<anyhow::Result<CqeRes, IoError>>,
 
         completion: StreamCompletion,
     },
@@ -404,13 +435,13 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[rstest]
-    #[case::positive_result_success(123, Ok(123))]
-    #[case::zero_result_success(0, Ok(0))]
+    #[case::positive_result_success(123, Ok(CqeRes::default().with_res(123)))]
+    #[case::zero_result_success(0, Ok(CqeRes::default()))]
     #[case::err_not_found(-2, Err(io::Error::new(ErrorKind::NotFound, "not found")))]
     #[case::err_would_block(-11, Err(io::Error::new(ErrorKind::WouldBlock, "would block")))]
     fn test_raw_sqe_single_completion(
         #[case] res: i32,
-        #[case] expected: io::Result<i32>,
+        #[case] expected: io::Result<CqeRes>,
     ) -> Result<()> {
         let (_runtime, _scheduler) = init_local_runtime_and_context(None)?;
         let (waker, waker_data) = mock_waker();
@@ -514,13 +545,23 @@ mod tests {
             assert!(sqe.waker.is_some(), "waker should NOT be consumed");
             assert_eq!(sqe.state, RawSqeState::Ready);
 
-            assert!(matches!(sqe.pop_next_result()?, Some(123)));
+            assert_eq!(
+                sqe.pop_next_result()?,
+                Some(
+                    CqeRes::default()
+                        .with_res(123)
+                        .with_flags(CompletionFlags::MORE)
+                )
+            );
         }
 
         assert!(sqe.on_completion(789, CompletionFlags::empty())?.is_none());
         assert_eq!(waker_data.get_count(), n + 1);
 
-        assert!(matches!(sqe.pop_next_result()?, Some(789)));
+        assert_eq!(
+            sqe.pop_next_result()?,
+            Some(CqeRes::default().with_res(789))
+        );
         assert_eq!(sqe.state, RawSqeState::Completed);
 
         assert!(sqe.pop_next_result()?.is_none());

@@ -260,7 +260,7 @@ impl Worker {
 
     fn drain_queues(&self) {
         self.pollable.lock().clear();
-        while let Some(_) = self.stealable.pop() {}
+        while self.stealable.pop().is_some() {}
     }
 }
 

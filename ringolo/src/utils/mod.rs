@@ -7,4 +7,6 @@ pub(crate) mod scheduler;
 
 pub(crate) mod scope_guard;
 
+pub(crate) mod sys;
+
 pub(crate) mod thread;

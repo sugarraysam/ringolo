@@ -2,7 +2,7 @@
 
 use crate::context;
 use crate::runtime::{Schedule, SchedulerPanic};
-use crate::sqe::{CompletionHandler, IoError, RawSqe, Submittable};
+use crate::sqe::{CompletionHandler, CqeRes, IoError, RawSqe, Submittable};
 use futures::Stream;
 use io_uring::squeue::Entry;
 use std::mem;
@@ -97,7 +97,7 @@ impl Submittable for SqeStream {
 // Instead, we implement `futures::Stream` interface, and will keep producing results to the
 // user as they become available.
 impl Stream for SqeStream {
-    type Item = Result<i32, IoError>;
+    type Item = Result<CqeRes, IoError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {

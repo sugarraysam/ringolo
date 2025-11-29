@@ -139,7 +139,7 @@ fn test_batch_of_nops() -> Result<()> {
         assert!(res.is_ok());
         for res in res.unwrap() {
             assert!(res.is_ok());
-            assert_eq!(res.unwrap(), 0);
+            assert_eq!(res.unwrap().res, 0);
         }
 
         Ok(())
@@ -216,7 +216,7 @@ async fn test_sqe_chain_backend_file_io(#[case] n: usize) -> Result<()> {
                 .zip(res.unwrap())
                 .for_each(|(expected, got)| {
                     assert!(got.is_ok());
-                    assert_eq!(expected, got.unwrap())
+                    assert_eq!(expected, got.unwrap().res)
                 });
 
             // vec is unaware that data was written as it was through a *mut T
@@ -278,7 +278,7 @@ fn test_sq_ring_full_recovers() -> Result<()> {
         assert!(res.is_ok());
         for res in res.unwrap() {
             assert!(res.is_ok());
-            assert_eq!(res.unwrap(), 0);
+            assert_eq!(res.unwrap().res, 0);
         }
     }
 
@@ -320,7 +320,7 @@ fn test_spawn_before_block_on() -> Result<()> {
         assert!(res.is_ok());
         for res in res.unwrap() {
             assert!(res.is_ok());
-            assert_eq!(res.unwrap(), 0);
+            assert_eq!(res.unwrap().res, 0);
         }
     }
 
@@ -338,7 +338,7 @@ fn test_spawn_within_block_on() -> Result<()> {
             assert!(res.is_ok());
             for res in res.unwrap() {
                 assert!(res.is_ok());
-                assert_eq!(res.unwrap(), 0);
+                assert_eq!(res.unwrap().res, 0);
             }
         })
         .await;

@@ -26,6 +26,7 @@ doctest = true
 [dependencies]
 anyhow = "~1.0.99"
 bitflags = "~2.9.4"
+bytes = "~1.11.0"
 crossbeam-deque = "~0.8.6"
 dashmap = { version = "~6.1.0", features = ["raw-api"] }
 either = "~1.15.0"

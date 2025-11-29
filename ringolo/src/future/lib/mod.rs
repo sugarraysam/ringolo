@@ -25,7 +25,7 @@
 //!   `sockaddr`) in favor of Rust standard types (`Duration`, `SocketAddr`).
 //!
 
-use crate::sqe::{IoError, Sqe, SqeSingle, SqeStream};
+use crate::sqe::{CqeRes, IoError, Sqe, SqeSingle, SqeStream};
 use futures::Stream;
 use io_uring::squeue::Entry;
 use pin_project::{pin_project, pinned_drop};
@@ -35,6 +35,10 @@ use std::task::{Context, Poll, Waker, ready};
 
 pub(crate) mod errors;
 pub(crate) use errors::OpcodeError;
+
+mod buffer;
+#[doc(inline)]
+pub use buffer::{BufferFamily, KernelBufferMode, UringBuffer};
 
 #[macro_use]
 mod fd;
@@ -85,7 +89,7 @@ pub trait OpPayload {
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError>;
 }
 
@@ -219,7 +223,7 @@ pub trait MultishotPayload {
     fn into_next(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Item, IoError>;
 }
 

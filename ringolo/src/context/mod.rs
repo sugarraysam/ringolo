@@ -39,6 +39,8 @@ use std::sync::Arc;
 use std::thread_local;
 
 // Exports
+pub(crate) mod buffer_pool;
+
 mod core;
 pub(crate) use core::Core;
 
@@ -223,6 +225,17 @@ where
     F: FnOnce(&SingleIssuerRing) -> R,
 {
     with_core(|core| f(&core.ring.borrow()))
+}
+
+#[inline(always)]
+pub(crate) fn try_with_ring<F, R>(f: F) -> Option<R>
+where
+    F: FnOnce(&SingleIssuerRing) -> R,
+{
+    try_with_context(|outer| match outer {
+        Context::Local(c) => c.with_ring(f),
+        Context::Stealing(c) => c.with_ring(f),
+    })
 }
 
 #[inline(always)]

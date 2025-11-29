@@ -4,7 +4,7 @@ use crate::future::lib::{
     BorrowedUringFd, CancelHow, KernelFdMode, MultishotParams, MultishotPayload, OpcodeError,
     OwnedUringFd,
 };
-use crate::sqe::IoError;
+use crate::sqe::{CqeRes, IoError};
 use io_uring::types::{TimeoutFlags, Timespec};
 use pin_project::pin_project;
 use std::io;
@@ -100,9 +100,9 @@ impl<'a> MultishotPayload for AcceptMultishot<'a> {
     fn into_next(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Item, IoError> {
-        let fd = result?;
+        let fd = result?.res;
         Ok(OwnedUringFd::from_result(fd, self.mode, waker))
     }
 }
@@ -179,7 +179,7 @@ impl MultishotPayload for TimeoutMultishot {
     fn into_next(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Item, IoError> {
         match result {
             Ok(_) => Ok(()),

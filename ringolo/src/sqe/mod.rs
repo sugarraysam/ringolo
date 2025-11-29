@@ -70,8 +70,7 @@ pub(crate) mod list;
 pub(crate) use list::{SqeBatchBuilder, SqeChainBuilder, SqeList, SqeListBuilder, SqeListKind};
 
 pub(crate) mod raw;
-pub(crate) use self::raw::RawSqe;
-pub(crate) use self::raw::{CompletionEffect, CompletionHandler, RawSqeState};
+pub(crate) use self::raw::{CompletionEffect, CompletionHandler, CqeRes, RawSqe, RawSqeState};
 
 pub(crate) mod single;
 pub(crate) use self::single::SqeSingle;

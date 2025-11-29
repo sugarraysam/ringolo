@@ -1,5 +1,5 @@
 use crate::context;
-use crate::sqe::{Completable, CompletionHandler, IoError, RawSqe, Sqe, Submittable};
+use crate::sqe::{Completable, CompletionHandler, CqeRes, IoError, RawSqe, Sqe, Submittable};
 use io_uring::squeue::Entry;
 use std::task::{Poll, Waker};
 
@@ -65,7 +65,7 @@ impl Submittable for SqeSingle {
 }
 
 impl Completable for SqeSingle {
-    type Output = Result<i32, IoError>;
+    type Output = Result<CqeRes, IoError>;
 
     fn poll_complete(&mut self, waker: &Waker) -> Poll<Self::Output> {
         let idx = self.get_idx()?;

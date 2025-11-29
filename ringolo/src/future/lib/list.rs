@@ -2,7 +2,7 @@ use crate::future::lib::ops::single::*;
 use crate::future::lib::types::EpollEvent;
 use crate::future::lib::{OpPayload, OpcodeError, OwnedUringFd};
 use crate::sqe::list::{SqeBatchBuilder, SqeChainBuilder, SqeListBuilder};
-use crate::sqe::{IoError, Sqe, SqeList, SqeListKind};
+use crate::sqe::{CqeRes, IoError, Sqe, SqeList, SqeListKind};
 use paste::paste;
 use pin_project::{pin_project, pinned_drop};
 use std::mem::MaybeUninit;
@@ -86,7 +86,7 @@ macro_rules! define_any_op {
                 fn into_output(
                     self: Pin<&mut Self>,
                     waker: &Waker,
-                    result: Result<i32, IoError>,
+                    result: Result<CqeRes, IoError>,
                 ) -> Result<Self::Output, IoError> {
                     match self.project() {
                         $(

@@ -12,9 +12,10 @@ use crate::future::lib::types::{
     OFlag, OpenHow, PosixFadviseAdvice, SockFlag, SockProtocol, SockType,
 };
 use crate::future::lib::{
-    BorrowedUringFd, KernelFdMode, OpPayload, OpcodeError, OwnedUringFd, parse,
+    BorrowedUringFd, BufferFamily, KernelBufferMode, KernelFdMode, OpPayload, OpcodeError,
+    OwnedUringFd, UringBuffer, parse,
 };
-use crate::sqe::IoError;
+use crate::sqe::{CqeRes, IoError};
 use anyhow::anyhow;
 use either::Either;
 use io_uring::squeue::Entry;
@@ -104,12 +105,12 @@ impl<'a> OpPayload for Accept<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let this = self.project();
 
         // SAFETY(1): Will return *immediately* if there was an error.
-        let fd = result?.as_raw_fd();
+        let fd = result?.res.as_raw_fd();
 
         let addr_info = if *this.with_addr {
             // SAFETY (2): We know the result was successful as we unwrapped above.
@@ -160,10 +161,10 @@ impl OpPayload for AsyncCancel {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -208,10 +209,10 @@ impl<'a> OpPayload for Bind<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -246,10 +247,10 @@ impl OpPayload for Close {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -295,10 +296,10 @@ impl<'a> OpPayload for Connect<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -359,10 +360,10 @@ impl<'a> OpPayload for EpollCtl<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -416,11 +417,11 @@ impl<'a> OpPayload for EpollWait<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
         let mut this = self.project();
-        Ok((res, std::mem::take(&mut this.events)))
+        Ok((res.res, std::mem::take(&mut this.events)))
     }
 }
 
@@ -477,11 +478,11 @@ impl<'a> OpPayload for FGetXattr<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let mut this = self.project();
         let res = result?;
-        Ok((res, std::mem::take(&mut this.value)))
+        Ok((res.res, std::mem::take(&mut this.value)))
     }
 }
 
@@ -543,10 +544,10 @@ impl<'a> OpPayload for FSetXattr<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -593,10 +594,10 @@ impl<'a> OpPayload for Fadvise<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -644,10 +645,10 @@ impl<'a> OpPayload for Fallocate<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -683,12 +684,12 @@ impl OpPayload for FixedFdInstall {
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         // Return a new legacy OwnedUringFd, i.e.: a Raw descriptor. We still enforce
         // proper ownership semantics, with RAII to close the descriptor.
         Ok(OwnedUringFd::from_result(
-            result?,
+            result?.res,
             KernelFdMode::Legacy,
             waker,
         ))
@@ -728,10 +729,10 @@ impl<'a> OpPayload for Fsync<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -765,10 +766,10 @@ impl<'a> OpPayload for Ftruncate<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -817,10 +818,10 @@ impl OpPayload for FutexWait {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -856,10 +857,10 @@ impl OpPayload for FutexWaitV {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -919,10 +920,10 @@ impl OpPayload for FutexWake {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -979,11 +980,11 @@ impl OpPayload for GetXattr {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let mut this = self.project();
         let res = result?;
-        Ok((res, std::mem::take(&mut this.value)))
+        Ok((res.res, std::mem::take(&mut this.value)))
     }
 }
 
@@ -1017,10 +1018,10 @@ impl<'a> OpPayload for Listen<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -1087,10 +1088,10 @@ impl OpPayload for LinkAt {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -1153,9 +1154,9 @@ impl OpPayload for OpenAt {
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
-        Ok(OwnedUringFd::from_result(result?, self.fd_mode, waker))
+        Ok(OwnedUringFd::from_result(result?.res, self.fd_mode, waker))
     }
 }
 
@@ -1213,9 +1214,9 @@ impl OpPayload for OpenAt2 {
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
-        Ok(OwnedUringFd::from_result(result?, self.fd_mode, waker))
+        Ok(OwnedUringFd::from_result(result?.res, self.fd_mode, waker))
     }
 }
 
@@ -1235,10 +1236,72 @@ impl OpPayload for Nop {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
+    }
+}
+
+/// Prepares a recv request.
+///
+/// Corresponds to [`io_uring_prep_recv`](https://man.archlinux.org/man/io_uring_prep_recv.3.en).
+#[derive(Debug)]
+#[pin_project]
+pub struct Recv<'a> {
+    fd: BorrowedUringFd<'a>,
+    #[pin]
+    buf_mode: KernelBufferMode,
+    buf_family: BufferFamily,
+}
+
+impl<'a> Recv<'a> {
+    pub fn new(
+        fd: BorrowedUringFd<'a>,
+        buf_mode: KernelBufferMode,
+        buf_family: BufferFamily,
+    ) -> Self {
+        Self {
+            fd,
+            buf_mode,
+            buf_family,
+        }
+    }
+}
+
+impl<'a> OpPayload for Recv<'a> {
+    type Output = UringBuffer; // TODO: also rename this
+
+    fn create_entry(self: Pin<&mut Self>) -> Result<Entry, OpcodeError> {
+        let this = self.project();
+
+        // TODO: refine BufferSubmission type
+        let config = this.buf_mode.prepare(*this.buf_family)?;
+
+        let entry = resolve_fd!(this.fd, |fd| {
+            let mut builder = io_uring::opcode::Recv::new(fd, config.ptr, config.len);
+
+            if config.is_mapped {
+                builder = builder
+                    .buf_group(config.bgid.val())
+                    .flags(io_uring::squeue::Flags::BUFFER_SELECT.bits() as i32);
+            }
+
+            builder.build()
+        });
+
+        Ok(entry)
+    }
+
+    fn into_output(
+        self: Pin<&mut Self>,
+        waker: &Waker,
+        result: Result<CqeRes, IoError>,
+    ) -> Result<Self::Output, IoError> {
+        let cqe_res = result?;
+        self.project()
+            .buf_mode
+            .complete(cqe_res.res as usize, cqe_res.flags, waker)
     }
 }
 
@@ -1286,9 +1349,9 @@ impl OpPayload for Socket {
     fn into_output(
         self: Pin<&mut Self>,
         waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
-        Ok(OwnedUringFd::from_result(result?, self.fd_mode, waker))
+        Ok(OwnedUringFd::from_result(result?.res, self.fd_mode, waker))
     }
 }
 
@@ -1328,10 +1391,10 @@ impl<'a> OpPayload for SetSockOpt<'a> {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
@@ -1379,10 +1442,10 @@ impl OpPayload for Timeout {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         match result {
-            Ok(res) => Ok(res),
+            Ok(res) => Ok(res.res),
             // Expired timeout yield -ETIME but this is a success case.
             Err(IoError::Io(e)) if e.raw_os_error() == Some(libc::ETIME) => Ok(0),
             Err(e) => Err(e),
@@ -1417,10 +1480,10 @@ impl OpPayload for TimeoutRemove {
     fn into_output(
         self: Pin<&mut Self>,
         _waker: &Waker,
-        result: Result<i32, IoError>,
+        result: Result<CqeRes, IoError>,
     ) -> Result<Self::Output, IoError> {
         let res = result?;
-        Ok(res)
+        Ok(res.res)
     }
 }
 
