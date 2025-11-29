@@ -66,7 +66,7 @@ pub(crate) struct TaskNode {
     // The reason we need a mutex is we need to swap the parent when
     parent: Mutex<Option<Weak<TaskNode>>>,
 
-    registry: Arc<dyn TaskRegistry>,
+    registry: Weak<dyn TaskRegistry>,
 
     released: AtomicBool,
 }
@@ -78,7 +78,7 @@ impl TaskNode {
     ///
     /// This allows writing clean APIs with separation of concerns. Also if no
     /// orphans are created the cost is just about zero.
-    pub(crate) fn new_root(root_id: Id, registry: Arc<dyn TaskRegistry>) -> Self {
+    pub(crate) fn new_root(root_id: Id, registry: Weak<dyn TaskRegistry>) -> Self {
         Self {
             id: root_id,
             opts: TaskOpts::default(),
@@ -100,7 +100,7 @@ impl TaskNode {
         id: Id,
         opts: Option<TaskOpts>,
         metadata: Option<TaskMetadata>,
-        registry: Arc<dyn TaskRegistry>,
+        registry: Weak<dyn TaskRegistry>,
     ) -> Arc<Self> {
         let opts = opts.unwrap_or_default();
 
@@ -225,11 +225,15 @@ impl TaskNode {
             .is_some_and(|m| m.is_superset(metadata))
     }
 
-    /// Shuts down the task.
-    fn shutdown(&self) {
-        // We want to go through the `Task<S>::shutdown()` path to ensure we manage
-        // ref counts properly.
-        self.registry.shutdown(&self.id);
+    /// Remotely aborts the task.
+    ///
+    /// This is similar to `shutdown` except that it asks the runtime to perform
+    /// the shutdown. This is necessary to avoid the shutdown happening in the
+    /// wrong thread for non-Send tasks.
+    fn remote_abort(&self) {
+        if let Some(registry) = self.registry.upgrade() {
+            registry.remote_abort(&self.id);
+        }
     }
 
     // Circumstances under which we should release a task.
@@ -238,7 +242,7 @@ impl TaskNode {
     // (3) Only allowed to release once
     fn should_release(&self) -> bool {
         !self.id.is_root()
-            && !self.registry.is_closed()
+            && self.registry.upgrade().is_some_and(|r| !r.is_closed())
             && !self.released.swap(true, Ordering::AcqRel)
     }
 
@@ -286,8 +290,12 @@ impl fmt::Debug for TaskNode {
 
 impl Drop for TaskNode {
     fn drop(&mut self) {
-        if self.has_children() && !self.registry.is_closed() {
-            let policy_enforced = matches!(self.registry.orphan_policy(), OrphanPolicy::Enforced);
+        if !self.has_children() {
+            return;
+        }
+
+        if let Some(registry) = self.registry.upgrade().filter(|r| !r.is_closed()) {
+            let policy_enforced = matches!(registry.orphan_policy(), OrphanPolicy::Enforced);
 
             if policy_enforced || self.opts.cancel_all_on_exit() {
                 let stats = self.recursive_cancel_all();
@@ -378,7 +386,7 @@ fn recursive_cancel_all(node: &TaskNode) -> CancellationStats {
             );
 
             if !child.released.swap(true, Ordering::AcqRel) {
-                child.shutdown();
+                child.remote_abort();
                 stats.cancelled += 1;
             }
 
@@ -445,7 +453,7 @@ where
                 );
 
                 if !child.released.swap(true, Ordering::AcqRel) {
-                    child.shutdown();
+                    child.remote_abort();
                     stats.cancelled += 1;
                 }
             }

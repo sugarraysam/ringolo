@@ -42,6 +42,11 @@ impl Worker {
     fn tick<T: TickerData>(&self, ctx: &T::Context, data: &mut T) -> TickerEvents {
         self.ticker.borrow_mut().tick(ctx, data)
     }
+
+    pub(super) fn drain(&self) {
+        let mut q = self.pollable.borrow_mut();
+        q.clear();
+    }
 }
 
 impl EventLoop for Worker {
@@ -56,7 +61,7 @@ impl EventLoop for Worker {
         // the end corresponds to the front.
         match mode {
             AddMode::Fifo => q.push_front(task),
-            AddMode::Lifo => q.push_back(task),
+            AddMode::Lifo | AddMode::Cancel => q.push_back(task),
         }
     }
 
@@ -105,7 +110,9 @@ impl Worker {
                 })?;
             } else {
                 match root_result.is_some() {
-                    true => return Ok(root_result),
+                    true => {
+                        return Ok(root_result);
+                    }
                     false => scheduler.set_root_woken(),
                 }
             }

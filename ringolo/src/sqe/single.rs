@@ -51,20 +51,15 @@ impl Submittable for SqeSingle {
                     entry.set_user_data(idx as u64);
                     ring.push(entry)?;
 
-                    reserved.commit(RawSqe::new(CompletionHandler::new_single()));
+                    reserved.commit(RawSqe::new(waker, CompletionHandler::new_single()));
 
                     Ok(idx)
                 })
             }
         }
+        // On successful push, transition state to submitted.
         .map(|idx| {
-            // On successful push, we can transition the state and increment the
-            // number of pending IOs at both the thread-level and task-level.
             self.state = SqeSingleState::Submitted { idx };
-            context::with_core(|core| {
-                core.increment_pending_ios();
-                core.increment_task_pending_ios(waker);
-            });
         })
     }
 }
@@ -80,13 +75,7 @@ impl Completable for SqeSingle {
 
             if raw.is_ready() {
                 let res = raw.take_final_result().map_err(Into::into);
-
-                // # Important
-                // We need to decrement task `pending_ios` *after* dropping the RawSqe
-                // to prevent making the task stealable while it still needs to drop this
-                // RawSqe from thread-local slab.
                 debug_assert!(slab.try_remove(idx).is_some(), "RawSqe not found in slab.");
-                context::with_core(|c| c.decrement_task_pending_ios(waker));
 
                 self.state = SqeSingleState::Completed;
                 Poll::Ready(res)
@@ -101,10 +90,6 @@ impl Completable for SqeSingle {
 impl Drop for SqeSingle {
     fn drop(&mut self) {
         if let SqeSingleState::Submitted { idx } = self.state {
-            // If we get here, it means *nothing* will decrement the task pending_ios.
-            // The consequence is the task will *not be stealable*. We can live with that
-            // and there is no way to get access to the underlying task anyways because
-            // the Waker is lost.
             context::with_slab_mut(|slab| {
                 if slab.try_remove(idx).is_none() {
                     eprintln!("[SqeSingle]: SQE {} not found in slab during drop.", idx,);
@@ -146,7 +131,7 @@ mod tests {
             let idx = sqe_fut.get().get_idx()?;
 
             assert_eq!(waker_data.get_count(), 0);
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 1));
+            assert_eq!(context::with_core(|core| core.get_pending_ios()), 1);
             assert_eq!(waker_data.get_pending_ios(), 1);
 
             with_slab_and_ring_mut(|slab, ring| {
@@ -154,7 +139,7 @@ mod tests {
 
                 let res = slab.get(idx).and_then(|sqe| {
                     assert!(!sqe.is_ready());
-                    assert!(sqe.has_waker());
+                    assert!(sqe.waker.is_some());
                     Ok(())
                 });
 
@@ -170,8 +155,6 @@ mod tests {
             // Process CQEs :: wakes up Waker
             assert!(matches!(ring.process_cqes(slab, None), Ok(1)));
             assert_eq!(waker_data.get_count(), 1);
-            context::with_core(|core| assert_eq!(core.get_pending_ios(), 0));
-            assert_eq!(waker_data.get_pending_ios(), 1);
         });
 
         assert!(matches!(
@@ -179,6 +162,8 @@ mod tests {
             Poll::Ready(Ok(_))
         ));
 
+        // RawSqe was dropped on complete
+        assert_eq!(context::with_core(|core| core.get_pending_ios()), 0);
         assert_eq!(waker_data.get_pending_ios(), 0);
         Ok(())
     }

@@ -10,13 +10,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  test:
+    name: Test (stable)
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v5
-    - name: Build
-      run: cargo build
-    - name: Run tests
-      run: cargo test --all-features -- --test-threads=1
+    - uses: actions/checkout@v6
+    - uses: dtolnay/rust-toolchain@stable
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: "stable-test"
+    - run: cargo test --all-features -- --test-threads=1
+  
+  sanitizers:
+    name: Test (${{ matrix.sanitizer }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install LLVM (for symbolizer)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y llvm
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.sanitizer }}
+      - env:
+          RUSTFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+          RUSTDOCFLAGS: -Zsanitizer=${{ matrix.sanitizer }}
+        run: cargo +nightly test --all-features -Zbuild-std --target x86_64-unknown-linux-gnu -- --test-threads=1

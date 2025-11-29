@@ -37,6 +37,15 @@ impl<S: 'static> Task<S> {
         self.raw
     }
 
+    /// Remotely aborts the task.
+    ///
+    /// This is similar to `shutdown` except that it asks the runtime to perform
+    /// the shutdown. This is necessary to avoid the shutdown happening in the
+    /// wrong thread for non-Send tasks.
+    pub(crate) fn remote_abort(&self) {
+        self.raw.remote_abort();
+    }
+
     fn header(&self) -> &Header {
         self.raw.header()
     }

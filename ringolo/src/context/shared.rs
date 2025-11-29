@@ -1,11 +1,11 @@
+use crate::context::Core;
 use crate::context::slots::WorkerSlots;
-use crate::context::{Core, PendingIoOp};
 use crate::runtime::RuntimeConfig;
 use crate::task::ThreadId;
 use parking_lot::RwLock;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, Thread};
 
 /// Global state shared across all worker threads.
@@ -45,10 +45,9 @@ impl Shared {
     }
 
     #[track_caller]
-    pub(super) fn register_worker(&self, core: &Core) -> Arc<AtomicUsize> {
+    pub(super) fn register_worker(&self, core: &Core) {
         self.worker_slots
             .register(core)
-            .map(|data| Arc::clone(&data.pending_ios))
             .expect("failed to register worker")
     }
 
@@ -65,24 +64,6 @@ impl Shared {
         self.worker_slots
             .unregister(&thread_id)
             .expect("failed to unregister worker");
-    }
-
-    // Slow path to decrement pending_ios on a specific thread. See note on
-    // `task::harness::Harness::cancel_task`.
-    #[track_caller]
-    pub(crate) fn modify_pending_ios(&self, thread_id: &ThreadId, op: PendingIoOp, delta: usize) {
-        self.worker_slots.with_data(thread_id, |data| {
-            match op {
-                PendingIoOp::Increment => data.pending_ios.fetch_add(delta, Ordering::Relaxed),
-                PendingIoOp::Decrement => data.pending_ios.fetch_sub(delta, Ordering::Relaxed),
-            };
-        });
-    }
-
-    #[track_caller]
-    pub(crate) fn get_pending_ios(&self, thread_id: &ThreadId) -> usize {
-        self.worker_slots
-            .with_data(thread_id, |data| data.pending_ios.load(Ordering::Relaxed))
     }
 
     /// This method parks the current thread, adding the thread to the LIFO

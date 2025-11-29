@@ -1,4 +1,3 @@
-use crate::context::PendingIoOp;
 use crate::runtime::{PanicReason, Schedule, SchedulerPanic};
 use crate::task::error::panic_payload_as_str;
 use crate::task::layout::{Core, TaskLayout};
@@ -7,7 +6,7 @@ use crate::task::state::{State, TransitionToIdle, TransitionToRunning};
 use crate::task::trailer::Trailer;
 use crate::task::waker::waker_ref;
 use crate::task::{Header, Id, JoinError, Notified, Task};
-use crate::{context, with_scheduler};
+use crate::with_scheduler;
 
 use std::future::Future;
 
@@ -265,33 +264,7 @@ impl<T: Future, S: Schedule> Harness<T, S> {
 
     /// Cancels the task and store the appropriate error in the stage field.
     fn cancel_task(&self) {
-        let header = self.header();
         let core = self.core();
-
-        // Since we are cancelling the task, we need to manually decrement
-        // pending IO to prevent scheduler from hanging. Normally this counter is
-        // decremented when a waker for a given task is woken up by value, but when
-        // we forcibly cancel a task, the following sequence of events happens:
-        // (1) `mem::forget(task)` is called after releasing the task from the
-        //     scheduler, dropping the future state machine.
-        // (2) SQE backends associated with the task are dropped.
-        // (3) RawSqe's associated with these SQE backends are dropped.
-        //
-        // This means the next time we call `process_cqes`, any CQEs that would have
-        // been associated with these RawSqe will be dropped without decrementing
-        // pending_ios.
-        //
-        // Also, we use the cold path to decrement pending IOs through the shared
-        // context because cancellation might have been initiated by the parent
-        // task on a separate thread, and we need to make sure we decrement pending
-        // IOs on the thread that owns this task.
-        context::with_shared(|shared| {
-            shared.modify_pending_ios(
-                &header.get_owner_id(),
-                PendingIoOp::Decrement,
-                header.get_pending_ios() as usize,
-            );
-        });
 
         // Drop the future from a panic guard.
         let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {

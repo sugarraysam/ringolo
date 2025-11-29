@@ -10,6 +10,7 @@ use crate::task::trailer::Trailer;
 use std::cell::Cell;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Headers are accessed all the time and represent thin-pointers to Task (i.e.: future).
 /// We can only store "hot data" in this struct, and we must only add values that are accessed
@@ -19,10 +20,10 @@ use std::sync::Arc;
 /// The structure now stands at 30 bytes:
 /// - 8 bytes  :: state (atomic_usize)
 /// - 8 bytes  :: vtable (ptr)
-/// - 4 bytes  :: thread_id (u32)
+/// - 4 bytes  :: owner_id (u32)
 /// - 4 bytes  :: pending_io (u32)
 /// - 4 bytes  :: owned_resources (u32)
-/// - 2 byte   :: task_opts (u16)
+/// - 2 bytes  :: task_opts (u16)
 #[repr(C, align(32))]
 pub(crate) struct Header {
     /// Task state (Lifecycle, Running, Complete, etc.).
@@ -33,7 +34,9 @@ pub(crate) struct Header {
 
     /// The ID of the worker thread that currently "owns" this task.
     /// Completions for this task must be processed by this thread.
-    pub(super) owner_id: Cell<ThreadId>,
+    //
+    // Atomic required to support concurrent access on shutdown and cancellation.
+    pub(super) owner_id: AtomicU32,
 
     /// We keep track of all locally scheduled IOs on io_uring as a signal to
     /// determine if a task can safely be stolen by another thread. This is
@@ -56,10 +59,11 @@ unsafe impl Sync for Header {}
 
 impl Header {
     pub(crate) fn new(state: State, vtable: &'static Vtable, opts: Option<TaskOpts>) -> Header {
+        let tid = context::with_core(|core| core.thread_id).as_u32();
         Header {
             state,
             vtable,
-            owner_id: Cell::new(context::with_core(|core| core.thread_id)),
+            owner_id: AtomicU32::new(tid),
             pending_ios: Cell::new(0),
             owned_resources: Cell::new(0),
             opts: opts.unwrap_or_default(),
@@ -90,14 +94,21 @@ impl Header {
     }
 
     pub(crate) unsafe fn set_owner_id(me: NonNull<Header>, owner_id: ThreadId) {
-        me.as_ref().owner_id.set(owner_id);
+        me.as_ref()
+            .owner_id
+            .store(owner_id.as_u32(), Ordering::Release);
     }
 
-    /// Modify pending ios.
-    pub(crate) unsafe fn modify_pending_ios(me: NonNull<Header>, delta: i32) {
+    /// Increment pending ios resources.
+    pub(crate) unsafe fn increment_pending_ios(me: NonNull<Header>) {
+        me.as_ref().pending_ios.update(|x| x + 1);
+    }
+
+    /// Decrement pending ios resources.
+    pub(crate) unsafe fn decrement_pending_ios(me: NonNull<Header>) {
         me.as_ref()
             .pending_ios
-            .update(|x| x.checked_add_signed(delta).expect("underflow"));
+            .update(|x| x.checked_add_signed(-1).expect("underflow"));
     }
 
     /// Increment owned resources.
@@ -105,9 +116,11 @@ impl Header {
         me.as_ref().owned_resources.update(|x| x + 1);
     }
 
-    /// Increment owned resources.
+    /// Decrement owned resources.
     pub(crate) unsafe fn decrement_owned_resources(me: NonNull<Header>) {
-        me.as_ref().owned_resources.update(|x| x - 1);
+        me.as_ref()
+            .owned_resources
+            .update(|x| x.checked_add_signed(-1).expect("underflow"));
     }
 }
 
@@ -165,6 +178,6 @@ impl Header {
 
     /// Gets the owner_id of the task containing this `Header`.
     pub(crate) fn get_owner_id(&self) -> ThreadId {
-        self.owner_id.get()
+        self.owner_id.load(Ordering::Acquire).into()
     }
 }

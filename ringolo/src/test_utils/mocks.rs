@@ -10,8 +10,8 @@ use crate::task::{Header, Id, Notified, State, Task};
 use std::future::Ready;
 use std::mem::ManuallyDrop;
 use std::ptr::{self, NonNull};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::task::{RawWaker, RawWakerVTable, Waker};
 
 #[derive(Debug, Default, Copy, Clone)]
@@ -28,8 +28,9 @@ impl Schedule for DummyScheduler {
 
     fn unhandled_panic(&self, _payload: SchedulerPanic) {}
 
-    fn task_registry(&self) -> Arc<dyn TaskRegistry> {
-        Arc::new(DummyTaskRegistry)
+    fn task_registry(&self) -> Weak<dyn TaskRegistry> {
+        // Returns a Weak pointer that upgrades to None immediately
+        Weak::<DummyTaskRegistry>::new() as Weak<dyn TaskRegistry>
     }
 }
 
@@ -51,7 +52,7 @@ pub(crate) fn mock_task(
 pub(crate) struct DummyTaskRegistry;
 
 impl TaskRegistry for DummyTaskRegistry {
-    fn shutdown(&self, _id: &Id) {}
+    fn remote_abort(&self, _id: &Id) {}
 
     fn is_closed(&self) -> bool {
         false

@@ -5,12 +5,10 @@ use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use std::collections::{HashMap, VecDeque};
 use std::os::fd::RawFd;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::AtomicBool;
 
 #[derive(Debug, Clone)]
 pub(crate) struct WorkerData {
-    pub(crate) pending_ios: Arc<AtomicUsize>,
-
     pub(crate) should_unpark: Arc<AtomicBool>,
 
     pub(crate) ring_fd: RawFd,
@@ -19,7 +17,6 @@ pub(crate) struct WorkerData {
 impl WorkerData {
     fn from_core(core: &Core) -> Self {
         Self {
-            pending_ios: Arc::new(AtomicUsize::new(0)),
             should_unpark: Arc::new(AtomicBool::new(false)),
             ring_fd: core.ring_fd,
         }
@@ -66,14 +63,13 @@ impl WorkerSlots {
             .map_err(|_| anyhow!("ThreadId {:?} not found", thread_id))
     }
 
-    pub(crate) fn register(&self, core: &Core) -> Result<WorkerData> {
+    pub(crate) fn register(&self, core: &Core) -> Result<()> {
         let slot_idx = self.mapping.write().reserve_slot(core.thread_id)?;
 
         let worker_data = WorkerData::from_core(core);
-        let worker_data_clone = worker_data.clone();
-
         self.slots.write()[slot_idx] = Some(worker_data);
-        Ok(worker_data_clone)
+
+        Ok(())
     }
 
     pub(crate) fn unregister(&self, thread_id: &ThreadId) -> Result<()> {

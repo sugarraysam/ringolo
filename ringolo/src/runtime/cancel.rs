@@ -174,12 +174,13 @@ mod tests {
             let stats = ringolo::recursive_cancel_all_metadata(&TaskMetadata::from(["dead"]))?;
             assert_eq!(stats.cancelled, 1);
             assert_eq!(stats.visited, n + 1);
-
-            // Check orphanage - only happens after we drop the join_handle
-            let orphan_root = get_orphan_root();
-            assert_eq!(orphan_root.num_children(), 0);
             drop(cancelled);
-            assert_eq!(orphan_root.num_children(), n);
+
+            // Next poll on the cancelled task creates orphans
+            let orphan_root = get_orphan_root();
+            while orphan_root.num_children() < n {
+                assert!(YieldNow::new(Some(AddMode::Fifo)).await.is_ok());
+            }
 
             // Now cancel remaining orphans
             let stats = ringolo::recursive_cancel_all_orphans()?;

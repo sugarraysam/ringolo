@@ -146,38 +146,48 @@ impl SingleIssuerRing {
         self.sq().taskrun()
     }
 
-    // Will busy loop until `num_to_complete` has been achieved. It is the caller's
+    // Will busy loop until `num_to_visit` CQE have been visited. It is the caller's
     // responsibility to make sure the CQ will see that many completions, otherwise
     // this will result in an infinite loop.
     pub(crate) fn process_cqes(
         &mut self,
         slab: &mut RawSqeSlab,
-        num_to_complete: Option<usize>,
+        num_to_visit: Option<usize>,
     ) -> Result<usize> {
+        // We need to split `num_visited`/`num_completed` counters because if we
+        // cancel an SQE inflight, the entry might be dropped from the slab while
+        // still producing a CQE. In that case, the loop would only increment the
+        // `num_visited` counter.
+        let mut num_visited = 0;
         let mut num_completed = 0;
+
+        let mut cq = self.cq();
+        let to_visit = num_to_visit.unwrap_or(cq.len());
+
         let mut should_sync = false;
 
-        let to_complete = num_to_complete.unwrap_or(self.cq().len());
-
-        while num_completed < to_complete {
-            let mut cq = self.cq();
-
-            // Avoid syncing on first pass
+        while num_visited < to_visit {
+            // Avoid syncing on first pass.
             if should_sync {
+                // If we get here, we are spinning waiting for completions so
+                // let's give the CPU a tiny breather.
+                std::thread::yield_now();
                 cq.sync();
             }
 
-            for cqe in cq {
+            for cqe in &mut cq {
+                num_visited += 1;
+
                 let raw_sqe = match slab.get_mut(cqe.user_data() as usize) {
                     Err(e) => {
                         eprintln!("CQE user data not found in RawSqeSlab: {:?}", e);
                         continue;
                     }
                     Ok(sqe) => {
-                        if !matches!(sqe.get_state(), RawSqeState::Pending | RawSqeState::Ready) {
+                        if !matches!(sqe.state, RawSqeState::Pending | RawSqeState::Ready) {
                             // Ignore unknown CQEs which might have valid index in
                             // the Slab. Can this even happen?
-                            eprintln!("SQE in unexpected state: {:?}", sqe.get_state());
+                            eprintln!("SQE in unexpected state: {:?}", sqe.state);
                             continue;
                         }
                         sqe
@@ -189,7 +199,12 @@ impl SingleIssuerRing {
                 if let Some(CompletionEffect::WakeHead { head }) =
                     raw_sqe.on_completion(cqe.result(), cqe.flags().into())?
                 {
-                    slab.get_mut(head)?.wake()?;
+                    slab.get_mut(head)?.wake_by_val()?;
+                }
+
+                // Exit early if user provided an override for `to_visit`.
+                if num_visited >= to_visit {
+                    break;
                 }
             }
 
@@ -273,6 +288,8 @@ mod tests {
         let builder = Builder::new_local().sq_ring_size(sq_ring_size);
         let (_runtime, _scheduler) = init_local_runtime_and_context(Some(builder))?;
 
+        let (waker, _) = mock_waker();
+
         context::with_slab_and_ring_mut(|slab, ring| -> Result<()> {
             {
                 let sq = ring.sq();
@@ -289,7 +306,7 @@ mod tests {
 
                 (0..n).for_each(|i| {
                     nops.push(nop().user_data(indices[i] as u64));
-                    raws.push(RawSqe::new(CompletionHandler::new_single()));
+                    raws.push(RawSqe::new(&waker, CompletionHandler::new_single()));
                 });
 
                 let _ = batch.commit(raws)?;
@@ -342,15 +359,9 @@ mod tests {
                 (0..n).for_each(|i| {
                     let nop = nop().user_data(indices[i] as u64);
 
-                    let mut raw = RawSqe::new(CompletionHandler::new_single());
-                    raw.set_waker(&waker);
-
+                    let raw = RawSqe::new(&waker, CompletionHandler::new_single());
                     nops.push(nop);
                     raws.push(raw);
-
-                    // We use single SQE even though we use batch API on slab,
-                    // anyways a bit messed up but need to count N pending ios.
-                    context::with_core(|core| core.increment_pending_ios());
                 });
 
                 let _ = batch.commit(raws)?;
@@ -372,6 +383,10 @@ mod tests {
             ring.process_cqes(slab, None)?;
             assert_eq!(waker_data.get_count(), n);
             assert_eq!(ring.cq().len(), 0);
+
+            // Waker goes out of scope *before* TLS is dropped causing heap-after-free
+            // errors. This is test-specific so we can just clear the slab to fix.
+            slab.clear();
 
             Ok(())
         })
